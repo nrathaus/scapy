@@ -759,6 +759,9 @@ class NTLM_Server(_NTLM_Automaton):
     :param IDENTITIES: a dict {"username": NTOWFv2("password", "username", "domain")}
                        (this is the KeyResponseNT). Setting this value enables
                        signature computation and authenticates inbound users.
+    :param DOMAIN_AUTH: a tuple ("<DC IP>", "machineName", b"machinePassword") to
+                        use for domain authentication, used to establish the netlogon
+                        session. (UNIMPLEMENTED)
     """
     port = 445
     cls = conf.raw_layer
@@ -768,7 +771,9 @@ class NTLM_Server(_NTLM_Automaton):
         self.cli_values = dict()
         self.ntlm_values = kwargs.pop("NTLM_VALUES", None)
         self.ntlm_state = 0
+        self.DOMAIN_AUTH = kwargs.pop("DOMAIN_AUTH", None)
         self.IDENTITIES = kwargs.pop("IDENTITIES", None)
+        self.CHECK_LOGIN = bool(self.IDENTITIES) or bool(self.DOMAIN_AUTH)
         self.SigningSessionKey = None
         self.Challenge = None
         super(NTLM_Server, self).__init__(*args, **kwargs)
@@ -857,16 +862,24 @@ class NTLM_Server(_NTLM_Automaton):
                 auth_tok, _, _, rawToken = self.token_pipe.recv()
                 if NTLM_AUTHENTICATE_V2 not in auth_tok:
                     raise ValueError("Unexpected state :(")
-                username = auth_tok.UserName
-                if self.IDENTITIES:
-                    # We should know this user's KeyResponseNT. Check it
-                    if username in self.IDENTITIES:
-                        NTProofStr = auth_tok.NtChallengeResponse.computeNTProofStr(
-                            self.IDENTITIES[username],
-                            self.Challenge.ServerChallenge,
-                        )
-                        if NTProofStr == auth_tok.NtChallengeResponse.NTProofStr:
+                if self.CHECK_LOGIN:
+                    if auth_tok.UserNameLen:
+                        username = auth_tok.UserName
+                    else:
+                        username = None
+                    # Check the NTProofStr
+                    if self.SigningSessionKey:
+                        if self.DOMAIN_AUTH:
+                            # Domain auth: if we have the session key, ntproofstr was ok
                             return None, 0, None, rawToken  # "success"
+                        elif username in self.IDENTITIES:
+                            # Local auth: We should know this user's KeyResponseNT
+                            NTProofStr = auth_tok.NtChallengeResponse.computeNTProofStr(
+                                self.IDENTITIES[username],
+                                self.Challenge.ServerChallenge,
+                            )
+                            if NTProofStr == auth_tok.NtChallengeResponse.NTProofStr:
+                                return None, 0, None, rawToken  # "success"
                     # Bad NTProofStr or unknown user
                     self.Challenge.ServerChallenge = struct.pack(
                         "<Q",
@@ -875,15 +888,22 @@ class NTLM_Server(_NTLM_Automaton):
                     return self.Challenge, 2, None, rawToken  # fail
                 return None, 0, None, rawToken  # "success"
 
+    def get_SessionBaseKey(self, ntlm):
+        if ntlm.UserNameLen:
+            username = ntlm.UserName
+        else:
+            username = None
+        if self.IDENTITIES and username in self.IDENTITIES:
+            return NTLMv2_ComputeSessionBaseKey(
+                self.IDENTITIES[username],
+                ntlm.NtChallengeResponse.NTProofStr
+            )
+
     def received_ntlm_token(self, ntlm_tuple):
         ntlm = ntlm_tuple[0]
-        if isinstance(ntlm, NTLM_AUTHENTICATE_V2) and self.IDENTITIES:
-            username = ntlm.UserName
-            if username in self.IDENTITIES:
-                SessionBaseKey = NTLMv2_ComputeSessionBaseKey(
-                    self.IDENTITIES[username],
-                    ntlm.NtChallengeResponse.NTProofStr
-                )
+        if isinstance(ntlm, NTLM_AUTHENTICATE_V2) and self.CHECK_LOGIN:
+            SessionBaseKey = self.get_SessionBaseKey(ntlm)
+            if SessionBaseKey:
                 # [MS-NLMP] sect 3.2.5.1.2
                 KeyExchangeKey = SessionBaseKey  # Only true for NTLMv2
                 if ntlm.NegotiateFlags.NTLMSSP_NEGOTIATE_KEY_EXCH:
@@ -922,7 +942,8 @@ def ntlm_relay(serverCls,
                ALLOW_SMB2=None,
                server_kwargs=None,
                client_kwargs=None,
-               iface=None):
+               iface=None,
+               debug=2):
     """
     NTLM Relay
 
@@ -970,7 +991,7 @@ def ntlm_relay(serverCls,
         while not evt.is_set():
             clientsocket, address = ssock.accept()
             sock = StreamSocket(clientsocket, serverCls.cls)
-            srv_atmt = serverCls(sock, debug=4, **server_kwargs)
+            srv_atmt = serverCls(sock, debug=debug, **server_kwargs)
             # Connect to real server
             _sock = socket.socket()
             _sock.connect(
@@ -989,7 +1010,7 @@ def ntlm_relay(serverCls,
                 remote_sock = StreamSocket(_sock, remoteClientCls.cls)
             print("%s connected -> %s" %
                   (repr(address), repr(_sock.getsockname())))
-            cli_atmt = remoteClientCls(remote_sock, debug=4, **client_kwargs)
+            cli_atmt = remoteClientCls(remote_sock, debug=debug, **client_kwargs)
             sock_tup = ((srv_atmt, cli_atmt), (sock, remote_sock))
             sniffers.append(sock_tup)
             # Bind NTLM functions
@@ -1017,7 +1038,8 @@ def ntlm_relay(serverCls,
 
 def ntlm_server(serverCls,
                 server_kwargs=None,
-                iface=None):
+                iface=None,
+                debug=2):
     """
     Starts a standalone NTLM server class
     """
@@ -1028,6 +1050,9 @@ def ntlm_server(serverCls,
     ssock.bind(
         (get_if_addr(iface or conf.iface), serverCls.port))
     ssock.listen(5)
+    print(conf.color_theme.green(
+        "Server %s started. Waiting..." % serverCls.__name__
+    ))
     sniffers = []
     server_kwargs = server_kwargs or {}
     try:
@@ -1035,9 +1060,9 @@ def ntlm_server(serverCls,
         while not evt.is_set():
             clientsocket, address = ssock.accept()
             sock = StreamSocket(clientsocket, serverCls.cls)
-            srv_atmt = serverCls(sock, debug=4, **server_kwargs)
+            srv_atmt = serverCls(sock, debug=debug, **server_kwargs)
             sniffers.append((srv_atmt, sock))
-            print("%s connected " % repr(address))
+            print(conf.color_theme.gold("-> %s connected " % repr(address)))
             # Start automatons
             srv_atmt.runbg()
     except KeyboardInterrupt:

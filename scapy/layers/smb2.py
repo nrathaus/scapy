@@ -38,6 +38,7 @@ from scapy.fields import (
     StrFixedLenField,
     StrLenFieldUtf16,
     StrLenField,
+    StrNullFieldUtf16,
     UTCTimeField,
     UUIDField,
     XLEIntField,
@@ -169,12 +170,21 @@ FileInformationClasses = {
     0x03: "FileBothDirectoryInformation",
     0x05: "FileStandardInformation",
     0x06: "FileInternalInformation",
+    0x07: "FileEaInformation",
     0x22: "FileNetworkOpenInformation",
     0x25: "FileIdBothDirectoryInformation",
     0x26: "FileIdFullDirectoryInformation",
     0x0C: "FileNamesInformation",
     0x3C: "FileIdExtdDirectoryInformation",
 }
+
+
+# [MS-FSCC] 2.4.12 FileEaInformation
+
+class FileEaInformation(Packet):
+    fields_desc = [
+        LEIntField("EaSize", 0),
+    ]
 
 
 # [MS-FSCC] 2.4.29 FileNetworkOpenInformation
@@ -235,7 +245,7 @@ class _NextPacketListField(PacketListField):
         res = b""
         for i, v in enumerate(val):
             x = self.i2m(pkt, v)
-            if v.Next is None and i != len(v) - 1:
+            if v.Next is None and i != len(val) - 1:
                 x = struct.pack("<I", len(x)) + x[4:]
             res += x
         return s + res
@@ -260,11 +270,134 @@ class FileInternalInformation(Packet):
 class FileStandardInformation(Packet):
     fields_desc = [
         LELongField("AllocationSize", 4096),
-        LELongField("EndOfFile", 4096),
+        LELongField("EndOfFile", 0),
         LEIntField("NumberOfLinks", 1),
         ByteField("DeletePending", 0),
         ByteField("Directory", 0),
         ShortField("Reserved", 0),
+    ]
+
+# [MS-FSCC] 2.4.43 FileStreamInformation
+
+
+class FileStreamInformation(Packet):
+    fields_desc = [
+        LEIntField("Next", 0),
+        FieldLenField("StreamNameLength", None, length_of="StreamName", fmt="<I"),
+        LELongField("StreamSize", 0),
+        LELongField("StreamAllocationSize", 0),
+        StrLenFieldUtf16("StreamName", b"::$DATA",
+                         length_from=lambda pkt: pkt.StreamNameLength)
+    ]
+
+# [MS-DTYP] 2.4.6 SECURITY_DESCRIPTOR
+
+
+class SECURITY_DESCRIPTOR(Packet):
+    fields_desc = [
+        ByteField("Revision", 0x01),
+        ByteField("Sbz1", 0x00),
+        FlagsField("Control", 0x00, -16, [
+            "SelfRelative",
+            "RMControlValid",
+            "SACLProtected",
+            "DACLProtected",
+            "SACLAutoInherited",
+            "DACLAutoInheriter",
+            "SACLComputer",
+            "DACLComputer",
+            "ServerSecurity",
+            "DACLTrusted",
+            "SACLDefaulted",
+            "SACLPresent",
+            "DACLDefaulted",
+            "DACLPresent",
+            "GroupDefaulted",
+            "OwnerDefaulted",
+        ]),
+        LEIntField("OffsetOwner", 0),
+        LEIntField("OffsetGroup", 0),
+        LEIntField("OffsetSacl", 0),
+        LEIntField("OffsetDacl", 0),
+        ConditionalField(
+            XStrLenField("OwnerSid", b""),
+            lambda pkt: pkt.OffsetOwner
+        ),
+        ConditionalField(
+            XStrLenField("GroupSid", b""),
+            lambda pkt: pkt.OffsetGroup
+        ),
+        ConditionalField(
+            XStrLenField("Sacl", b""),
+            lambda pkt: pkt.Control.SACLPresent,
+        ),
+        ConditionalField(
+            XStrLenField("Dacl", b""),
+            lambda pkt: pkt.Control.DACLPresent,
+        )
+    ]
+
+# [MS-FSCC] 2.5.1 FileFsAttributeInformation
+
+
+class FileFsAttributeInformation(Packet):
+    fields_desc = [
+        FlagsField("FileSystemAttributes", 0x80000f, -32, {
+            0x02000000: "FILE_SUPPORTS_USN_JOURNAL",
+            0x01000000: "FILE_SUPPORTS_OPEN_BY_FILE_ID",
+            0x00800000: "FILE_SUPPORTS_EXTENDED_ATTRIBUTES",
+            0x00400000: "FILE_SUPPORTS_HARD_LINKS",
+            0x00200000: "FILE_SUPPORTS_TRANSACTIONS",
+            0x00100000: "FILE_SEQUENTIAL_WRITE_ONCE",
+            0x00080000: "FILE_READ_ONLY_VOLUME",
+            0x00040000: "FILE_NAMED_STREAMS",
+            0x00020000: "FILE_SUPPORTS_ENCRYPTION",
+            0x00010000: "FILE_SUPPORTS_OBJECT_IDS",
+            0x00008000: "FILE_VOLUME_IS_COMPRESSED",
+            0x00000100: "FILE_SUPPORTS_REMOTE_STORAGE",
+            0x00000080: "FILE_SUPPORTS_REPARSE_POINTS",
+            0x00000040: "FILE_SUPPORTS_SPARSE_FILES",
+            0x00000020: "FILE_VOLUME_QUOTAS",
+            0x00000010: "FILE_FILE_COMPRESSION",
+            0x00000008: "FILE_PERSISTENT_ACLS",
+            0x00000004: "FILE_UNICODE_ON_DISK",
+            0x00000002: "FILE_CASE_PRESERVED_NAMES",
+            0x00000001: "FILE_CASE_SENSITIVE_SEARCH",
+            0x04000000: "FILE_SUPPORT_INTEGRITY_STREAMS",
+            0x08000000: "FILE_SUPPORTS_BLOCK_REFCOUNTING",
+            0x10000000: "FILE_SUPPORTS_SPARSE_VDL",
+        }),
+        LEIntField("MaximumComponentNameLength", 255),
+        FieldLenField("FileSystemNameLength", None,
+                      length_of="FileSystemName", fmt="<I"),
+        StrLenFieldUtf16("FileSystemName", b"NTFS",
+                         length_from=lambda pkt: pkt.FileSystemNameLength),
+    ]
+
+# [MS-FSCC] 2.5.8 FileFsSizeInformation
+
+
+class FileFsSizeInformation(Packet):
+    fields_desc = [
+        LELongField("TotalAllocationUnits", 10485760),
+        LELongField("AvailableAllocationUnits", 1048576),
+        LEIntField("SectorsPerAllocationUnit", 8),
+        LEIntField("BytesPerSector", 512),
+    ]
+
+# [MS-FSCC] 2.5.9 FileFsVolumeInformation
+
+
+class FileFsVolumeInformation(Packet):
+    fields_desc = [
+        UTCTimeField("VolumeCreationTime", None, fmt="<Q",
+                     epoch=[1601, 1, 1, 0, 0, 0],
+                     custom_scaling=1e7),
+        LEIntField("VolumeSerialNumber", 0),
+        LEIntField("VolumeLabelLength", 0),
+        ByteField("SupportsObjects", 1),
+        ByteField("Reserved", 0),
+        StrNullFieldUtf16("VolumeLabel", b"C"),
     ]
 
 
@@ -362,6 +495,10 @@ class SMB2_Header(Packet):
             if self.Flags.SMB2_FLAGS_SERVER_TO_REDIR:
                 return SMB2_Tree_Connect_Response
             return SMB2_Tree_Connect_Request
+        elif self.Command == 0x0004:  # TREE disconnect
+            if self.Flags.SMB2_FLAGS_SERVER_TO_REDIR:
+                return SMB2_Tree_Disconnect_Response
+            return SMB2_Tree_Disconnect_Request
         elif self.Command == 0x0005:  # Create
             if self.Flags.SMB2_FLAGS_SERVER_TO_REDIR:
                 return SMB2_Create_Response
@@ -928,7 +1065,6 @@ SMB2_ACCESS_FLAGS = {
 
 class SMB2_Tree_Connect_Response(_SMB2_Payload):
     name = "SMB2 TREE_CONNECT Response"
-    OFFSET = 8 + 64
     fields_desc = [
         XLEShortField("StructureSize", 0x10),
         ByteEnumField("ShareType", 0, {0x01: "DISK",
@@ -970,6 +1106,42 @@ bind_top_down(
     Command=0x0003,
     Flags=1
 )
+
+# sect 2.2.11
+
+
+class SMB2_Tree_Disconnect_Request(_SMB2_Payload):
+    name = "SMB2 TREE_DISCONNECT Request"
+    fields_desc = [
+        XLEShortField("StructureSize", 0x4),
+        XLEShortField("Reserved", 0),
+    ]
+
+
+bind_top_down(
+    SMB2_Header,
+    SMB2_Tree_Disconnect_Request,
+    Command=0x0004
+)
+
+# sect 2.2.12
+
+
+class SMB2_Tree_Disconnect_Response(_SMB2_Payload):
+    name = "SMB2 TREE_DISCONNECT Response"
+    fields_desc = [
+        XLEShortField("StructureSize", 0x4),
+        XLEShortField("Reserved", 0),
+    ]
+
+
+bind_top_down(
+    SMB2_Header,
+    SMB2_Tree_Disconnect_Response,
+    Command=0x0004,
+    Flags=1
+)
+
 
 # sect 2.2.14.1
 
