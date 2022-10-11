@@ -128,21 +128,21 @@ s = EcuState(session=1)
 
 assert False == e._evaluate_response(s, UDS(b"\x27\x01"), None, **config)
 config = {"exit_if_service_not_supported": True}
-assert e._retry_pkt[s] == None
+assert not e._retry_pkt[s]
 assert True == e._evaluate_response(s, UDS(b"\x27\x01"), UDS(b"\x7f\x27\x11"), **config)
-assert e._retry_pkt[s] == None
+assert not e._retry_pkt[s]
 assert True == e._evaluate_response(s, UDS(b"\x27\x01"), UDS(b"\x7f\x27\x24"), **config)
 assert e._retry_pkt[s] == UDS(b"\x27\x01")
 assert False == e._evaluate_response(s, UDS(b"\x27\x02"), UDS(b"\x7f\x27\x24"), **config)
-assert e._retry_pkt[s] is None
+assert not e._retry_pkt[s]
 assert True == e._evaluate_response(s, UDS(b"\x27\x01"), UDS(b"\x7f\x27\x37"), **config)
 assert e._retry_pkt[s] == UDS(b"\x27\x01")
 assert False == e._evaluate_response(s, UDS(b"\x27\x01"), UDS(b"\x7f\x27\x37"), **config)
-assert e._retry_pkt[s] == None
+assert not e._retry_pkt[s]
 assert True == e._evaluate_response(s, UDS(b"\x27\x01"), UDS(b"\x67\x01ab"), **config)
-assert e._retry_pkt[s] == None
+assert not e._retry_pkt[s]
 assert False == e._evaluate_response(s, UDS(b"\x27\x01"), UDS(b"\x67\x02ab"), **config)
-assert e._retry_pkt[s] == None
+assert not e._retry_pkt[s]
 
 
 = Test UDS_SA_XOR_Enumerator stand alone mode
@@ -228,13 +228,13 @@ assert len(tc.results_without_response) < 10
 if tc.results_without_response:
     tc.show()
 
-assert len(tc.results_with_negative_response) == 17
-assert len(tc.results_with_positive_response) == 8
+assert len(tc.results_with_negative_response) == 20
+assert len(tc.results_with_positive_response) == 5
 assert len(tc.scanned_states) == 5
 
 result = tc.show(dump=True)
 
-assert "incorrectMessageLengthOrInvalidFormat received 17 times" in result
+assert "incorrectMessageLengthOrInvalidFormat received 20 times" in result
 
 ###################### UDS_ServiceEnumerator ###################
 tc = scanner.configuration.test_cases[2]
