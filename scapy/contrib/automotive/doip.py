@@ -8,12 +8,22 @@
 # scapy.contrib.description = Diagnostic over IP (DoIP) / ISO 13400
 # scapy.contrib.status = loads
 
-import struct
 import socket
-import time
 import ssl
+import struct
+import time
+from typing import (
+    Any,
+    Union,
+    Tuple,
+    Optional,
+    Dict,
+    Type,
+)
 
 from scapy.contrib.automotive import log_automotive
+from scapy.contrib.automotive.uds import UDS
+from scapy.data import MTU
 from scapy.fields import (
     ByteEnumField,
     ConditionalField,
@@ -27,19 +37,9 @@ from scapy.fields import (
     XShortField,
     XStrField,
 )
-from scapy.packet import Packet, bind_layers, bind_bottom_up
-from scapy.supersocket import StreamSocket, SSLStreamSocket
 from scapy.layers.inet import TCP, UDP
-from scapy.contrib.automotive.uds import UDS
-from scapy.data import MTU
-
-from typing import (
-    Any,
-    Union,
-    Tuple,
-    Optional,
-    Dict,
-)
+from scapy.packet import Packet, bind_layers, bind_bottom_up
+from scapy.supersocket import SSLStreamSocket
 
 
 # ISO 13400-2 sect 9.2
@@ -239,10 +239,7 @@ class DoIP(Packet):
 
     def hashret(self):
         # type: () -> bytes
-        if self.payload_type in [0x8001, 0x8002, 0x8003]:
-            return bytes(self)[:2] + struct.pack(
-                "H", self.target_address ^ self.source_address)
-        return bytes(self)[:2]
+        return bytes(self)[:3]
 
     def post_build(self, pkt, pay):
         # type: (bytes, bytes) -> bytes
@@ -257,15 +254,15 @@ class DoIP(Packet):
     def extract_padding(self, s):
         # type: (bytes) -> Tuple[bytes, Optional[bytes]]
         if self.payload_type == 0x8001:
-            return s[:self.payload_length - 4], None
+            return s[:self.payload_length - 4], s[self.payload_length - 4:]
         else:
-            return b"", None
+            return b"", s
 
     @classmethod
     def tcp_reassemble(cls, data, metadata, session):
         # type: (bytes, Dict[str, Any], Dict[str, Any]) -> Optional[Packet]
         length = struct.unpack("!I", data[4:8])[0] + 8
-        if len(data) == length:
+        if len(data) >= length:
             return DoIP(data)
         return None
 
@@ -280,7 +277,37 @@ bind_layers(TCP, DoIP, dport=13400)
 bind_layers(DoIP, UDS, payload_type=0x8001)
 
 
-class DoIPSocket(SSLStreamSocket):
+class DoIPSSLStreamSocket(SSLStreamSocket):
+    """Custom SSLStreamSocket for DoIP communication.
+    """
+
+    def __init__(self, sock, basecls=None):
+        # type: (socket.socket, Optional[Type[Packet]]) -> None
+        super(DoIPSSLStreamSocket, self).__init__(sock, basecls or DoIP)
+        self.buffer = b""
+
+    def recv(self, x=MTU, **kwargs):
+        # type: (Optional[int], **Any) -> Optional[Packet]
+        if len(self.buffer) < 8:
+            self.buffer += self.ins.recv(8)
+        if len(self.buffer) < 8:
+            return None
+        len_data = self.buffer[:8]
+
+        len_int = struct.unpack(">I", len_data[4:8])[0]
+        len_int += 8
+
+        self.buffer += self.ins.recv(len_int - len(self.buffer))
+        if len(self.buffer) < len_int:
+            return None
+        pktbuf = self.buffer[:len_int]
+        self.buffer = self.buffer[len_int:]
+
+        pkt = self.basecls(pktbuf, **kwargs)  # type: Packet
+        return pkt
+
+
+class DoIPSocket(DoIPSSLStreamSocket):
     """Socket for DoIP communication. This sockets automatically
     sends a routing activation request as soon as a TCP or TLS connection is
     established.
@@ -328,48 +355,29 @@ class DoIPSocket(SSLStreamSocket):
         self.target_address = target_address
         self.activation_type = activation_type
         self.reserved_oem = reserved_oem
-        self.buffer = b""
         self.force_tls = force_tls
         self.context = context
         try:
-            self._init_socket(socket.AF_INET)
+            self._init_socket()
         except Exception:
             self.close()
             raise
 
-    def recv(self, x=MTU, **kwargs):
-        # type: (Optional[int], **Any) -> Optional[Packet]
-        if len(self.buffer) < 8:
-            self.buffer += self.ins.recv(8)
-        if len(self.buffer) < 8:
-            return None
-        len_data = self.buffer[:8]
-
-        len_int = struct.unpack(">I", len_data[4:8])[0]
-        len_int += 8
-
-        self.buffer += self.ins.recv(len_int - len(self.buffer))
-        if len(self.buffer) < len_int:
-            return None
-        pktbuf = self.buffer[:len_int]
-        self.buffer = self.buffer[len_int:]
-
-        pkt = self.basecls(pktbuf, **kwargs)  # type: Packet
-        return pkt
-
-    def _init_socket(self, sock_family=socket.AF_INET):
-        # type: (int) -> None
+    def _init_socket(self):
+        # type: () -> None
         connected = False
+        addrinfo = socket.getaddrinfo(self.ip, self.port, proto=socket.IPPROTO_TCP)
+        sock_family = addrinfo[0][0]
+
         s = socket.socket(sock_family, socket.SOCK_STREAM)
         s.settimeout(5)
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
         if not self.force_tls:
-            addrinfo = socket.getaddrinfo(self.ip, self.port, proto=socket.IPPROTO_TCP)
             s.connect(addrinfo[0][-1])
             connected = True
-            SSLStreamSocket.__init__(self, s, DoIP)
+            DoIPSSLStreamSocket.__init__(self, s)
 
             if not self.activate_routing:
                 return
@@ -398,7 +406,7 @@ class DoIPSocket(SSLStreamSocket):
             addrinfo = socket.getaddrinfo(
                 self.ip, self.tls_port, proto=socket.IPPROTO_TCP)
             ss.connect(addrinfo[0][-1])
-            SSLStreamSocket.__init__(self, ss, DoIP)
+            DoIPSSLStreamSocket.__init__(self, ss)
 
             if not self.activate_routing:
                 return
@@ -441,66 +449,7 @@ class DoIPSocket(SSLStreamSocket):
             return -1
 
 
-class DoIPSocket6(DoIPSocket):
-    """Socket for DoIP communication. This sockets automatically
-    sends a routing activation request as soon as a TCP or TLS connection is
-    established.
-
-    :param ip: IPv6 address of destination
-    :param port: destination port, usually 13400
-    :param tls_port: destination port for TLS connection, usually 3496
-    :param activate_routing: If true, routing activation request is
-                             automatically sent
-    :param source_address: DoIP source address
-    :param target_address: DoIP target address, this is automatically
-                           determined if routing activation request is sent
-    :param activation_type: This allows to set a different activation type for
-                            the routing activation request
-    :param reserved_oem: Optional parameter to set value for reserved_oem field
-                         of routing activation request
-    :param force_tls: Skip establishing of a TCP connection and directly try to
-                      connect via SSL/TLS
-    :param context: Optional ssl.SSLContext object for initialization of ssl socket
-                    connections.
-
-    Example:
-        >>> socket = DoIPSocket6("2001:16b8:3f0e:2f00:21a:37ff:febf:edb9")
-        >>> socket_link_local = DoIPSocket6("fe80::30e8:80ff:fe07:6d43%eth1")
-        >>> pkt = DoIP(payload_type=0x8001, source_address=0xe80, target_address=0x1000) / UDS() / UDS_RDBI(identifiers=[0x1000])
-        >>> resp = socket.sr1(pkt, timeout=1)
-    """  # noqa: E501
-
-    def __init__(self,
-                 ip='::1',  # type: str
-                 port=13400,  # type: int
-                 tls_port=3496,  # type: int
-                 activate_routing=True,  # type: bool
-                 source_address=0xe80,  # type: int
-                 target_address=0,  # type: int
-                 activation_type=0,  # type: int
-                 reserved_oem=b"",  # type: bytes
-                 force_tls=False,  # type: bool
-                 context=None  # type: Optional[ssl.SSLContext]
-                 ):  # type: (...) -> None
-        self.ip = ip
-        self.port = port
-        self.tls_port = tls_port
-        self.activate_routing = activate_routing
-        self.source_address = source_address
-        self.target_address = target_address
-        self.activation_type = activation_type
-        self.reserved_oem = reserved_oem
-        self.buffer = b""
-        self.force_tls = force_tls
-        self.context = context
-        try:
-            self._init_socket(socket.AF_INET6)
-        except Exception:
-            self.close()
-            raise
-
-
-class _UDS_DoIPSocketBase(StreamSocket):
+class UDS_DoIPSocket(DoIPSocket):
     """
     Application-Layer socket for DoIP endpoints. This socket takes care about
     the encapsulation of UDS packets into DoIP packets.
@@ -515,8 +464,8 @@ class _UDS_DoIPSocketBase(StreamSocket):
         # type: (Union[Packet, bytes]) -> int
         if isinstance(x, UDS):
             pkt = DoIP(payload_type=0x8001,
-                       source_address=self.source_address,  # type: ignore
-                       target_address=self.target_address  # type: ignore
+                       source_address=self.source_address,
+                       target_address=self.target_address
                        ) / x
         else:
             pkt = x
@@ -536,28 +485,4 @@ class _UDS_DoIPSocketBase(StreamSocket):
         else:
             return pkt
 
-
-class UDS_DoIPSocket(_UDS_DoIPSocketBase, DoIPSocket):
-    """
-    Application-Layer socket for DoIP endpoints. This socket takes care about
-    the encapsulation of UDS packets into DoIP packets.
-
-    Example:
-        >>> socket = UDS_DoIPSocket("169.254.117.238")
-        >>> pkt = UDS() / UDS_RDBI(identifiers=[0x1000])
-        >>> resp = socket.sr1(pkt, timeout=1)
-    """
-    pass
-
-
-class UDS_DoIPSocket6(_UDS_DoIPSocketBase, DoIPSocket6):
-    """
-    Application-Layer socket for DoIP endpoints. This socket takes care about
-    the encapsulation of UDS packets into DoIP packets.
-
-    Example:
-        >>> socket = UDS_DoIPSocket6("2001:16b8:3f0e:2f00:21a:37ff:febf:edb9")
-        >>> pkt = UDS() / UDS_RDBI(identifiers=[0x1000])
-        >>> resp = socket.sr1(pkt, timeout=1)
-    """
     pass
