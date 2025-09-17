@@ -92,6 +92,8 @@ SMB_DIALECTS = {
 # SMB2 sect 3.3.5.15 + [MS-ERREF]
 STATUS_ERREF = {
     0x00000000: "STATUS_SUCCESS",
+    0x00000002: "ERROR_FILE_NOT_FOUND",
+    0x00000005: "ERROR_ACCESS_DENIED",
     0x00000103: "STATUS_PENDING",
     0x0000010B: "STATUS_NOTIFY_CLEANUP",
     0x0000010C: "STATUS_NOTIFY_ENUM_DIR",
@@ -101,6 +103,8 @@ STATUS_ERREF = {
     0x80000005: "STATUS_BUFFER_OVERFLOW",
     0x80000006: "STATUS_NO_MORE_FILES",
     0x8000002D: "STATUS_STOPPED_ON_SYMLINK",
+    0x80070005: "E_ACCESSDENIED",
+    0x8007000E: "E_OUTOFMEMORY",
     0x80090308: "SEC_E_INVALID_TOKEN",
     0x8009030C: "SEC_E_LOGON_DENIED",
     0x8009030F: "SEC_E_MESSAGE_ALTERED",
@@ -1501,8 +1505,14 @@ class WINNT_ACL(Packet):
     fields_desc = [
         ByteField("AclRevision", 2),
         ByteField("Sbz1", 0x00),
+        # Total size including header:
+        # AclRevision(1) + Sbz1(1) + AclSize(2) + AceCount(2) + Sbz2(2)
         FieldLenField(
-            "AclSize", None, length_of="Aces", adjust=lambda _, x: x + 14, fmt="<H"
+            "AclSize",
+            None,
+            length_of="Aces",
+            adjust=lambda _, x: x + 8,
+            fmt="<H",
         ),
         FieldLenField("AceCount", None, count_of="Aces", fmt="<H"),
         ShortField("Sbz2", 0),
