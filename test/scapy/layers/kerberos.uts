@@ -215,7 +215,7 @@ assert [type(x) for x in pkt.Payloads] == [
     UPN_DNS_INFO,
     NDRSerialization1Header,
     PAC_ATTRIBUTES_INFO,
-    PAC_REQUESTOR,
+    PAC_REQUESTOR_SID,
     PAC_SIGNATURE_DATA,
     PAC_SIGNATURE_DATA,
 ]
@@ -226,10 +226,10 @@ assert pkt.Payloads[2].DnsDomainName == 'DOM1.LOCAL'
 assert pkt.Payloads[2].SamName == 'SRV$'
 assert pkt.Payloads[2].Sid.summary() == 'S-1-5-21-826288890-480667314-1550869521-1104'
 
-assert pkt.Payloads[3].value.Claims.ClaimsSet.value.value[0].value.ClaimsArrays.value.value[0].usClaimsSourceType == 1
-claimentry = pkt.Payloads[3].value.Claims.ClaimsSet.value.value[0].value.ClaimsArrays.value.value[0].ClaimEntries.value.value[0]
-assert claimentry.Id.value.value[0].value == b'ad://ext/AuthenticationSilo'
-assert claimentry.Values.value.StringValues.value.value[0].value.value[0].value == b'T0-silo'
+assert pkt.Payloads[3].valueof("Claims.ClaimsSet.ClaimsArrays")[0].usClaimsSourceType == 1
+claimentry = pkt.Payloads[3].valueof("Claims.ClaimsSet.ClaimsArrays")[0].valueof("ClaimEntries")[0]
+assert claimentry.valueof("Id") == b'ad://ext/AuthenticationSilo'
+assert claimentry.valueof("Values.StringValues")[0] == b"T0-silo"
 
 assert pkt.Payloads[4].Flags[0].PAC_WAS_REQUESTED
 
@@ -252,9 +252,9 @@ pkt = AuthorizationData(data)
 assert isinstance(pkt.seq[0].adData.Payloads[0], NDRSerialization1Header)
 k = pkt.seq[0].adData.Payloads[0].value
 assert isinstance(k, KERB_VALIDATION_INFO)
-assert k.EffectiveName.Buffer.value.value[0].value == b'lzhu'
-assert k.LogonDomainName.Buffer.value.value[0].value == b"NTDEV"
-assert "S%s" % "-".join(str(x) for x in k.LogonDomainId.value.SubAuthority) == 'S21-397955417-626881126-188441444'
+assert k.valueof("EffectiveName.Buffer") == b'lzhu'
+assert k.valueof("LogonDomainName.Buffer") == b"NTDEV"
+assert "S-1-5-%s" % "-".join(str(x) for x in k.LogonDomainId.value.SubAuthority) == 'S-1-5-21-397955417-626881126-188441444'
 assert len(k.ExtraSids.value.value) == 13
 assert [x.RelativeId for x in k.GroupIds.value.value] == [3392609, 2999049, 3322974, 513, 2931095, 3338539, 3354830, 3026599, 3338538, 2931096, 3392610, 3342740, 3392630, 3014318, 2937394, 3278870, 3038018, 3322975, 3513546, 2966661, 3338434, 3271401, 3051245, 3271606, 3026603, 3018354]
 
@@ -840,6 +840,7 @@ claimSet = CLAIMS_SET(
     usReservedType=0,
     ulReservedFieldSize=0,
     ReservedField=None,
+    ndr64=False,
 )
 
 = MSPAC - Check that Pointers, Arrays, etc. were inferred
@@ -894,7 +895,7 @@ with open(TICKETER_TEMPFILE, "wb") as fd:
 = Ticketer++ - Create and load Ticketer object
 
 t = Ticketer()
-t.open_file(TICKETER_TEMPFILE)
+t.open_ccache(TICKETER_TEMPFILE)
 
 = Ticketer++ - Get ticket 0, change it, resign it and set it back
 
@@ -911,7 +912,7 @@ with mock.patch('scapy.libs.rfc3961.os.urandom', side_effect=fake_random):
     tkt.renewTill.val = '20220930172927Z'
     t.update_ticket(0, tkt, resign=True, hash=KRBTGT, kdc_hash=KRBTGT)
 
-= Ticketer++ - Call show()
+= Ticketer++ - Call show() with ccache
 
 with ContextManagerCaptureOutput() as cmco:
     t.show(utc=True)
@@ -920,7 +921,7 @@ with ContextManagerCaptureOutput() as cmco:
 print(outp)
 
 assert outp == """
-Tickets:
+CCache tickets:
 0. Administrator@DOMAIN.LOCAL -> krbtgt/DOMAIN.LOCAL@DOMAIN.LOCAL
    canonicalize+pre-authent+initial+renewable+proxiable+forwardable
 Start time         End time           Renew until        Auth time        
@@ -929,7 +930,7 @@ Start time         End time           Renew until        Auth time
 
 = Ticketer++ - Save to disk
 
-t.save()
+t.save_ccache()
 
 = Ticketer++ - Read and check written ccache
 
@@ -954,6 +955,64 @@ hexdiff(tkt, TKT)
 assert bytes(tkt) == bytes(TKT)
 assert upn == 'DC1$@DOMAIN.LOCAL'
 assert spn == 'krbtgt/DOMAIN.LOCAL@DOMAIN.LOCAL'
+
+= Ticketer++ - Create keytab
+
+t = Ticketer()
+t.add_cred("host/dc.domain.local", password="Scapy1", salt=b"salt")
+
+assert t.get_cred("host/dc.domain.local").key == bytes.fromhex("811f44006ad73972ffec42cc89ce6e79749e6effd8db4db5fb0f38c0f3fa6f4f")
+
+= Ticketer++ - Get SPN ssp
+
+ssp = t.ssp("host/dc.domain.local")
+
+= Ticketer++ - Load keytab
+
+from scapy.utils import get_temp_file
+TICKETER_TEMPFILE = get_temp_file()
+
+KEYTAB_DATA = bytes.fromhex("0502000000440001000c646f6d61696e2e6c6f63616c000d41646d696e6973747261746f720000000067fd666f0100110010de93a48926de94c2feff6abd8e0e763b00000000000000540001000c646f6d61696e2e6c6f63616c000d41646d696e6973747261746f720000000067fd666f0200120020dcd8ce2bb77dfb6cab0e1afb69a9a5713a8818ed502c3625edc7772e6b4c442a00000000000000440001000c646f6d61696e2e6c6f63616c000d41646d696e6973747261746f720000000067fd666f03001700102b576acbe6bcfda7294d6bd18041b8fe00000000")
+
+with open(TICKETER_TEMPFILE, "wb") as fd:
+    fd.write(KEYTAB_DATA)
+
+t = Ticketer()
+t.open_keytab(TICKETER_TEMPFILE)
+
+assert t.get_cred("Administrator@domain.local", EncryptionType.RC4_HMAC).key == b'+Wj\xcb\xe6\xbc\xfd\xa7)Mk\xd1\x80A\xb8\xfe'
+assert t.get_cred("Administrator@domain.local", EncryptionType.AES128_CTS_HMAC_SHA1_96).key == b'\xde\x93\xa4\x89&\xde\x94\xc2\xfe\xffj\xbd\x8e\x0ev;'
+
+= Ticketer++ - Call show() with keytab
+
+with ContextManagerCaptureOutput() as cmco:
+    t.show(utc=True)
+    outp = cmco.get_output().strip()
+
+# crop first line
+outp = outp.split("\n", 1)[1]
+
+print(repr(outp))
+
+assert outp == """
+Principal                   Timestamp          KVNO  Keytype                
+Administrator@domain.local  14/04/25 19:47:59  0     AES128-CTS-HMAC-SHA1-96
+Administrator@domain.local  14/04/25 19:47:59  0     AES256-CTS-HMAC-SHA1-96
+Administrator@domain.local  14/04/25 19:47:59  0     RC4-HMAC               
+
+No tickets in CCache.
+""".strip()
+
+= Ticketer++ - Get UPN ssp
+
+ssp = t.ssp("Administrator@domain.local")
+
+= Ticketer++ - Save keytab
+
+from scapy.utils import get_temp_file
+TICKETER_TEMPFILE = get_temp_file()
+
+t.save_keytab(TICKETER_TEMPFILE)
 
 + Crypto tests
 

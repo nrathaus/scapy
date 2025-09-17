@@ -9,20 +9,22 @@ Main module for interactive startup.
 
 
 import builtins
-import pathlib
-import sys
-import os
-import getopt
 import code
-import gzip
+import getopt
 import glob
+import gzip
 import importlib
 import io
-from itertools import zip_longest
 import logging
+import os
+import pathlib
 import pickle
+import shutil
+import sys
 import types
 import warnings
+
+from itertools import zip_longest
 from random import choice
 
 # Never add any global import, in main.py, that would trigger a
@@ -68,17 +70,18 @@ QUOTES = [
 def _probe_xdg_folder(var, default, *cf):
     # type: (str, str, *str) -> Optional[pathlib.Path]
     path = pathlib.Path(os.environ.get(var, default))
-    if not path.exists():
-        # ~ folder doesn't exist. Create according to spec
-        # https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html
-        # "If, when attempting to write a file, the destination directory is
-        # non-existent an attempt should be made to create it with permission 0700."
-        try:
+    try:
+        if not path.exists():
+            # ~ folder doesn't exist. Create according to spec
+            # https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html
+            # "If, when attempting to write a file, the destination directory is
+            # non-existent an attempt should be made to create it with permission 0700."
             path.mkdir(mode=0o700, exist_ok=True)
-        except Exception:
-            # There is a gazillion ways this can fail. Most notably,
-            # a read-only fs.
-            return None
+    except Exception:
+        # There is a gazillion ways this can fail. Most notably, a read-only fs or no
+        # permissions to even check for folder to exist (e.x. privileges were dropped
+        # before scapy was started).
+        return None
     return path.joinpath(*cf).resolve()
 
 
@@ -98,6 +101,35 @@ def _probe_cache_folder(*cf):
         os.path.join(os.path.expanduser("~"), ".cache"),
         *cf
     )
+
+
+def _probe_share_folder(*cf):
+    # type: (str) -> Optional[pathlib.Path]
+    return _probe_xdg_folder(
+        "XDG_DATA_HOME",
+        os.path.join(os.path.expanduser("~"), ".local", "share"),
+        *cf
+    )
+
+
+def _check_perms(file: Union[pathlib.Path, str]) -> None:
+    """
+    Checks that the permissions of a file are properly user-specific, if sudo is used.
+    """
+    if (
+        not WINDOWS and
+        "SUDO_UID" in os.environ and
+        "SUDO_GID" in os.environ
+    ):
+        # Was started with sudo. Still, chown to the user.
+        try:
+            os.chown(
+                file,
+                int(os.environ["SUDO_UID"]),
+                int(os.environ["SUDO_GID"]),
+            )
+        except Exception:
+            pass
 
 
 def _read_config_file(cf, _globals=globals(), _locals=locals(),
@@ -136,36 +168,12 @@ def _read_config_file(cf, _globals=globals(), _locals=locals(),
         try:
             if not cf_path.parent.exists():
                 cf_path.parent.mkdir(parents=True, exist_ok=True)
-                if (
-                    not WINDOWS and
-                    "SUDO_UID" in os.environ and
-                    "SUDO_GID" in os.environ
-                ):
-                    # Was started with sudo. Still, chown to the user.
-                    try:
-                        os.chown(
-                            cf_path.parent,
-                            int(os.environ["SUDO_UID"]),
-                            int(os.environ["SUDO_GID"]),
-                        )
-                    except Exception:
-                        pass
+                _check_perms(cf_path.parent)
+
             with cf_path.open("w") as fd:
                 fd.write(default)
-            if (
-                not WINDOWS and
-                "SUDO_UID" in os.environ and
-                "SUDO_GID" in os.environ
-            ):
-                # Was started with sudo. Still, chown to the user.
-                try:
-                    os.chown(
-                        cf_path,
-                        int(os.environ["SUDO_UID"]),
-                        int(os.environ["SUDO_GID"]),
-                    )
-                except Exception:
-                    pass
+
+            _check_perms(cf_path)
             log_loading.debug("Config file [%s] created with default.", cf)
         except OSError:
             log_loading.warning("Config file [%s] could not be created.", cf,
@@ -206,6 +214,22 @@ else:
     DEFAULT_PRESTART_FILE = None
     DEFAULT_STARTUP_FILE = None
 
+# https://github.com/scop/bash-completion/blob/main/README.md#faq
+if "BASH_COMPLETION_USER_DIR" in os.environ:
+    BASH_COMPLETION_USER_DIR: Optional[pathlib.Path] = pathlib.Path(
+        os.environ["BASH_COMPLETION_USER_DIR"]
+    )
+else:
+    BASH_COMPLETION_USER_DIR = _probe_share_folder("bash-completion")
+
+if BASH_COMPLETION_USER_DIR:
+    BASH_COMPLETION_FOLDER: Optional[pathlib.Path] = (
+        BASH_COMPLETION_USER_DIR / "completions"
+    )
+else:
+    BASH_COMPLETION_FOLDER = None
+
+
 # Default scapy prestart.py config file
 
 DEFAULT_PRESTART = """
@@ -221,6 +245,12 @@ conf.color_theme = DefaultTheme()
 
 # disable INFO: tags related to dependencies missing
 # log_loading.setLevel(logging.WARNING)
+
+# extensions to load by default
+conf.load_extensions = [
+    # "scapy-red",
+    # "scapy-rpc",
+]
 
 # force-use libpcap
 # conf.use_pcap = True
@@ -238,6 +268,31 @@ def _usage():
         "\t-P: do not read pre-startup file\n"
     )
     sys.exit(0)
+
+
+def _add_bash_autocompletion(fname: str, script: pathlib.Path) -> None:
+    """
+    Util function used most notably in setup.py to add a bash autocompletion script.
+    """
+    try:
+        if BASH_COMPLETION_FOLDER is None:
+            raise OSError()
+
+        # If already defined, exit.
+        dest = BASH_COMPLETION_FOLDER / fname
+        if dest.exists():
+            return
+
+        # Check that bash autocompletion folder exists
+        if not BASH_COMPLETION_FOLDER.exists():
+            BASH_COMPLETION_FOLDER.mkdir(parents=True, exist_ok=True)
+            _check_perms(BASH_COMPLETION_FOLDER)
+
+        # Copy file
+        shutil.copy(script, BASH_COMPLETION_FOLDER)
+    except OSError:
+        log_loading.warning("Bash autocompletion script could not be copied.",
+                            exc_info=True)
 
 
 ######################
@@ -733,8 +788,12 @@ def get_fancy_banner(mini: Optional[bool] = None) -> str:
     )
 
 
-def interact(mydict=None, argv=None, mybanner=None, loglevel=logging.INFO):
-    # type: (Optional[Any], Optional[Any], Optional[Any], int) -> None
+def interact(mydict=None,
+             argv=None,
+             mybanner=None,
+             mybanneronly=False,
+             loglevel=logging.INFO):
+    # type: (Optional[Any], Optional[Any], Optional[Any], bool, int) -> None
     """
     Starts Scapy's console.
     """
@@ -807,13 +866,22 @@ def interact(mydict=None, argv=None, mybanner=None, loglevel=logging.INFO):
             _locals=SESSION
         )
 
+    # Load extensions (Python 3.8 Only)
+    if sys.version_info >= (3, 8):
+        conf.exts.loadall()
+
     if conf.fancy_banner:
         banner_text = get_fancy_banner()
     else:
         banner_text = "Welcome to Scapy (%s)" % conf.version
-    if mybanner is not None:
-        banner_text += "\n"
-        banner_text += mybanner
+
+    # Make sure the history file has proper permissions
+    try:
+        if not pathlib.Path(conf.histfile).exists():
+            pathlib.Path(conf.histfile).touch()
+            _check_perms(conf.histfile)
+    except OSError:
+        pass
 
     # Configure interactive terminal
 
@@ -932,6 +1000,12 @@ def interact(mydict=None, argv=None, mybanner=None, loglevel=logging.INFO):
         import bpython
         banner = banner_text + " using bpython %s" % bpython.__version__
 
+    if mybanner is not None:
+        if mybanneronly:
+            banner = ""
+        banner += "\n"
+        banner += mybanner
+
     # Start IPython or ptipython
     if conf.interactive_shell in ["ipython", "ptipython"]:
         banner += "\n"
@@ -980,6 +1054,8 @@ def interact(mydict=None, argv=None, mybanner=None, loglevel=logging.INFO):
                 cfg.InteractiveShellEmbed.term_title = False
             cfg.HistoryAccessor.hist_file = conf.histfile
             cfg.InteractiveShell.banner1 = banner
+            if conf.verb < 2:
+                cfg.InteractiveShellEmbed.enable_tip = False
             # configuration can thus be specified here.
             _kwargs = {}
             if conf.interactive_shell == "ptipython":
