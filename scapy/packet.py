@@ -811,6 +811,9 @@ class Packet(
                     continue
 
                 for idx, field_value in enumerate(field):
+                    if not isinstance(field_value, Packet):
+                        continue
+
                     for field_in_list_name in field_value.default_fields.keys():
                         field_in_list = field_value.default_fields[field_in_list_name]
                         field_in_list_class_name = type(field_in_list).__name__
