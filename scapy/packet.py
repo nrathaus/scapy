@@ -942,6 +942,17 @@ class Packet(
 
         print(f"Now fuzzing: {', '.join(fields_fuzzed)}")
 
+    def return_active_state(self, states):
+        """
+        Return the state that is active or 'None'
+        """
+
+        for (_, state) in enumerate(states):
+            if state['active']:
+                return state
+        
+        return None
+
 
     def forward(self, states):
         """
@@ -1798,12 +1809,23 @@ values.
         """Deprecated. Use show() method."""
         self.show(*args, **kargs)
 
+    def break_highlight_field(self, highlight_field):
+        # type(str) -> Tuple[str, str]:
+        if ":" not in highlight_field:
+            msg = "This is unexpected structure: {highlight_field}"
+            raise ValueError(msg)
+
+        values = highlight_field.split(":")
+        return [values[0], values[1]]
+
+
     def _show_or_dump(self,
                       dump=False,  # type: bool
                       indent=3,  # type: int
                       lvl="",  # type: str
                       label_lvl="",  # type: str
-                      first_call=True  # type: bool
+                      first_call=True,  # type: bool
+                      highlight_fields=[] # type: List[str]
                       ):
         # type: (...) -> Optional[str]
         """
@@ -1847,8 +1869,19 @@ values.
             else:
                 ncol = ct.field_name
                 vcol = ct.field_value
+
             pad = max(0, 10 - len(f.name)) * " "
             fvalue = self.getfieldval(f.name)
+
+            # Check if we should highlight the field as fuzzed
+            highlight_value = False
+            for highlight_field in highlight_fields:
+                (layer_name, field_name) = self.break_highlight_field(highlight_field)
+                if layer_name == ct.layer_name(self.name):
+                    if field_name == f.name:
+                        highlight_value = True
+                        break
+
             if isinstance(fvalue, Packet) or (f.islist and f.holds_packets and isinstance(fvalue, list)):  # noqa: E501
                 s += "%s  %s%s%s%s\n" % (label_lvl + lvl,
                                          ct.punct("\\"),
@@ -1872,6 +1905,8 @@ values.
                                                                   len(lvl) +
                                                                   len(f.name) +
                                                                   4))
+                if highlight_value:
+                    reprval += " (fuzzed)"
                 s += "%s%s\n" % (begn, vcol(reprval))
         if self.payload:
             s += self.payload._show_or_dump(  # type: ignore
@@ -1879,7 +1914,8 @@ values.
                 indent=indent,
                 lvl=lvl + (" " * indent * self.show_indent),
                 label_lvl=label_lvl,
-                first_call=False
+                first_call=False,
+                highlight_fields=highlight_fields
             )
 
         if first_call and not dump:
@@ -1888,8 +1924,8 @@ values.
         else:
             return s
 
-    def show(self, dump=False, indent=3, lvl="", label_lvl=""):
-        # type: (bool, int, str, str) -> Optional[Any]
+    def show(self, dump=False, indent=3, lvl="", label_lvl="", highlight_fields=[]):
+        # type: (bool, int, str, str, List[str]) -> Optional[Any]
         """
         Prints or returns (when "dump" is true) a hierarchical view of the
         packet.
@@ -1900,10 +1936,10 @@ values.
         :param str label_lvl: additional information about the layer fields
         :return: return a hierarchical view if dump, else print it
         """
-        return self._show_or_dump(dump, indent, lvl, label_lvl)
+        return self._show_or_dump(dump, indent, lvl, label_lvl, True, highlight_fields)
 
-    def show2(self, dump=False, indent=3, lvl="", label_lvl=""):
-        # type: (bool, int, str, str) -> Optional[Any]
+    def show2(self, dump=False, indent=3, lvl="", label_lvl="", highlight_fields=[]):
+        # type: (bool, int, str, str, List[str]) -> Optional[Any]
         """
         Prints or returns (when "dump" is true) a hierarchical view of an
         assembled version of the packet, so that automatic fields are
@@ -1915,7 +1951,7 @@ values.
         :param str label_lvl: additional information about the layer fields
         :return: return a hierarchical view if dump, else print it
         """
-        return self.__class__(raw(self)).show(dump, indent, lvl, label_lvl)
+        return self.__class__(raw(self)).show(dump, indent, lvl, label_lvl, highlight_fields)
 
     def sprintf(self, fmt, relax=1):
         # type: (str, int) -> str
