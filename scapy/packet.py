@@ -968,6 +968,7 @@ class Packet(
 
         # Find the first state that has 'done' False
         state_fuzzed = None
+        state = None
         for (_, state) in enumerate(states):
             if not state['done']:
                 state_fuzzed = state
@@ -1027,11 +1028,12 @@ class Packet(
 
         # Find the first field that is not done and move it forward
         found_a_fuzzable_field = False
+        next_field = None
         for (field_idx, field) in enumerate(state_fuzzed['fields']):
             if not field['done']:
                 (packet_holder, field_fuzzed) = self.locate_field(self, field['name'])
                 if field_fuzzed.max == field_fuzzed.min and field_fuzzed.max == 0:
-                    print(f"'{field['name']}' max == 0")
+                    print(f"Why is '{field['name']}' max == 0? this is not going to do anything")
 
                 if "state_pos" not in dir(field_fuzzed):
                     # Make sure next_field exists, as it might be the first element
@@ -1047,7 +1049,20 @@ class Packet(
                 else:
                     field_fuzzed.state_pos += 1
 
-                # If we recached max for this field, try the next one
+                # Put the new value (fuzzed) in the 'fields' so that ".commmand()" will display it
+                field_split = field['name'].split(":")
+                field_name = None
+                if len(field_split) > 1:
+                    field_name = field_split[1]
+
+                if field_name is not None:
+                    # If the field_name exists already and is a list (i.e. it is a list from 'init', keep the structure)
+                    if field_name in packet_holder.fields and isinstance(packet_holder.fields[field_name], list):
+                        packet_holder.fields[field_name] = [field_fuzzed._fix()]
+                    else:
+                        packet_holder.fields[field_name] = field_fuzzed._fix()
+
+                # If we reached max for this field, try the next one
                 if field_fuzzed.state_pos > field_fuzzed.max:
                     # Reset the position back to default
                     if type(field_fuzzed.default).__name__ in ['str', 'bytes', 'tuple']:
@@ -1056,6 +1071,12 @@ class Packet(
                         raise ValueError("field_fuzzed.default is not int")
                     else:
                         field_fuzzed.state_pos = field_fuzzed.default
+
+                    if field_name is not None:
+                        if field_name in packet_holder.fields and isinstance(packet_holder.fields[field_name], list):
+                            packet_holder.fields[field_name] = []
+                        else:
+                            del packet_holder.fields[field_name]
 
                     # Breaks send, shows 'int' error
                     # # Make the 'fields' no longer list this value as non-default
@@ -1126,7 +1147,7 @@ class Packet(
 
                     break
 
-        if not found_a_fuzzable_field:
+        if not found_a_fuzzable_field and state is not None:
             # We reached the end...
             state['done'] = True
             state['active'] = False
@@ -1814,7 +1835,7 @@ values.
         if ":" not in highlight_field:
             msg = "This is unexpected structure: {highlight_field}"
             raise ValueError(msg)
-
+        
         values = highlight_field.split(":")
         return [values[0], values[1]]
 
