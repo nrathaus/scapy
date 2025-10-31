@@ -1072,8 +1072,8 @@ class Packet(
                     else:
                         field_fuzzed.state_pos = field_fuzzed.default
 
-                    if field_name is not None:
-                        if field_name in packet_holder.fields and isinstance(packet_holder.fields[field_name], list):
+                    if field_name is not None and field_name in packet_holder.fields:
+                        if isinstance(packet_holder.fields[field_name], list):
                             packet_holder.fields[field_name] = []
                         else:
                             del packet_holder.fields[field_name]
