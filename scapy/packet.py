@@ -1049,19 +1049,11 @@ class Packet(
                 else:
                     field_fuzzed.state_pos += 1
 
-                # Put the new value (fuzzed) in the 'fields' so that ".commmand()" will display it
                 field_split = field['name'].split(":")
                 field_name = None
                 if len(field_split) > 1:
                     field_name = field_split[1]
-
-                if field_name is not None:
-                    # If the field_name exists already and is a list (i.e. it is a list from 'init', keep the structure)
-                    if field_name in packet_holder.fields and isinstance(packet_holder.fields[field_name], list):
-                        packet_holder.fields[field_name] = [field_fuzzed._fix()]
-                    else:
-                        packet_holder.fields[field_name] = field_fuzzed._fix()
-
+                
                 # If we reached max for this field, try the next one
                 if field_fuzzed.state_pos > field_fuzzed.max:
                     # Reset the position back to default
@@ -1139,6 +1131,14 @@ class Packet(
                         are_we_last = (curr_pos + 1) == len(state_fuzzed['fields'])
 
                 else:
+                    # Put the new value (fuzzed) in the 'fields' so that ".commmand()" will display it
+                    if field_name is not None:
+                        # If the field_name exists already and is a list (i.e. it is a list from 'init', keep the structure)
+                        if field_name in packet_holder.fields and isinstance(packet_holder.fields[field_name], list):
+                            packet_holder.fields[field_name] = [field_fuzzed._fix()]
+                        else:
+                            packet_holder.fields[field_name] = field_fuzzed._fix()
+
                     field['combinations'] += 1
                     field['active'] = True
                     state_fuzzed['combinations'] += 1
