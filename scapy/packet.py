@@ -1152,6 +1152,8 @@ class Packet(
                                     packet_holder.fields[field_name] = [field_fuzzed._fix()]
                             else:
                                 packet_holder.fields[field_name] = field_fuzzed._fix()
+                        else:
+                            packet_holder.fields[field_name] = field_fuzzed._fix()
 
                     field['combinations'] += 1
                     field['active'] = True
