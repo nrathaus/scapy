@@ -1066,7 +1066,13 @@ class Packet(
 
                     if field_name is not None and field_name in packet_holder.fields:
                         if isinstance(packet_holder.fields[field_name], list):
-                            packet_holder.fields[field_name] = []
+                            # Make sure that the first item is not 'obj'
+                            if len(packet_holder.fields[field_name]) > 0:
+                                if isinstance(packet_holder.fields[field_name][0], Packet):
+                                    # We don't touch it
+                                    pass
+                                else:
+                                    packet_holder.fields[field_name] = []
                         else:
                             del packet_holder.fields[field_name]
 
@@ -1134,10 +1140,18 @@ class Packet(
                     # Put the new value (fuzzed) in the 'fields' so that ".commmand()" will display it
                     if field_name is not None:
                         # If the field_name exists already and is a list (i.e. it is a list from 'init', keep the structure)
-                        if field_name in packet_holder.fields and isinstance(packet_holder.fields[field_name], list):
-                            packet_holder.fields[field_name] = [field_fuzzed._fix()]
-                        else:
-                            packet_holder.fields[field_name] = field_fuzzed._fix()
+                        if field_name in packet_holder.fields:
+                            if isinstance(packet_holder.fields[field_name], list):
+                                if len(packet_holder.fields[field_name]) > 0:
+                                    if isinstance(packet_holder.fields[field_name][0], Packet):
+                                        # We don't touch it
+                                        pass
+                                    else:
+                                        packet_holder.fields[field_name] = [field_fuzzed._fix()]
+                                else:
+                                    packet_holder.fields[field_name] = [field_fuzzed._fix()]
+                            else:
+                                packet_holder.fields[field_name] = field_fuzzed._fix()
 
                     field['combinations'] += 1
                     field['active'] = True
@@ -1835,9 +1849,9 @@ values.
         if ":" not in highlight_field:
             msg = "This is unexpected structure: {highlight_field}"
             raise ValueError(msg)
-        
+
         values = highlight_field.split(":")
-        return [values[0], values[1]]
+        return values
 
 
     def _show_or_dump(self,
@@ -1896,12 +1910,31 @@ values.
 
             # Check if we should highlight the field as fuzzed
             highlight_value = False
+            sub_highlight_fields = highlight_fields
             for highlight_field in highlight_fields:
-                (layer_name, field_name) = self.break_highlight_field(highlight_field)
-                if layer_name == ct.layer_name(self.name):
-                    if field_name == f.name:
-                        highlight_value = True
-                        break
+                values = self.break_highlight_field(highlight_field)
+                # Highlighting can be either:
+                #  2 -> Holder and field
+                #  4 -> Holder, field, item in list and field (like ip IPv4 with Option) = 'IP:options:0:pointer'
+
+                if len(values) == 2:
+                    layer_name = values[0]
+                    field_name = values[1]
+                    if layer_name == ct.layer_name(self.name):
+                        if field_name == f.name:
+                            highlight_value = True
+                            break
+                    
+                if len(values) == 4:
+                    layer_name = values[0]
+                    field_name = values[1]
+                    if layer_name == ct.layer_name(self.name):
+                        if field_name == f.name:
+                            # Combine the fvalue[0] with the rest
+                            #  IP:options:0:pointer => "IP Option ..:pointer"
+                            #  IP Option comes frmo the fvalue[0]
+                            sub_highlight_field = fvalue[0].name + ":" + ":".join(values[3:])
+                            sub_highlight_fields = [sub_highlight_field]
 
             if isinstance(fvalue, Packet) or (f.islist and f.holds_packets and isinstance(fvalue, list)):  # noqa: E501
                 s += "%s  %s%s%s%s\n" % (label_lvl + lvl,
@@ -1914,7 +1947,7 @@ values.
                     _iterpacket=0
                 )  # type: SetGen[Packet]
                 for fvalue in fvalue_gen:
-                    s += fvalue._show_or_dump(dump=dump, indent=indent, label_lvl=label_lvl + lvl + "   |", first_call=False)  # noqa: E501
+                    s += fvalue._show_or_dump(dump=dump, indent=indent, label_lvl=label_lvl + lvl + "   |", first_call=False, highlight_fields=sub_highlight_fields)  # noqa: E501
             else:
                 begn = "%s  %s%s%s " % (label_lvl + lvl,
                                         ncol(f.name),
