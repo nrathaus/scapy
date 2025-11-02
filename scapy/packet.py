@@ -1933,7 +1933,7 @@ values.
                             # Combine the fvalue[0] with the rest
                             #  IP:options:0:pointer => "IP Option ..:pointer"
                             #  IP Option comes frmo the fvalue[0]
-                            sub_highlight_field = fvalue[0].name + ":" + ":".join(values[3:])
+                            sub_highlight_field = values[2] + ":" + fvalue[0].name + ":" + ":".join(values[3:])
                             sub_highlight_fields = [sub_highlight_field]
 
             if isinstance(fvalue, Packet) or (f.islist and f.holds_packets and isinstance(fvalue, list)):  # noqa: E501
@@ -1946,8 +1946,20 @@ values.
                     fvalue,
                     _iterpacket=0
                 )  # type: SetGen[Packet]
-                for fvalue in fvalue_gen:
-                    s += fvalue._show_or_dump(dump=dump, indent=indent, label_lvl=label_lvl + lvl + "   |", first_call=False, highlight_fields=sub_highlight_fields)  # noqa: E501
+                for idx, fvalue in enumerate(fvalue_gen):
+                    relevant_highlight_fields = []
+                    idx_highlight = None
+                    try:
+                        sub_highlight_field = sub_highlight_fields[idx].split(":")
+                        idx_highlight = int(sub_highlight_field[0])
+                    except Exception:
+                        pass
+
+                    if idx == idx_highlight:
+                        relevant_highlight_fields = [":".join(sub_highlight_field[1:])]
+                        relevant_highlight_fields += sub_highlight_fields[1:]
+
+                    s += fvalue._show_or_dump(dump=dump, indent=indent, label_lvl=label_lvl + lvl + "   |", first_call=False, highlight_fields=relevant_highlight_fields)  # noqa: E501
             else:
                 begn = "%s  %s%s%s " % (label_lvl + lvl,
                                         ncol(f.name),
