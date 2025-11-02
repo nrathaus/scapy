@@ -1405,7 +1405,7 @@ def dns_resolve(qname, qtype="A", raw=False, tcp=False, verbose=1, timeout=3, **
     :param timeout: seconds until timeout (per server)
     :raise TimeoutError: if no DNS servers were reached in time.
     """
-    # Unify types
+    # Unify types (for caching)
     qtype = DNSQR.qtype.any2i_one(None, qtype)
     qname = DNSQR.qname.any2i(None, qname)
     # Check cache
@@ -1418,7 +1418,7 @@ def dns_resolve(qname, qtype="A", raw=False, tcp=False, verbose=1, timeout=3, **
         return result
 
     kwargs.setdefault("timeout", timeout)
-    kwargs.setdefault("verbose", 0)
+    kwargs.setdefault("verbose", 0)  # hide sr1() output
     res = None
     for nameserver in conf.nameservers:
         # Try all nameservers
@@ -1455,8 +1455,6 @@ def dns_resolve(qname, qtype="A", raw=False, tcp=False, verbose=1, timeout=3, **
                         qtype=qtype,
                         raw=raw,
                         tcp=True,
-                        verbose=verbose,
-                        timeout=timeout,
                         **kwargs,
                     )
                 elif verbose:
