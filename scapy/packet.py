@@ -987,7 +987,7 @@ class Packet(
                                    f"isn't VolatileValue: {type(field_obj)=}, was scapy.all.fuzz called?")
                             raise ValueError(err)
 
-                        if "default" in dir(field_obj):
+                        if hasattr(field_obj, "default"):
                             # Some fields have a 'default'
                             if type(field_obj.default).__name__ in ['str', 'bytes', 'tuple']:
                                 # Store the value so we can use it
@@ -998,10 +998,10 @@ class Packet(
                                 field_obj.default = None
 
                         # Some fields don't have a 'default', try to use 'min'
-                        if "min" in dir(field_obj) and type(field_obj.min).__name__ == 'int':
+                        if hasattr(field_obj, "min") and type(field_obj.min).__name__ == 'int':
                             field_obj.state_pos = field_obj.min
 
-                            if "default" not in dir(field_obj) or field_obj.default is None:
+                            if not hasattr(field_obj, "default") or field_obj.default is None:
                                 # set it to something if it doesn't have a value
                                 field_obj.default = field_obj.min
                         else:
@@ -1011,14 +1011,14 @@ class Packet(
                             field_obj.state_pos = 0
 
                         # RandString has a 'size' rather than max
-                        if 'size' in dir(field_obj):
+                        if hasattr(field_obj, 'size'):
                             if isinstance(field_obj.size, int):
                                 field_obj.max = field_obj.size
                             else:
                                 field_obj.max = field_obj.size.max
 
                         # Make sure it exists
-                        if 'max' not in dir(field_obj):
+                        if not hasattr(field_obj, 'max'):
                             field_obj.max = field_obj.min
 
                 break
@@ -1035,7 +1035,7 @@ class Packet(
                 if field_fuzzed.max == field_fuzzed.min and field_fuzzed.max == 0:
                     print(f"Why is '{field['name']}' max == 0? this is not going to do anything")
 
-                if "state_pos" not in dir(field_fuzzed):
+                if not hasattr(field_fuzzed, "state_pos"):
                     # Make sure next_field exists, as it might be the first element
                     if next_field is not None:
                         next_field['done'] = True # Mark it as done
@@ -1072,7 +1072,14 @@ class Packet(
                                     # We don't touch it
                                     pass
                                 else:
-                                    packet_holder.fields[field_name] = []
+                                    if hasattr(packet_holder, "default_list_value"):
+                                        # Keep record of what was there by default, which is better than putting an empty array (fixes VRRP edge case of 'addrlist')
+                                        packet_holder.fields[field_name] = packet_holder.default_list_value
+
+                                        # Remove the attr, so that it can be placed again if relevant
+                                        delattr(packet_holder, 'default_list_value')
+                                    else:
+                                        packet_holder.fields[field_name] = []
                         else:
                             del packet_holder.fields[field_name]
 
@@ -1097,7 +1104,7 @@ class Packet(
                             # Try to move to the next item
                             (_, field_fuzzed) = self.locate_field(self, next_field['name'])
 
-                            if 'state_pos' not in dir(field_fuzzed):
+                            if not hasattr(field_fuzzed, 'state_pos'):
                                 err = f"We will fail for: {field_fuzzed}"
                                 raise ValueError(err)
 
@@ -1147,6 +1154,9 @@ class Packet(
                                         # We don't touch it
                                         pass
                                     else:
+                                        if not hasattr(packet_holder, "default_list_value"):
+                                            # Keep record of what was there by default
+                                            setattr(packet_holder, 'default_list_value', packet_holder.fields[field_name])
                                         packet_holder.fields[field_name] = [field_fuzzed._fix()]
                                 else:
                                     packet_holder.fields[field_name] = [field_fuzzed._fix()]
@@ -1934,7 +1944,7 @@ values.
                         if field_name == f.name:
                             # Combine the fvalue[0] with the rest
                             #  IP:options:0:pointer => "IP Option ..:pointer"
-                            #  IP Option comes frmo the fvalue[0]
+                            #  IP Option comes from the fvalue[0]
                             sub_highlight_field = values[2] + ":" + fvalue[0].name + ":" + ":".join(values[3:])
                             sub_highlight_fields = [sub_highlight_field]
 
