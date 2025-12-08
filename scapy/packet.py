@@ -903,7 +903,7 @@ class Packet(
         return pkt.locate_field(pkt.payload, name)
 
 
-    def prepare_combinations(self, complexity: int) -> Dict:
+    def prepare_combinations(self, complexity: int) -> List:
         """Prepare fuzzing by returning a 'states' of fields"""
         relevant_fields = self.return_relevant_fields(self)
 
