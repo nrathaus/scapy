@@ -799,13 +799,27 @@ class RandMAC(_RandString[str]):
 
 
 class RandIP6(_RandString[str]):
-    def __init__(self, ip6template="**"):
+    _DEFAULT_IPTEMPLATE = "**"
+
+    _COMBINATIONS = [
+        '::', '::1', '::ffff:192.0.2.1',
+        'fc00::1', 'fe80::abcd:ef12', 'fd00::', 'fd80::1',
+        'fe80::1', '::ffff:FEEF:FEEF', 'ff00::1', 'ff02::1',
+        '2001:db8:85a3:0:0:8a2e:370:7334', '2001:db8::1', '2001:db8:1234:113::',
+        'ff02::1', 'ff02::255', 'ff0e::1', 'fd12:3456:789a::1',
+        'fec0::1', '::255.255.255.255', '2002:ffff:ffff:ffff:ffff:ffff:ffff:ffff'
+        ]
+    min = 0
+    max = len(_COMBINATIONS)
+    state_pos = None
+
+    def __init__(self, ip6template=_DEFAULT_IPTEMPLATE):
         # type: (str) -> None
         super(RandIP6, self).__init__()
         self.tmpl = ip6template
         self.sp = []  # type: List[Union[int, RandNum, str]]
         for v in self.tmpl.split(":"):
-            if not v or v == "**":
+            if not v or v == self._DEFAULT_IPTEMPLATE:
                 self.sp.append(v)
                 continue
             if "-" in v:
@@ -834,31 +848,40 @@ class RandIP6(_RandString[str]):
 
     def _fix(self):
         # type: () -> str
-        nbm = self.multi
-        ip = []  # type: List[str]
-        for i, n in enumerate(self.sp):
-            if n == "**":
-                nbm -= 1
-                remain = 8 - (len(self.sp) - i - 1) - len(ip) + nbm
-                if "" in self.sp:
-                    remain += 1
-                if nbm or self.variable:
-                    remain = random.randint(0, remain)
-                for j in range(remain):
-                    ip.append("%04x" % random.randint(0, 65535))
-            elif isinstance(n, RandNum):
-                ip.append("%04x" % int(n))
-            elif n == 0:
-                ip.append("0")
-            elif not n:
-                ip.append("")
-            else:
-                ip.append("%04x" % int(n))
-        if len(ip) == 9:
-            ip.remove("")
-        if ip[-1] == "":
-            ip[-1] = "0"
-        return ":".join(ip)
+
+        # Old
+        # nbm = self.multi
+        # ip = []  # type: List[str]
+        # for i, n in enumerate(self.sp):
+        #     if n == "**":
+        #         nbm -= 1
+        #         remain = 8 - (len(self.sp) - i - 1) - len(ip) + nbm
+        #         if "" in self.sp:
+        #             remain += 1
+        #         if nbm or self.variable:
+        #             remain = random.randint(0, remain)
+        #         for j in range(remain):
+        #             ip.append("%04x" % random.randint(0, 65535))
+        #     elif isinstance(n, RandNum):
+        #         ip.append("%04x" % int(n))
+        #     elif n == 0:
+        #         ip.append("0")
+        #     elif not n:
+        #         ip.append("")
+        #     else:
+        #         ip.append("%04x" % int(n))
+        # if len(ip) == 9:
+        #     ip.remove("")
+        # if ip[-1] == "":
+        #     ip[-1] = "0"
+        # return ":".join(ip)
+
+        # New:
+        ipv6 = self._COMBINATIONS[0]
+        if self.state_pos is not None and self.state_pos > 0:
+            ipv6 = self._COMBINATIONS[self.state_pos % len(self._COMBINATIONS)]
+
+        return ipv6
 
 
 class RandOID(_RandString[str]):
