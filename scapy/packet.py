@@ -1859,7 +1859,7 @@ values.
     def break_highlight_field(self, highlight_field):
         # type(str) -> Tuple[str, str]:
         if ":" not in highlight_field:
-            msg = "This is unexpected structure: {highlight_field}"
+            msg = f"This is unexpected structure: {highlight_field}"
             raise ValueError(msg)
 
         values = highlight_field.split(":")
