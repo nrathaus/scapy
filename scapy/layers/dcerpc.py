@@ -451,6 +451,14 @@ class RPC_C_AUTHN_LEVEL(IntEnum):
 DCE_C_AUTHN_LEVEL = RPC_C_AUTHN_LEVEL  # C706 name
 
 
+class RPC_C_IMP_LEVEL(IntEnum):
+    DEFAULT = 0x0
+    ANONYMOUS = 0x1
+    IDENTIFY = 0x2
+    IMPERSONATE = 0x3
+    DELEGATE = 0x4
+
+
 # C706 sect 13.2.6.1
 
 
@@ -1935,9 +1943,19 @@ class NDRPacketField(NDRConstructedType, NDRAlign):
     def __init__(self, name, default, pkt_cls, **kwargs):
         self.DEPORTED_CONFORMANTS = pkt_cls.DEPORTED_CONFORMANTS
         self.fld = _NDRPacketField(name, default, pkt_cls=pkt_cls, **kwargs)
+
+        # The inner _NDRPacketPadField handles NDR64's trailing gap in
+        # the case where there a no inner conformants (see [MS-RPCE] 2.2.5.3.4.1)
+        if self.DEPORTED_CONFORMANTS:
+            innerfld = self.fld
+        else:
+            innerfld = _NDRPacketPadField(self.fld, align=pkt_cls.ALIGNMENT)
+
+        # C706 14.3.2 Alignment of Constructed Types is handled by the
+        # NDRAlign below.
         NDRAlign.__init__(
             self,
-            _NDRPacketPadField(self.fld, align=pkt_cls.ALIGNMENT),
+            innerfld,
             align=pkt_cls.ALIGNMENT,
         )
         NDRConstructedType.__init__(self, pkt_cls.fields_desc)
@@ -1988,11 +2006,12 @@ class _NDRPacketListField(NDRConstructedType, PacketListField):
     islist = 1
     holds_packets = 1
 
-    __slots__ = ["ptr_pack", "fld"]
+    __slots__ = ["ptr_lvl", "fld"]
 
     def __init__(self, name, default, pkt_cls, **kwargs):
-        self.ptr_pack = kwargs.pop("ptr_pack", False)
-        if self.ptr_pack:
+        self.ptr_lvl = kwargs.pop("ptr_lvl", False)
+        if self.ptr_lvl:
+            # TODO: support more than 1 level ?
             self.fld = NDRFullEmbPointerField(NDRPacketField("", None, pkt_cls))
         else:
             self.fld = NDRPacketField("", None, pkt_cls)
@@ -2034,7 +2053,6 @@ class NDRFieldListField(NDRConstructedType, FieldListField):
     islist = 1
 
     def __init__(self, *args, **kwargs):
-        kwargs.pop("ptr_pack", None)  # TODO: unimplemented
         if "length_is" in kwargs:
             kwargs["count_from"] = kwargs.pop("length_is")
         elif "size_is" in kwargs:
@@ -2090,6 +2108,9 @@ class _NDRVarField:
             kwargs["length_from"] = length_is
         elif self.COUNT_FROM:
             kwargs["count_from"] = length_is
+        # TODO: For now, we do nothing with max_is
+        if "max_is" in kwargs:
+            kwargs.pop("max_is")
         super(_NDRVarField, self).__init__(*args, **kwargs)
 
     def getfield(self, pkt, s):
@@ -2213,13 +2234,23 @@ class _NDRConfField:
                 kwargs["length_from"] = size_is
             elif self.COUNT_FROM:
                 kwargs["count_from"] = size_is
+        # TODO: For now, we do nothing with max_is
+        if "max_is" in kwargs:
+            kwargs.pop("max_is")
         super(_NDRConfField, self).__init__(*args, **kwargs)
 
     def getfield(self, pkt, s):
         # [C706] - 14.3.7 Structures Containing Arrays
         fmt = _e(pkt.ndrendian) + ["I", "Q"][pkt.ndr64]
         if self.conformant_in_struct:
-            return super(_NDRConfField, self).getfield(pkt, s)
+            # [MS-RPCE] 2.2.5.3.4.2 Structure Containing a Conformant Array
+            # Padding is here: just before the Conformant content
+            return NDRAlign(
+                super(_NDRConfField, self),
+                align=pkt.ALIGNMENT,
+            ).getfield(pkt, s)
+
+        # The max count is aligned as a primitive type
         remain, max_count = NDRAlign(Field("", 0, fmt=fmt), align=(4, 8)).getfield(
             pkt, s
         )
@@ -2230,7 +2261,12 @@ class _NDRConfField:
 
     def addfield(self, pkt, s, val):
         if self.conformant_in_struct:
-            return super(_NDRConfField, self).addfield(pkt, s, val)
+            # [MS-RPCE] 2.2.5.3.4.2 Structure Containing a Conformant Array
+            # Padding is here: just before the Conformant content
+            return NDRAlign(super(_NDRConfField, self), align=pkt.ALIGNMENT).addfield(
+                pkt, s, val
+            )
+
         if self.CONFORMANT_STRING and not isinstance(val, NDRConformantString):
             raise ValueError(
                 "Expected NDRConformantString in %s. You are using it wrong!"
@@ -2375,6 +2411,22 @@ class NDRConfStrLenFieldUtf16(_NDRConfField, _NDRValueOf, StrLenFieldUtf16, _NDR
     CONFORMANT_STRING = True
     ON_WIRE_SIZE_UTF16 = False
     LENGTH_FROM = True
+
+
+class NDRVarStrNullField(_NDRVarField, _NDRValueOf, StrNullField):
+    """
+    NDR Varying StrNullField
+    """
+
+    NULLFIELD = True
+
+
+class NDRVarStrNullFieldUtf16(_NDRVarField, _NDRValueOf, StrNullFieldUtf16, _NDRUtf16):
+    """
+    NDR Varying StrNullFieldUtf16
+    """
+
+    NULLFIELD = True
 
 
 class NDRVarStrLenField(_NDRVarField, StrLenField):
@@ -2766,9 +2818,9 @@ class DceRpcSession(DefaultSession):
         self.ssp = kwargs.pop("ssp", None)
         self.sspcontext = kwargs.pop("sspcontext", None)
         self.auth_level = kwargs.pop("auth_level", None)
-        self.auth_context_id = kwargs.pop("auth_context_id", 0)
         self.sent_cont_ids = []
         self.cont_id = 0  # Currently selected context
+        self.auth_context_id = 0  # Currently selected authentication context
         self.map_callid_opnum = {}
         self.frags = collections.defaultdict(lambda: b"")
         self.sniffsspcontexts = {}  # Unfinished contexts for passive
@@ -3283,7 +3335,6 @@ class DceRpcSocket(StreamSocket):
         self.session = DceRpcSession(
             ssp=kwargs.pop("ssp", None),
             auth_level=kwargs.pop("auth_level", None),
-            auth_context_id=kwargs.pop("auth_context_id", None),
             support_header_signing=kwargs.pop("support_header_signing", True),
         )
         super(DceRpcSocket, self).__init__(*args, **kwargs)
