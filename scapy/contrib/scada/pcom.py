@@ -123,7 +123,9 @@ class PCOMAsciiRequest(PCOMAscii):
         StrFixedLenField("stx", "/", 1),
         StrFixedLenField("unitId", "00", 2),
         PCOMAsciiCommandField(
-            "command", '', length_from=lambda pkt: pkt.underlayer.len - 6),
+            "command", '',
+            length_from=lambda pkt: None if pkt.underlayer is None
+            else pkt.underlayer.len - 6),
         XShortField("chksum", None),
         XByteField("etx", 0x0d)
     ]
@@ -141,7 +143,9 @@ class PCOMAsciiResponse(PCOMAscii):
         StrFixedLenField("stx", "/A", 2),
         StrFixedLenField("unitId", "00", 2),
         PCOMAsciiCommandField(
-            "command", '', length_from=lambda pkt: pkt.underlayer.len - 7),
+            "command", '',
+            length_from=lambda pkt: None if pkt.underlayer is None
+            else pkt.underlayer.len - 7),
         XShortField("chksum", None),
         XByteField("etx", 0x0d)
     ]

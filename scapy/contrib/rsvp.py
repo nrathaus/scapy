@@ -171,7 +171,7 @@ class RSVP_Data(Packet):
         StrLenField(
             "Data",
             "",
-            length_from=lambda pkt: pkt.underlayer.Length - 4
+            length_from=lambda pkt: None if pkt.underlayer is None else pkt.underlayer.Length - 4  # noqa: E501
         ),
     ]
 
@@ -238,7 +238,7 @@ class RSVP_SenderTSPEC(Packet):
         StrLenField(
             "Tokens",
             "",
-            length_from=lambda pkt: pkt.underlayer.Length - 12
+            length_from=lambda pkt: None if pkt.underlayer is None else pkt.underlayer.Length - 12  # noqa: E501
         ),
     ]
 

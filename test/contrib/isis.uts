@@ -177,3 +177,22 @@ assert p[ISIS_RouterCapabilityTlv].type==242
 assert p[ISIS_RouterCapabilityTlv].subtlvs[0].srgb_ranges[0].range==1000
 assert p[ISIS_RouterCapabilityTlv].subtlvs[0].srgb_ranges[0].sid_label.sid==10
 assert p[ISIS_RouterCapabilityTlv].subtlvs[1].algorithms==[0, 1]
+
++ Regression Tests
+
+= ISIS PDU, standalone instantiation without an ISIS_CommonHdr underlayer
+# Regression test: _ISIS_PduLengthField's adjust and _ISIS_TlvListField's
+# length_from used pkt.underlayer.hdrlen without checking that
+# pkt.underlayer was not None, which crashed as soon as an ISIS PDU was
+# built or dissected without being layered under ISIS_CommonHdr().
+p = ISIS_L1_LAN_Hello(sourceid="0102.0304.0506")
+raw_p = bytes(p)
+assert raw_p == b'\x02\x01\x02\x03\x04\x05\x06\x00\x1e\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00'
+assert p.pdulength is None
+assert p.tlvs == []
+p.show()
+
+q = ISIS_L1_LAN_Hello(b'\x01\x02\x03\x04\x05\x06\x07\x08\x00\x1e\x00\x1b\x01\x00\x00\x00\x00\x00\x00\x00')  # noqa: E501
+assert q.pdulength == 7680
+assert len(q.tlvs) == 1
+q.show()

@@ -399,6 +399,26 @@ assert pkt.fcf_security == 0
 assert Dot15d4Beacon in pkt
 assert pkt[Dot15d4Beacon].aux_sec_header is None
 
+= Dot15d4Data/Dot15d4Beacon/Dot15d4Cmd standalone instantiation without a Dot15d4 underlayer
+
+# Regression test: these fields_desc used pkt.underlayer.getfieldval(...)
+# without checking that pkt.underlayer was not None, which crashed as soon
+# as one of these layers was built or shown standalone, without being
+# layered under a Dot15d4()/Dot15d4FCS().
+p = Dot15d4Data()
+assert bytes(p) == b'\xff\xff'
+p.show()
+
+p = Dot15d4Beacon()
+bytes(p)
+p.show()
+
+p = Dot15d4Cmd()
+bytes(p)
+p.show()
+
+assert util_srcpanid_present(Dot15d4Data()) is False
+
 # RPL: unimplemented
 #p = SixLoWPAN(b"\x7b\x3b\x3a\x1a\x9b\x02\xae\x30\x21\x00\x00\xef\x05\x12\x00\x80\x20\x02\x0d\xb8\x00\x00\x00\x00\x00\x00\x00\xff\xfe\x00\x33\x44\x09\x04\x00\x00\x00\x00\x06\x04\x00\x01\xef\xff")
 #p.show2()
@@ -948,3 +968,26 @@ assert ZCLIASZoneZoneEnrollResponse in pkt.layers()
 assert pkt[ZCLIASZoneZoneEnrollResponse].rsp_code == 0x00
 assert pkt[ZCLIASZoneZoneEnrollResponse].zone_id == 0x3a
 assert raw(pkt[ZCLIASZoneZoneEnrollResponse].payload) == b''
+
+= ZigbeeDeviceProfile standalone instantiation without a ZigbeeAppDataPayload underlayer
+
+# Regression test: ZigbeeDeviceProfile.guess_payload_class() used self.underlayer.cluster
+# without checking that self.underlayer was not None, which crashed as soon as a
+# ZigbeeDeviceProfile with remaining bytes was dissected standalone, without being
+# layered under a ZigbeeAppDataPayload().
+pkt = ZigbeeDeviceProfile(b'\x01\x02\x03')
+assert pkt.trans_seqnum == 1
+assert Raw in pkt
+assert pkt[Raw].load == b'\x02\x03'
+pkt.show()
+
+= ZigbeeClusterLibrary standalone instantiation without a ZigbeeAppDataPayload underlayer
+
+# Regression test: ZigbeeClusterLibrary.guess_payload_class() used self.underlayer.cluster
+# for cluster-specific commands (zcl_frametype == 1) without checking that self.underlayer
+# was not None, which crashed as soon as such a frame was dissected standalone.
+raw_zcl = bytes(ZigbeeClusterLibrary(zcl_frametype=1, command_direction=0, command_identifier=0x00)) + b'\x00\x3a'  # noqa: E501
+pkt = ZigbeeClusterLibrary(raw_zcl)
+assert pkt.zcl_frametype == 1
+assert Raw in pkt
+pkt.show()

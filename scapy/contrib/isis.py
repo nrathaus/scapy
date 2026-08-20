@@ -914,14 +914,20 @@ class _ISIS_PduBase(Packet):
         return conf.padding_layer
 
 
+def _isis_pdulength_adjust(pkt, x):
+    # pkt.underlayer is the ISIS_CommonHdr providing hdrlen; without it we
+    # cannot know the header length, so leave the tlvs length unadjusted.
+    return x if pkt.underlayer is None else x + pkt.underlayer.hdrlen
+
+
 class _ISIS_PduLengthField(FieldLenField):
     def __init__(self):
-        FieldLenField.__init__(self, "pdulength", None, length_of="tlvs", adjust=lambda pkt, x: x + pkt.underlayer.hdrlen)  # noqa: E501
+        FieldLenField.__init__(self, "pdulength", None, length_of="tlvs", adjust=_isis_pdulength_adjust)  # noqa: E501
 
 
 class _ISIS_TlvListField(PacketListField):
     def __init__(self):
-        PacketListField.__init__(self, "tlvs", [], _ISIS_GuessTlvClass, length_from=lambda pkt: pkt.pdulength - pkt.underlayer.hdrlen)  # noqa: E501
+        PacketListField.__init__(self, "tlvs", [], _ISIS_GuessTlvClass, length_from=lambda pkt: None if pkt.underlayer is None else pkt.pdulength - pkt.underlayer.hdrlen)  # noqa: E501
 
 
 class _ISIS_LAN_HelloBase(_ISIS_PduBase):

@@ -331,7 +331,7 @@ class TacacsPacketArguments(Packet):
         while isinstance(cur, TacacsPacketArguments):
             cur = cur.underlayer
             i += 1
-        self._len = cur.arg_len_list[i]
+        self._len = cur.arg_len_list[i] if cur is not None else len(s)
         return s
 
     def guess_payload_class(self, pay):
@@ -343,7 +343,7 @@ class TacacsPacketArguments(Packet):
         while isinstance(cur, TacacsPacketArguments):
             cur = cur.underlayer
             i += 1
-        if i + 1 < cur.arg_cnt:
+        if cur is not None and i + 1 < cur.arg_cnt:
             return TacacsPacketArguments
         return conf.padding_layer
 

@@ -1356,19 +1356,25 @@ class EIR_RandomTargetAddress(EIR_Element):
     ]
 
 
+def _eir_advertising_interval_len(p):
+    if p.underlayer is None:
+        return None
+    return p.underlayer.len - 1
+
+
 class EIR_AdvertisingInterval(EIR_Element):
     name = "Advertising Interval"
     fields_desc = [
         MultipleTypeField(
             [
                 (ByteField("advertising_interval", 0),
-                 lambda p: p.underlayer.len - 1 == 1),
+                 lambda p: _eir_advertising_interval_len(p) == 1),
                 (LEShortField("advertising_interval", 0),
-                 lambda p: p.underlayer.len - 1 == 2),
+                 lambda p: _eir_advertising_interval_len(p) == 2),
                 (LEThreeBytesField("advertising_interval", 0),
-                 lambda p: p.underlayer.len - 1 == 3),
+                 lambda p: _eir_advertising_interval_len(p) == 3),
                 (LEIntField("advertising_interval", 0),
-                 lambda p: p.underlayer.len - 1 == 4),
+                 lambda p: _eir_advertising_interval_len(p) == 4),
             ],
             LEShortField("advertising_interval", 0)
         )
@@ -2763,7 +2769,8 @@ class HCI_Event_Vendor(Packet):
     """
     name = "HCI_Vendor_Specific"
     fields_desc = [StrLenField("data", b"",
-                               length_from=lambda pkt: pkt.underlayer.len)]
+                               length_from=lambda pkt: None if pkt.underlayer is None
+                               else pkt.underlayer.len)]
 
 
 class HCI_Event_LE_Meta(Packet):

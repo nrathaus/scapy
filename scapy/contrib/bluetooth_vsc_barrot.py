@@ -169,13 +169,19 @@ class HCI_Cmd_Complete_VSC_Barrot_Bd_Param(Packet):
     fields_desc = [LEMACField("bd_addr", None)]
 
 
+def _barrot_read_complete_len(p):
+    u = p.underlayer
+    if u is None or u.underlayer is None or u.underlayer.underlayer is None:
+        return None
+    return u.underlayer.underlayer.len - 6
+
+
 class HCI_Cmd_Complete_VSC_Barrot_Bus_Read(Packet):
     """Bus Read (cmd 0x0F) command complete: the ``length`` bytes read from
     the memory bus."""
     name = "Barrot Bus Read complete"
     fields_desc = [
-        XStrLenField("data", b"",
-                     length_from=lambda p: p.underlayer.underlayer.underlayer.len - 6)
+        XStrLenField("data", b"", length_from=_barrot_read_complete_len)
     ]
 
 
@@ -183,8 +189,7 @@ class HCI_Cmd_Complete_VSC_Barrot_Flash_Read(Packet):
     """Flash Read (cmd 0x12) command complete: the ``length`` bytes read."""
     name = "Barrot Flash Read complete"
     fields_desc = [
-        XStrLenField("data", b"",
-                     length_from=lambda p: p.underlayer.underlayer.underlayer.len - 6)
+        XStrLenField("data", b"", length_from=_barrot_read_complete_len)
     ]
 
 

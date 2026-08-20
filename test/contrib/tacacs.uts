@@ -204,3 +204,16 @@ raw(pkt) == b"E\x00\x00P\x00\x01\x00\x00@\x06|\xa5\x7f\x00\x00\x01\x7f\x00\x00\x
 
 pkt = Ether(b'\xff\xff\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x08\x00E\x00\x00P\x00\x01\x00\x00@\x06|\xa5\x7f\x00\x00\x01\x7f\x00\x00\x01\x001\x001\x00\x00\x00\x00\x00\x00\x00\x00P\x02 \x00sG\x00\x00\xc0\x01\x01\x01\x90}\xd0\x86\x00\x00\x00\x1c\x01\x01\x01\x01\x05\x04\x0b\x00scapytty2172.10.10.1')
 pkt.user == b'scapy' and pkt.port == b'tty2'
+
++ TacacsPacketArguments, standalone dissection without a Tacacs+ underlayer
+
+= dissection without underlayer
+
+# Regression test: TacacsPacketArguments.pre_dissect() / guess_payload_class()
+# walked up pkt.underlayer without checking that it could be None, which
+# crashed as soon as a TacacsPacketArguments was dissected on its own,
+# without being layered under a TacacsAccountingRequest/TacacsAuthorizationRequest/... # noqa: E501
+pkt = TacacsPacketArguments(b'service=shell')
+pkt.data == b'service=shell'
+
+pkt.guess_payload_class(b'') == conf.padding_layer

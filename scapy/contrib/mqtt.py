@@ -191,6 +191,10 @@ class MQTTConnack(Packet):
     ]
 
 
+def _mqtt_publish_qos(pkt):
+    return pkt.underlayer.QOS if pkt.underlayer is not None else 0
+
+
 class MQTTPublish(Packet):
     name = "MQTT publish"
     fields_desc = [
@@ -198,12 +202,12 @@ class MQTTPublish(Packet):
         StrLenField("topic", "",
                     length_from=lambda pkt: pkt.length),
         ConditionalField(ShortField("msgid", None),
-                         lambda pkt: (pkt.underlayer.QOS == 1 or
-                                      pkt.underlayer.QOS == 2)),
+                         lambda pkt: _mqtt_publish_qos(pkt) in (1, 2)),
         StrLenField("value", "",
-                    length_from=lambda pkt: pkt.underlayer.len - pkt.length - 2
-                    if pkt.underlayer.QOS == 0 else
-                    pkt.underlayer.len - pkt.length - 4)
+                    length_from=lambda pkt: None if pkt.underlayer is None else (
+                        pkt.underlayer.len - pkt.length - 2
+                        if _mqtt_publish_qos(pkt) == 0 else
+                        pkt.underlayer.len - pkt.length - 4))
     ]
 
 

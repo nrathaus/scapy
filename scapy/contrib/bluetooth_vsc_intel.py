@@ -109,6 +109,13 @@ class HCI_Cmd_Complete_VSC_Intel_Version_TLV(Packet):
         return b"", s
 
 
+def _intel_read_version_tlvs_len(pkt):
+    u = pkt.underlayer
+    if u is None or u.underlayer is None:
+        return None
+    return u.underlayer.len - 4
+
+
 class HCI_Cmd_Complete_VSC_Intel_Read_Version(Packet):
     """
     Read Version (0xFC05) command complete.
@@ -116,7 +123,7 @@ class HCI_Cmd_Complete_VSC_Intel_Read_Version(Packet):
     name = "Intel Read Version (TLV) complete"
     fields_desc = [
         PacketListField("tlvs", [], HCI_Cmd_Complete_VSC_Intel_Version_TLV,
-                        length_from=lambda pkt: pkt.underlayer.underlayer.len - 4),
+                        length_from=_intel_read_version_tlvs_len),
     ]
 
 

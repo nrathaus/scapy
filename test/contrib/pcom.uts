@@ -62,3 +62,15 @@ commandSpecific='\x00\x00\x00\x00\x00\x01', len=4, data= data))[2:] == r
 = PCOM/Binary Known Codes
 f = PCOMBinaryCommandField('command', None)
 assert f.i2repr(None, 0x4d) == 'Read Operands Request - 0x4d'
+
+= PCOMAsciiRequest/Response, standalone dissection without a PCOM underlayer
+# Regression test: PCOMAsciiRequest/Response used pkt.underlayer.len
+# without checking that pkt.underlayer was not None, which crashed as soon
+# as one of them was dissected without being layered under a
+# PCOMRequest/PCOMResponse.
+req_bytes = raw(PCOMAsciiRequest(command='ID'))
+p = PCOMAsciiRequest(req_bytes)
+p.show()
+resp_bytes = raw(PCOMAsciiResponse(command='ID'))
+p = PCOMAsciiResponse(resp_bytes)
+p.show()

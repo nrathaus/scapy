@@ -84,6 +84,15 @@ assert HCI_Evt_VSC_Barrot_Command_Complete in evt
 assert evt[HCI_Evt_VSC_Barrot_Command_Complete].cmd == 0x0f
 assert HCI_Cmd_Complete_VSC_Barrot_Flash_Read not in evt
 
+= HCI_Cmd_Complete_VSC_Barrot_Flash_Read standalone dissection without underlayers
+# Regression test: length_from walked pkt.underlayer.underlayer.underlayer.len,
+# which crashed as soon as a HCI_Cmd_Complete_VSC_Barrot_Flash_Read was
+# dissected without its full HCI_Evt_VSC_Barrot_Command_Complete /
+# HCI_Event_Command_Complete / HCI_Event_Hdr underlayer chain.
+p = HCI_Cmd_Complete_VSC_Barrot_Flash_Read(bytes.fromhex("deadbeef"))
+assert p.data == bytes.fromhex("deadbeef")
+p.show()
+
 
 + Barrot Read Chip Version (cmd 0x01)
 
@@ -262,3 +271,12 @@ evt = HCI_Hdr(bytes.fromhex("040e0a0180fc00120011223344"))
 assert HCI_Evt_VSC_Barrot_Command_Complete in evt
 assert evt[HCI_Evt_VSC_Barrot_Command_Complete].cmd == 0x12
 assert HCI_Cmd_Complete_VSC_Barrot_Bus_Read not in evt
+
+= HCI_Cmd_Complete_VSC_Barrot_Bus_Read standalone dissection without underlayers
+# Regression test: length_from walked pkt.underlayer.underlayer.underlayer.len,
+# which crashed as soon as a HCI_Cmd_Complete_VSC_Barrot_Bus_Read was
+# dissected without its full HCI_Evt_VSC_Barrot_Command_Complete /
+# HCI_Event_Command_Complete / HCI_Event_Hdr underlayer chain.
+p = HCI_Cmd_Complete_VSC_Barrot_Bus_Read(bytes.fromhex("deadbeef"))
+assert p.data == bytes.fromhex("deadbeef")
+p.show()

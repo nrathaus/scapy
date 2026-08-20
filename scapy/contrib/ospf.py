@@ -516,7 +516,7 @@ class OSPFv3_Hello(Packet):
                    IPField("router", "0.0.0.0"),
                    IPField("backup", "0.0.0.0"),
                    FieldListField("neighbors", [], IPField("", "0.0.0.0"),
-                                  length_from=lambda pkt: (pkt.underlayer.len - 36))]  # noqa: E501
+                                  length_from=lambda pkt: (pkt.underlayer.len - 36) if pkt.underlayer else None)]  # noqa: E501
 
 
 _OSPFv3_LStypes = {0x2001: "router",
@@ -736,7 +736,7 @@ class OSPFv3_DBDesc(Packet):
                    IntField("ddseq", 1),
                    PacketListField("lsaheaders", None, OSPFv3_LSA_Hdr,
                                    count_from=lambda pkt:None,
-                                   length_from=lambda pkt:pkt.underlayer.len - 28)]  # noqa: E501
+                                   length_from=lambda pkt: pkt.underlayer and pkt.underlayer.len - 28)]  # noqa: E501
 
 
 class OSPFv3_LSReq_Item(Packet):
@@ -754,7 +754,7 @@ class OSPFv3_LSReq(Packet):
     name = "OSPFv3 Link State Request (container)"
     fields_desc = [PacketListField("requests", None, OSPFv3_LSReq_Item,
                                    count_from=lambda pkt:None,
-                                   length_from=lambda pkt:pkt.underlayer.len - 16)]  # noqa: E501
+                                   length_from=lambda pkt: pkt.underlayer and pkt.underlayer.len - 16)]  # noqa: E501
 
 
 class OSPFv3_LSUpd(Packet):
@@ -762,14 +762,14 @@ class OSPFv3_LSUpd(Packet):
     fields_desc = [FieldLenField("lsacount", None, fmt="!I", count_of="lsalist"),  # noqa: E501
                    PacketListField("lsalist", [], _OSPFv3_LSAGuessPayloadClass,
                                    count_from=lambda pkt:pkt.lsacount,
-                                   length_from=lambda pkt:pkt.underlayer.len - 16)]  # noqa: E501
+                                   length_from=lambda pkt: pkt.underlayer and pkt.underlayer.len - 16)]  # noqa: E501
 
 
 class OSPFv3_LSAck(Packet):
     name = "OSPFv3 Link State Acknowledgement"
     fields_desc = [PacketListField("lsaheaders", None, OSPFv3_LSA_Hdr,
                                    count_from=lambda pkt:None,
-                                   length_from=lambda pkt:pkt.underlayer.len - 16)]  # noqa: E501
+                                   length_from=lambda pkt: pkt.underlayer and pkt.underlayer.len - 16)]  # noqa: E501
 
 
 bind_layers(IP, OSPF_Hdr, proto=89)

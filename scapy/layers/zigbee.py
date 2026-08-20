@@ -986,6 +986,8 @@ class ZigbeeDeviceProfile(Packet):
     ]
 
     def guess_payload_class(self, payload):
+        if self.underlayer is None:
+            return Packet.guess_payload_class(self, payload)
         if self.underlayer.cluster == 0x0005:
             return ZDPActiveEPReq
         elif self.underlayer.cluster == 0x0013:
@@ -1377,7 +1379,7 @@ class ZigbeeClusterLibrary(Packet):
                     {0x00, 0x01, 0x02, 0x04, 0x06, 0x07, 0x0a, 0x0b}):
                 # done in bind_layers
                 pass
-        elif self.zcl_frametype == 0x01:
+        elif self.zcl_frametype == 0x01 and self.underlayer is not None:
             # Cluster-specific command
             if self.underlayer.cluster == 0x0500:
                 # IAS Zone

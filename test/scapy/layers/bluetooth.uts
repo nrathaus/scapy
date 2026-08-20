@@ -622,6 +622,13 @@ assert parsed[HCI_Event_Hdr].code == 0xff
 assert parsed[HCI_Event_Hdr].len == 4
 assert parsed[HCI_Event_Vendor].data == b"\xde\xad\xbe\xef"
 
+# Regression test: length_from read pkt.underlayer.len unconditionally, which
+# crashed as soon as a HCI_Event_Vendor was built or dissected without an
+# HCI_Event_Hdr wrapping it.
+p = HCI_Event_Vendor(data=b"\xde\xad\xbe\xef")
+assert raw(p) == b"\xde\xad\xbe\xef"
+p.show()
+
 
 + Bluetooth LE Advertising / Scan Response Data Parsing
 = Parse EIR_IncompleteList32BitServiceUUIDs
@@ -657,6 +664,13 @@ assert p[EIR_AdvertisingInterval].advertising_interval == 400
 p = BTLE(hex_bytes('d6be898e20234fe761e5b754021a1803030a18020ace12fffa07104a2b010000000054b7e561e74f00000000'))
 assert EIR_AdvertisingInterval in p
 assert p[EIR_AdvertisingInterval].advertising_interval == 24
+
+# Regression test: the MultipleTypeField conditions read pkt.underlayer.len
+# unconditionally, which crashed as soon as an EIR_AdvertisingInterval was
+# built or shown without being layered under an EIR_Hdr().
+p = EIR_AdvertisingInterval(advertising_interval=400)
+assert raw(p) == b'\x90\x01'
+p.show()
 
 = Parse EIR_LEBluetoothDeviceAddress
 p = HCI_Event_Hdr(hex_bytes("3e2a02010000d93519d7ba4c1e0201020affc4000734151317fd80081b00d93519d7ba4c0303b9fe020ad4ad"))

@@ -233,10 +233,10 @@ class Dot15d4Data(Packet):
         ConditionalField(XLEShortField("src_panid", 0x0),
                          lambda pkt:util_srcpanid_present(pkt)),
         ConditionalField(dot15d4AddressField("src_addr", None, length_of="fcf_srcaddrmode"),  # noqa: E501
-                         lambda pkt:pkt.underlayer.getfieldval("fcf_srcaddrmode") != 0),  # noqa: E501
+                         lambda pkt:_dot15d4_fcf_srcaddrmode(pkt) != 0),
         # Security field present if fcf_security == True
         ConditionalField(PacketField("aux_sec_header", Dot15d4AuxSecurityHeader(), Dot15d4AuxSecurityHeader),  # noqa: E501
-                         lambda pkt:pkt.underlayer.getfieldval("fcf_security")),  # noqa: E501
+                         lambda pkt:_dot15d4_fcf_security(pkt)),
     ]
 
     def guess_payload_class(self, payload):
@@ -275,7 +275,7 @@ class Dot15d4Beacon(Packet):
         dot15d4AddressField("src_addr", None, length_of="fcf_srcaddrmode"),
         # Security field present if fcf_security == True
         ConditionalField(PacketField("aux_sec_header", Dot15d4AuxSecurityHeader(), Dot15d4AuxSecurityHeader),  # noqa: E501
-                         lambda pkt:pkt.underlayer.getfieldval("fcf_security")),  # noqa: E501
+                         lambda pkt:_dot15d4_fcf_security(pkt)),
 
         # Superframe spec field:
         BitField("sf_sforder", 15, 4),  # not used by ZigBee
@@ -334,10 +334,10 @@ class Dot15d4Cmd(Packet):
                          lambda pkt:util_srcpanid_present(pkt)),
         ConditionalField(dot15d4AddressField("src_addr", None,
                          length_of="fcf_srcaddrmode"),
-                         lambda pkt:pkt.underlayer.getfieldval("fcf_srcaddrmode") != 0),  # noqa: E501
+                         lambda pkt:_dot15d4_fcf_srcaddrmode(pkt) != 0),
         # Security field present if fcf_security == True
         ConditionalField(PacketField("aux_sec_header", Dot15d4AuxSecurityHeader(), Dot15d4AuxSecurityHeader),  # noqa: E501
-                         lambda pkt:pkt.underlayer.getfieldval("fcf_security")),  # noqa: E501
+                         lambda pkt:_dot15d4_fcf_security(pkt)),
         ByteEnumField("cmd_id", 0, {
             1: "AssocReq",  # Association request
             2: "AssocResp",  # Association response
@@ -410,8 +410,18 @@ class Dot15d4CmdCoordRealignPage(Packet):
 # Utility Functions #
 
 
+def _dot15d4_fcf_srcaddrmode(pkt):
+    return 0 if pkt.underlayer is None else pkt.underlayer.getfieldval("fcf_srcaddrmode")  # noqa: E501
+
+
+def _dot15d4_fcf_security(pkt):
+    return False if pkt.underlayer is None else pkt.underlayer.getfieldval("fcf_security")  # noqa: E501
+
+
 def util_srcpanid_present(pkt):
     '''A source PAN ID is included if and only if both src addr mode != 0 and PAN ID Compression in FCF == 0'''  # noqa: E501
+    if pkt.underlayer is None:
+        return False
     if (pkt.underlayer.getfieldval("fcf_srcaddrmode") != 0) and (pkt.underlayer.getfieldval("fcf_panidcompress") == 0):  # noqa: E501
         return True
     else:

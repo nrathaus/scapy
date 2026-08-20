@@ -79,3 +79,11 @@ assert evt[HCI_Cmd_Complete_VSC_Realtek_Read_Mem].data == bytes.fromhex("00b0083
 # event param len = 5 -> 1 data byte
 evt = HCI_Hdr(bytes.fromhex("040e050161fc00ab"))
 assert evt[HCI_Cmd_Complete_VSC_Realtek_Read_Mem].data == b"\xab"
+
+= HCI_Cmd_Complete_VSC_Realtek_Read_Mem standalone dissection without underlayers
+# Regression test: length_from walked pkt.underlayer.underlayer.len, which
+# crashed as soon as a HCI_Cmd_Complete_VSC_Realtek_Read_Mem was dissected
+# without its HCI_Event_Command_Complete / HCI_Event_Hdr underlayer chain.
+p = HCI_Cmd_Complete_VSC_Realtek_Read_Mem(bytes.fromhex("00b0083c"))
+assert p.data == bytes.fromhex("00b0083c")
+p.show()

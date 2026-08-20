@@ -1453,7 +1453,9 @@ class SMB2_Netname_Negotiate_Context_ID(Packet):
     name = "SMB2 Netname Negotiate Context ID"
     fields_desc = [
         StrLenFieldUtf16(
-            "NetName", "", length_from=lambda pkt: pkt.underlayer.DataLength
+            "NetName", "",
+            length_from=lambda pkt: None if pkt.underlayer is None
+            else pkt.underlayer.DataLength
         )
     ]
 

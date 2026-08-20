@@ -49,6 +49,17 @@ assert raw(evt) == bytes.fromhex(
     "180237001c01011d0212161e01011f04ea3f00002701002801012901002a01002b01012c01"
     "002d03010a0e2e01002f0101300645590ba994d4310100")
 
+= HCI_Cmd_Complete_VSC_Intel_Read_Version standalone dissection without underlayers
+# Regression test: length_from walked pkt.underlayer.underlayer.len, which
+# crashed as soon as a HCI_Cmd_Complete_VSC_Intel_Read_Version was dissected
+# without its HCI_Event_Command_Complete / HCI_Event_Hdr underlayer chain.
+tlv = HCI_Cmd_Complete_VSC_Intel_Version_TLV(type=0x10, value=b"AB")
+p = HCI_Cmd_Complete_VSC_Intel_Read_Version(raw(tlv))
+assert len(p.tlvs) == 1
+assert p.tlvs[0].type == 0x10
+assert p.tlvs[0].value == b"AB"
+p.show()
+
 
 + Intel Read Boot Params (OCF 0x00D / opcode 0xFC0D)
 

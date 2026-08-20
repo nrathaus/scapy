@@ -176,6 +176,15 @@ assert p.length == None
 p = MQTT()
 assert bytes(p) == b'\x10\x00'
 
+= MQTTPublish, standalone instantiation without a MQTT underlayer
+# Regression test: MQTTPublish used pkt.underlayer.QOS / pkt.underlayer.len
+# without checking that pkt.underlayer was not None, which crashed as soon
+# as a MQTTPublish was built or shown without being layered under a MQTT().
+p = MQTTPublish(topic='test1', value='test2')
+assert bytes(p) == b'\x00\x05test1test2'
+assert p.msgid is None
+p.show()
+
 = MQTT RandVariableFieldLen
 assert type(MQTT().fieldtype['len'].randval()) == RandVariableFieldLen
 assert type(MQTT().fieldtype['len'].randval() + 0) == int

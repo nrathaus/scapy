@@ -57,3 +57,25 @@ assert pkt2.reserved == 6
 assert pkt2.tunnel_id == 0
 assert pkt2.ext_tunnel_id == "1.1.1.1"
 assert bytes(pkt2) == raw_pkt
+
++ Regression Tests
+
+= RSVP_Data, standalone dissection without an RSVP_Object underlayer
+
+# Regression test: RSVP_Data's Data field used pkt.underlayer.Length
+# without checking that pkt.underlayer was not None, which crashed as
+# soon as RSVP_Data was dissected without being layered under
+# RSVP_Object().
+p = RSVP_Data(b"ABCD")
+assert p.Data == b"ABCD"
+p.show()
+
+= RSVP_SenderTSPEC, standalone dissection without an RSVP_Object underlayer
+
+# Regression test: RSVP_SenderTSPEC's Tokens field used
+# pkt.underlayer.Length without checking that pkt.underlayer was not
+# None, which crashed as soon as RSVP_SenderTSPEC was dissected without
+# being layered under RSVP_Object().
+q = RSVP_SenderTSPEC(b"\x00\x00\x00\x04\x01\x00\x00\x04WXYZ")
+assert q.Tokens == b"WXYZ"
+q.show()

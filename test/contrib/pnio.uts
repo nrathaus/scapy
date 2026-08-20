@@ -181,6 +181,25 @@ assert p[PNIORealTimeCyclicPDU].dataStatus == 0x35
 assert p[PNIORealTimeCyclicPDU].transferStatus == 0
 True
 
+= ProfinetIO RTC PDU parsing without an Ether underlayer
+# Regression test: PNIORealTimeCyclicPDU.next_cls_cb() found a ProfinetIO
+# underlayer but no Ether underlayer, then unconditionally dereferenced
+# ether_layer.src/.dst, which crashed as soon as ProfinetIO was reached
+# through UDP alone (no Ether in the underlayer chain).
+p = UDP(
+    b'\x00\x00\x88\x92\x00\x12\x00\x00' \
+    b'\x80\x00' \
+    b'\x01\x02\x03\x04' \
+    b'\xf0\x00' \
+    b'\x35' \
+    b'\x00'
+)
+assert isinstance(p[ProfinetIO].payload, PNIORealTimeCyclicPDU)
+assert len(p[PNIORealTimeCyclicPDU].data) == 1
+assert isinstance(p[PNIORealTimeCyclicPDU].data[0], PNIORealTimeCyclicDefaultRawData)
+assert p[PNIORealTimeCyclicDefaultRawData].data == b'\x01\x02\x03\x04'
+True
+
 = PROFIsafe parsing (query with F_CRC_SEED=0)
 p = PROFIsafe.build_PROFIsafe_class(PROFIsafeControl, 2)(b'\x80\x80\x40\x01\x02\x03')
 assert p.data == b'\x80\x80'

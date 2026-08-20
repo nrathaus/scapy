@@ -88,3 +88,14 @@ OSPF_LSReq().show2()
 OSPF_LSUpd().show2()
 OSPF_LSAck().show2()
 
+= OSPFv3 - build/dissect without header
+
+# Regression test: these classes used pkt.underlayer.len without checking
+# that pkt.underlayer was not None, which crashed as soon as they were
+# dissected without being layered under their expected OSPFv3_Hdr.
+OSPFv3_Hello().show2()
+OSPFv3_DBDesc().show2()
+OSPFv3_LSReq().show2()
+OSPFv3_LSUpd().show2()
+OSPFv3_LSAck().show2()
+

@@ -81,11 +81,18 @@ class HCI_Cmd_VSC_Realtek_Write_Mem(Packet):
     ]
 
 
+def _realtek_read_mem_complete_len(pkt):
+    u = pkt.underlayer
+    if u is None or u.underlayer is None:
+        return None
+    return u.underlayer.len - 4
+
+
 class HCI_Cmd_Complete_VSC_Realtek_Read_Mem(Packet):
     """Read Controller Memory (0xFC61) command complete"""
     name = "Realtek Read Controller Memory complete"
     fields_desc = [
-        XStrLenField("data", b"", lambda pkt: pkt.underlayer.underlayer.len - 4)
+        XStrLenField("data", b"", _realtek_read_mem_complete_len)
     ]
 
 
