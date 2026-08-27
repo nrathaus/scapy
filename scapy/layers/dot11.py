@@ -734,6 +734,9 @@ class Dot11(Packet):
         _Dot11MacField("addr1", ETHER_ANY, 1),
         ConditionalField(
             _Dot11MacField("addr2", ETHER_ANY, 2),
+            # 'type' can be a live VolatileValue while fuzzing (see fuzz()/forward()),
+            # and VolatileValue.__hash__ is disabled - a set membership test would
+            # raise TypeError, so use a list here instead.
             lambda pkt: (pkt.type not in [1, 3] or
                          pkt.subtype in [0x4, 0x5, 0x6, 0x8, 0x9, 0xa, 0xb, 0xe, 0xf]),
         ),
@@ -941,7 +944,8 @@ class _Dot11EltUtils(Packet):
                     crypto.add(wpa_version)
             elif p.ID == 221:
                 if isinstance(p, Dot11EltMicrosoftWPA):
-                    if p.akm_suites:
+
+                  if p.akm_suites:
                         auth = p.akm_suites[0].sprintf("%suite%")
                         crypto.add("WPA/%s" % auth)
                     else:

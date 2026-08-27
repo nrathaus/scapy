@@ -1,0 +1,135 @@
+% Regression tests for the sequential (non-random) fuzzing state machine
+% MultipleTypeField selectors must not desync their dependent fields
+
+# ICMP.unused is a MultipleTypeField: its concrete field (and therefore the
+# shape of value it expects - int vs bytes, and its own min/max/size) is
+# picked by looking at ICMP.type. fuzz() only resolves this once, using
+# whatever 'type' happens to be at fuzz()-time. Once 'type' itself becomes
+# an actively fuzzed field (this branch deliberately fuzzes fields that
+# MultipleTypeFields depend on - see 'Don't freeze fields if they are
+# dependent, we want to test them'), the cached VolatileValue for 'unused'
+# goes stale: built for a different concrete field than the one that will
+# actually be used to pack it, causing struct.error while building.
+
+############
+############
++ MultipleTypeField resync during fuzzing
+
+= resync_multiple_type_fields refreshes a stale dependent field
+~ fuzzing packet inet
+
+pkt = fuzz(ICMP())
+
+# type defaults to 8 (echo-request), which resolves 'unused' to the
+# StrFixedLenField variant (RandBin-backed)
+assert isinstance(pkt.default_fields['unused'], RandBin)
+
+# Move 'type' to a value that resolves 'unused' to the IntField variant
+# instead (any value not in the MultipleTypeField's exclusion list).
+# ICMP.type is a ByteEnumField, so its volatile is a RandEnumWalk and
+# state_pos is an *index* into the enum's declared values rather than the
+# value itself - ask it where value 1 sits instead of assuming they're the
+# same number (index 1 is icmptypes' second key, 3, which the exclusion list
+# does cover).
+selector = pkt.default_fields['type']
+selector.state_pos = selector.values.index(1)
+assert selector._fix() == 1
+pkt.resync_multiple_type_fields(pkt)
+
+assert isinstance(pkt.default_fields['unused'], RandNum)
+assert not isinstance(pkt.default_fields['unused'], RandBin)
+
+# Must not raise ValueError/struct.error
+data = bytes(pkt)
+
+
+= Untouched MultipleTypeFields are left alone
+~ fuzzing packet inet
+
+pkt = fuzz(ICMP())
+before = pkt.default_fields['unused']
+pkt.resync_multiple_type_fields(pkt)
+assert pkt.default_fields['unused'] is before
+
+
+= forward() through ICMP:type keeps ICMP:unused consistent
+~ fuzzing packet inet
+
+pkt = fuzz(ICMP())
+states = pkt.prepare_combinations(1)
+
+continue_to_fuzz = True
+iterations = 0
+seen_type_change = False
+
+while continue_to_fuzz and iterations < 600:
+    states, continue_to_fuzz = pkt.forward(states)
+    # Must not raise ValueError/struct.error, whichever concrete field
+    # 'unused' currently resolves to
+    data = bytes(pkt)
+    if pkt.type != 8:
+        seen_type_change = True
+    iterations += 1
+
+assert iterations > 0
+assert seen_type_change
+
+
+= End-to-end: Ether()/IP()/ICMP() combination-2 fuzzing must not raise
+~ fuzzing packet inet l2
+
+# dst is set explicitly to skip Ether's MAC resolution (resolve() ->
+# getmacbyip()) - it fails and falls back to broadcast identically on every
+# single build in this environment anyway, so leaving dst unset just burns
+# ~25% of this test's runtime re-deriving the same fallback each iteration.
+pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / IP(dst="192.168.15.1") / ICMP()
+pkt = fuzz(pkt)
+
+states = pkt.prepare_combinations(2)
+continue_to_fuzz = True
+iterations = 0
+
+while continue_to_fuzz and iterations < 20000:
+    states, continue_to_fuzz = pkt.forward(states)
+    data = pkt.show2(dump=True)
+    iterations += 1
+
+assert iterations > 0
+
+
+= resync_multiple_type_fields looks through single-field wrappers
+~ fuzzing packet
+
+# rtmsg_rtattr.rta_data is a PadField wrapped around a MultipleTypeField,
+# selected by the rta_type EnumField next to it. fuzz() unwraps single-field
+# containers before deciding which fields need a resolved randval, so
+# rta_data got one - but resync_multiple_type_fields() tested
+# isinstance(f, MultipleTypeField) on the *wrapper*, never matched, and so
+# never refreshed exactly the fields fuzz() had cached.
+#
+# Latent until enum fields started walking their declared values: rta_type's
+# integer sweep only ever produced multiples of 512, and every variant of
+# rta_data is selected by a value <= 0x10, so the stale bytes-valued
+# XStrLenField default was never handed to an int-valued variant.
+
+from scapy.arch.linux.rtnetlink import rtmsg_rtattr
+
+pkt = fuzz(rtmsg_rtattr())
+states = pkt.prepare_combinations(1)
+
+# 0x04/0x06/0x10 select Field(fmt="=I") and 0x0F an EnumField(fmt="=I"),
+# against a default XStrLenField variant - so a stale cache raises
+# ValueError('Incorrect type of value for field rta_data') on build.
+continue_to_fuzz = True
+iterations = 0
+selected_int_variant = False
+
+while continue_to_fuzz and iterations < 4000:
+    states, continue_to_fuzz = pkt.forward(states)
+    data = bytes(pkt)
+    if pkt.fields.get('rta_type') in [0x04, 0x06, 0x0f, 0x10]:
+        selected_int_variant = True
+    iterations += 1
+
+assert iterations > 0
+assert selected_int_variant, "rta_type never reached a value selecting an int variant"

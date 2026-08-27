@@ -39,6 +39,19 @@ from typing import (
 #  Random numbers  #
 ####################
 
+# Classic off-by-one/overflow boundaries, in value space. Anything a fuzzed
+# field should be made to carry regardless of how its walk happens to be
+# strided: signed/unsigned limits and their immediate neighbours at every
+# common width. Used by Packet._boundary_checkpoints() for the integer walk
+# and by _EnumField._enum_walk_edges() for the enum walk, which want the
+# same set for the same reason.
+MAGIC_BOUNDARIES = (
+    0, 1,
+    0x7f, 0x80, 0xff,
+    0x7fff, 0x8000, 0xffff,
+    0x7fffffff, 0x80000000, 0xffffffff,
+)
+
 
 class RandomEnumeration:
     """iterate through a sequence in random order.
@@ -231,6 +244,7 @@ class RandNum(_RandNumeral[int]):
     """Instances evaluate to random integers in selected range"""
     min = 0
     max = 0
+    state_pos = None
 
     def __init__(self, min, max):
         # type: (int, int) -> None
@@ -245,7 +259,49 @@ class RandNum(_RandNumeral[int]):
 
     def _fix(self):
         # type: () -> int
-        return random.randrange(self.min, self.max + 1)
+
+        # Old code:
+        # return random.randrange(self.min, self.max + 1)
+
+        # New code:
+        if self.state_pos is None:
+            if 'default' in self.__dict__:
+                # If the 'default' exists, use it rather than min
+                # 'min' is '0' causing:
+                #    new_default_fields = {
+                #      key: (val._fix() if isinstance(val, VolatileValue) else val)
+                #      for key, val in six.iteritems(new_default_fields)
+                #    }
+                # To fix the value to '0' rather than use the value that was set by the
+                #   packet generator, for example for ARP(), 'hwtype' will be set to 0
+                #   rather than Ethernet (10Mb)
+                return self.default
+
+            return self.min
+
+        if 'default' in self.__dict__ and isinstance(self.default, tuple):
+            # if the default value is a tuple, we modify the first item
+            if not isinstance(self.default[0], int):
+                raise ValueError("We expected the first value to be a 'int' in the 'tuple'")
+
+            return (self.state_pos, self.default[1])
+
+        if isinstance(self, RandInt):
+            if 'expecting_unsigned_short' in self.__dict__ and self.expecting_unsigned_short:
+                return (self.state_pos % 65535) # needs to be between 0 <= val <= 65535
+
+        if isinstance(self, RandShort):
+            if 'expecting_unsigned_byte' in self.__dict__ and self.expecting_unsigned_byte:
+                return [self.state_pos % 255]
+
+        if isinstance(self, RandByte):
+            # Plain ByteField/XByteField/ByteEnumField all feed this straight into
+            # struct.pack("B", val) via Field.i2m/addfield, which requires an int -
+            # same contract as RandShort/RandInt above. Returning bytes here breaks
+            # every scalar byte field (IP.tos, IP.ttl, ...) as soon as it's fuzzed.
+            return self.state_pos
+
+        return self.state_pos
 
     def __lshift__(self, other):
         # type: (int) -> int
@@ -273,6 +329,13 @@ class RandNum(_RandNumeral[int]):
 
 
 class RandFloat(_RandNumeral[float]):
+    # Kept in line with RandNum/RandBin/RandString: forward() reads
+    # field_obj.state_pos unconditionally on any VolatileValue it's handed,
+    # and without a class-level default here that falls through
+    # VolatileValue.__getattr__ (-> _fix() -> AttributeError on the
+    # resulting float, uncaught).
+    state_pos = None
+
     def __init__(self, min, max):
         # type: (int, int) -> None
         self.min = min
@@ -478,6 +541,180 @@ class RandEnumKeys(RandEnum):
         return self.enum[next(self.seq)]
 
 
+class RandEnumWalk(RandNum):
+    """State-driven walk over an enum field's own declared values, then the rest
+
+    ``Field.randval()`` dispatches on the struct format character alone, so an
+    ``EnumField`` used to be handed a plain ``RandByte``/``RandShort``/... and
+    the ``i2s`` dict sitting on the very same field object was never consulted.
+    The field was then walked as an integer, and at the default
+    ``max_samples_per_field=128`` a byte field is sampled at 128 of its 256
+    points - every *other* value, and never ``min`` itself - so the values a
+    protocol actually defines were the ones least likely to be sent, and a
+    ``{0: "off", 1: "on"}`` enum could send neither of them.
+
+    The list is built in three blocks, and the order is the whole design:
+
+    1. **the declared keys**, in declared order, so a run cut short has covered
+       the protocol's own vocabulary before spending anything else;
+    2. **the guaranteed edges** - 0, the field's maximum, one past the highest
+       declared key, and the ``MAGIC_BOUNDARIES`` that fit (see
+       ``_EnumField._enum_walk_edges()``);
+    3. **undefined values filling the rest of the sampling budget**, spread
+       across whatever the enum leaves unused.
+
+    Blocks 1 and 2 are sent whatever the budget; block 3 is what
+    ``max_samples_per_field`` bounds (see ``plan_budget()``). That split is what
+    keeps both halves of the coverage: an unhandled enum value is its own bug
+    class, and it is most of what the integer sweep provided by accident, so a
+    walk that sent *only* the declared values would trade one blind spot for
+    another - a byte enum field went from 114 undefined values per field to 6.
+
+    Unlike the rest of the ``Rand*`` family, ``state_pos`` here is an *index*
+    into ``values`` rather than the value itself, so ``min``/``max`` bound the
+    list and not the field's integer width.
+    """
+
+    # Packet._advance_state_pos() reads this: the value list is already sized to
+    # the sampling budget, so it must be stepped one at a time. Striding it -
+    # which is what max_samples_per_field means for an integer field - would
+    # sample away the declared values this exists to send.
+    exhaustive = True
+
+    # Above this span, listing the not-yet-used values costs more than it buys:
+    # 'used' is sparse in a 16-bit-or-wider range, so proportional striding
+    # lands on distinct values without enumerating anything.
+    _ENUMERABLE_SPAN = 1024
+
+    def __init__(self, declared, guaranteed, low, high, budget=128):
+        # type: (List[int], List[int], int, int, int) -> None
+        if not declared:
+            raise TypeError("RandEnumWalk needs at least one declared value")
+        self.declared = list(declared)
+        self.guaranteed = list(guaranteed)
+        self.low = low
+        self.high = high
+        self.values = []  # type: List[Any]
+        self._field_default = self.declared[0]  # type: Any
+        self._default_index = 0
+        self._budget = None  # type: Optional[int]
+        self.plan_budget(budget)
+
+    def plan_budget(self, budget):
+        # type: (int) -> None
+        """Size the value list to a max_samples_per_field budget
+
+        Called by ``Packet.initialize_volatile_field()`` with the budget the
+        state carries, which is what makes the density knob mean something for
+        an enum field again: at 128 a byte enum sends its declared values, the
+        guaranteed edges and about a hundred of the remaining range; at 512 it
+        sends all 256. Without this the walk sent the same handful of cases at
+        every density, so a caller stepping 128 -> 512 -> 1024 got identical
+        work out of every enum field.
+
+        Idempotent for a given budget, since a field shared across several
+        pair-states is re-initialized once per pair.
+        """
+        if budget == self._budget:
+            return
+        self._budget = budget
+
+        self.values = self.declared + self.guaranteed
+        self.values.extend(self._undefined_fill(budget))
+        # Indexes the value list directly: 0 .. len(values) - 1. This used to
+        # start at -1, because Packet.forward() advanced a field before
+        # reading it and so emitted min + 1 .. max, never min - which would
+        # have made values[0], the first declared value, unreachable.
+        # Packet._advance_state_pos() now emits a cycle's own starting
+        # position first, for plain integer fields as much as for this one,
+        # so the extra index below the list is no longer needed. _fix()
+        # still clamps, so a read before the first advance renders
+        # values[0] rather than raising.
+        RandNum.__init__(self, 0, len(self.values) - 1)
+        # Re-resolve the field default against the new list.
+        self.default = self._field_default
+
+    def _undefined_fill(self, budget):
+        # type: (int) -> List[int]
+        """Undefined values spread over whatever the enum leaves unused
+
+        Spread rather than clustered at the edges: for an enum whose keys are
+        0..40, 90 is as likely to matter as 254. Deterministic in ``state_pos``,
+        which the state-based walk requires - no randomness anywhere here.
+        """
+        used = set(self.values)
+        room = budget - len(self.values)
+        if room <= 0:
+            # A wide enum can exceed the budget on its own (IP.proto declares
+            # 138 against a default 128). The declared block wins.
+            return []
+
+        span = self.high - self.low + 1
+        unused_count = span - len(used)
+        if unused_count <= room:
+            # The whole value space fits in the budget - send all of it, which
+            # is what a density of 512 on a byte field should mean.
+            return [v for v in range(self.low, self.high + 1) if v not in used]
+
+        if span <= self._ENUMERABLE_SPAN:
+            unused = [v for v in range(self.low, self.high + 1) if v not in used]
+            return [unused[(i * len(unused)) // room] for i in range(room)]
+
+        # Too wide to enumerate: step proportionally through the range and walk
+        # forward off the rare collision with a declared or guaranteed value.
+        filled = []  # type: List[int]
+        for i in range(room):
+            candidate = self.low + (i * span) // room
+            while candidate <= self.high and candidate in used:
+                candidate += 1
+            if candidate > self.high:
+                break
+            used.add(candidate)
+            filled.append(candidate)
+        return filled
+
+    # Everywhere else in this module 'default' is the field's own default
+    # value, and fuzz() assigns it that way ('rnd.default = f.default'). But
+    # Packet.forward() also assigns 'default' straight into 'state_pos' when it
+    # resets an exhausted field, and here state_pos is an index into 'values',
+    # not a value. Keep both meanings: the setter records the real default, the
+    # getter hands the walk machinery the matching index.
+    @property
+    def default(self):
+        # type: () -> int
+        return self._default_index
+
+    @default.setter
+    def default(self, value):
+        # type: (Any) -> None
+        self._field_default = value
+        try:
+            self._default_index = self.values.index(value)
+        except (ValueError, TypeError):
+            # A default the enum doesn't declare (or that got filtered out for
+            # not fitting the field's width) - start the walk at the top of the
+            # list instead, which is the first declared value.
+            self._default_index = 0
+
+    def _command_args(self):
+        # type: () -> str
+        return "declared=%r, guaranteed=%r, low=%r, high=%r" % (
+            self.declared, self.guaranteed, self.low, self.high,
+        )
+
+    def _fix(self):
+        # type: () -> Any
+        if self.state_pos is None:
+            # Not the field being fuzzed right now - same contract as
+            # RandNum._fix(): build with the value the packet would have had.
+            return self._field_default
+
+        # 'max' is len(values) - 1 and Packet.forward() stops a field as soon
+        # as state_pos passes max, so an out-of-range index is a bug rather
+        # than something to wrap around into an unrelated enum entry.
+        return self.values[min(max(self.state_pos, 0), len(self.values) - 1)]
+
+
 class RandChoice(RandField[Any]):
     def __init__(self, *args):
         # type: (*Any) -> None
@@ -513,7 +750,10 @@ class _RandString(RandField[_S], Generic[_S]):
 
 class RandString(_RandString[str]):
     _DEFAULT_CHARS = (string.ascii_uppercase + string.ascii_lowercase +
-                      string.digits)
+                      string.digits).encode("utf-8")
+    min = 0
+    max = 0
+    state_pos = None
 
     def __init__(self, size=None, chars=_DEFAULT_CHARS):
         # type: (Optional[Union[int, RandNum]], str) -> None
@@ -521,6 +761,18 @@ class RandString(_RandString[str]):
             size = RandNumExpo(0.01)
         self.size = size
         self.chars = chars
+        self.max = len(chars)
+
+    def __getitem__(self, start, stop=None, step=None):
+        # Missing subscriptable (needed by BOOTP while show calls it, maybe others?)
+        #  due to i2repr being called/implemented
+        if stop is not None and step is None:
+            return self.chars[start:stop]
+        
+        if stop is not None and step is not None:
+            return self.chars[start:stop:step]
+        
+        return self.chars[start]
 
     def _command_args(self):
         # type: () -> str
@@ -536,15 +788,46 @@ class RandString(_RandString[str]):
         return ret
 
     def _fix(self):
-        # type: () -> str
-        s = ""
-        for _ in range(int(self.size)):
-            s += random.choice(self.chars)
+        # type: () -> bytes
+
+        # Old code:
+        # s = b""
+        # for _ in range(int(self.size)):
+        #     rdm_chr = random.choice(self.chars)
+        #     s += rdm_chr if isinstance(rdm_chr, str) else chb(rdm_chr)
+        # return s
+
+        # State aware code:
+        if self.state_pos is None:
+            # Not the field currently being fuzzed - render its actual
+            # (un-fuzzed) default rather than a fixed-size slice of the
+            # whole charset. fuzz() sets '.default' to the field's original
+            # value; without it (e.g. a fresh MultipleTypeField randval that
+            # hasn't gone through forward()'s init yet), fall back to empty -
+            # self.chars[:self.max] used to be returned unconditionally here,
+            # which for the default 256-byte charset silently inflated every
+            # not-yet-active string/bin field to up to 256 bytes.
+            if 'default' in self.__dict__:
+                return bytes_encode(self.default)
+
+            return b""
+
+        if len(self.chars) == 0:
+            # If no value was given, don't divide it...
+            return bytes_encode(self.chars)
+
+        pos_adjusted = self.state_pos % len(self.chars)
+        s = bytes_encode(self.chars[0:pos_adjusted]) # Make it change by state_pos
+
         return s
 
 
 class RandBin(_RandString[bytes]):
     _DEFAULT_CHARS = b"".join(chb(c) for c in range(256))
+
+    min = 0
+    max = 0
+    state_pos = None
 
     def __init__(self, size=None, chars=_DEFAULT_CHARS):
         # type: (Optional[Union[int, RandNum]], bytes) -> None
@@ -552,23 +835,63 @@ class RandBin(_RandString[bytes]):
             size = RandNumExpo(0.01)
         self.size = size
         self.chars = chars
+        self.max = len(chars)
+
+    def __getitem__(self, start, stop=None, step=None):
+        # Missing subscriptable (needed by BOOTP while show calls it, maybe others?)
+        #  due to i2repr being called/implemented
+        if stop is not None and step is None:
+            return self.chars[start:stop]
+
+        if stop is not None and step is not None:
+            return self.chars[start:stop:step]
+
+        return self.chars[start]
 
     def _command_args(self):
         # type: () -> str
-        if not isinstance(self.size, VolatileValue):
-            return "size=%r" % self.size
+        ret = ""
+        if isinstance(self.size, VolatileValue):
+            if self.size.lambd != 0.01 or self.size.base != 0:
+                ret += "size=%r" % self.size.command()
+        else:
+            ret += "size=%r" % self.size
 
-        if isinstance(self.size, RandNumExpo) and \
-                self.size.lambd == 0.01 and self.size.base == 0:
-            # Default size for RandString, skip
-            return ""
-        return "size=%r" % self.size.command()
+        if self.chars != self._DEFAULT_CHARS:
+            ret += ", chars=%r" % self.chars
+        return ret
 
     def _fix(self):
         # type: () -> bytes
-        s = b""
-        for _ in range(int(self.size)):
-            s += struct.pack("!B", random.choice(self.chars))
+
+        # Old code:
+        # s = b""
+        # for _ in range(int(self.size)):
+        #   s += struct.pack("!B", random.choice(self.chars))
+        # return s
+
+        # State aware code:
+        if self.state_pos is None:
+            # Not the field currently being fuzzed - render its actual
+            # (un-fuzzed) default rather than a fixed-size slice of the
+            # whole charset. fuzz() sets '.default' to the field's original
+            # value; without it (e.g. a fresh MultipleTypeField randval that
+            # hasn't gone through forward()'s init yet), fall back to empty -
+            # self.chars[:self.max] used to be returned unconditionally here,
+            # which for the default 256-byte charset silently inflated every
+            # not-yet-active string/bin field to up to 256 bytes.
+            if 'default' in self.__dict__:
+                return bytes_encode(self.default)
+
+            return b""
+
+        if len(self.chars) == 0:
+            # If no value was given, don't divide it...
+            return bytes_encode(self.chars)
+
+        pos_adjusted = self.state_pos % len(self.chars)
+        s = bytes_encode(self.chars[0:pos_adjusted]) # Make it change by state_pos
+
         return s
 
 
@@ -592,6 +915,16 @@ class RandTermString(RandBin):
 class RandIP(_RandString[str]):
     _DEFAULT_IPTEMPLATE = "0.0.0.0/0"
 
+    _COMBINATIONS = [
+        '0.0.0.0', '127.0.0.1', '255.255.255.255',
+        '10.0.0.0', '172.16.0.0', '192.168.0.0',
+        '169.254.0.0', '254.254.254.254',
+        '192.0.2.1', '198.51.100.0', '203.0.113.0',
+        '224.0.0.0', '239.255.255.255']
+    min = 0
+    max = len(_COMBINATIONS)
+    state_pos = None
+
     def __init__(self, iptemplate=_DEFAULT_IPTEMPLATE):
         # type: (str) -> None
         super(RandIP, self).__init__()
@@ -606,10 +939,45 @@ class RandIP(_RandString[str]):
 
     def _fix(self):
         # type: () -> str
-        return self.ip.choice()
+
+        # Old:
+        # return self.ip.choice()
+
+        # New:
+        if self.state_pos is None:
+            # Not the field being fuzzed right now - same contract as
+            # RandNum._fix()/RandString._fix(): build with the value the
+            # packet would have had. Without this every IP-typed field that
+            # isn't the active one both built and rendered as
+            # _COMBINATIONS[0], 0.0.0.0, instead of its own default
+            # (OSPF_Hdr.src is 1.1.1.1 until the layer is fuzzed).
+            if 'default' in self.__dict__ and self.default is not None:
+                return self.default
+
+            return self._COMBINATIONS[0]
+
+        # No 'state_pos > 0' guard: index 0 is a value of the list like any
+        # other, and skipping it made _COMBINATIONS[0] unreachable the same
+        # way min used to be for an integer field.
+        return self._COMBINATIONS[self.state_pos % len(self._COMBINATIONS)]
 
 
 class RandMAC(_RandString[str]):
+    # https://www.iana.org/assignments/ethernet-numbers/ethernet-numbers.xhtml
+    _COMBINATIONS = [
+        '00:00:00:00:00:00',
+        'FF:FF:FF:FF:FF:FF', # Broadcast
+        '00:00:5E:00:00:00', # Reserved
+        '00:00:5E:00:01:00', # VRRP
+        '00:00:5E:00:02:01', # VRRP IPv6
+        '00:00:5E:00:03:00', # Unassigned
+        '01:00:5E:00:00:00', # Multicast
+        '01:00:5E:80:00:00', # MPLS Multicast
+    ]
+    min = 0
+    max = len(_COMBINATIONS)
+    state_pos = None
+
     def __init__(self, _template="*"):
         # type: (str) -> None
         super(RandMAC, self).__init__()
@@ -636,17 +1004,48 @@ class RandMAC(_RandString[str]):
 
     def _fix(self):
         # type: () -> str
-        return "%02x:%02x:%02x:%02x:%02x:%02x" % self.mac  # type: ignore
+
+        # Old:
+        # return "%02x:%02x:%02x:%02x:%02x:%02x" % self.mac  # type: ignore
+
+        # New: same contract as RandNum._fix()/RandIP._fix() - render the
+        # field's own default when this isn't the field being fuzzed, and
+        # treat index 0 as a value like any other rather than as a stand-in
+        # for "not fuzzed" (which made _COMBINATIONS[0] unreachable and made
+        # every MAC field that isn't the active one build as 00:00:00:00:00:00
+        # instead of the address it carries).
+        if self.state_pos is None:
+            if 'default' in self.__dict__ and self.default is not None:
+                return self.default
+
+            return self._COMBINATIONS[0]
+
+        return self._COMBINATIONS[self.state_pos % len(self._COMBINATIONS)]
+
 
 
 class RandIP6(_RandString[str]):
-    def __init__(self, ip6template="**"):
+    _DEFAULT_IPTEMPLATE = "**"
+
+    _COMBINATIONS = [
+        '::', '::1', '::ffff:192.0.2.1',
+        'fc00::1', 'fe80::abcd:ef12', 'fd00::', 'fd80::1',
+        'fe80::1', '::ffff:FEEF:FEEF', 'ff00::1', 'ff02::1',
+        '2001:db8:85a3:0:0:8a2e:370:7334', '2001:db8::1', '2001:db8:1234:113::',
+        'ff02::1', 'ff02::255', 'ff0e::1', 'fd12:3456:789a::1',
+        'fec0::1', '::255.255.255.255', '2002:ffff:ffff:ffff:ffff:ffff:ffff:ffff'
+        ]
+    min = 0
+    max = len(_COMBINATIONS)
+    state_pos = None
+
+    def __init__(self, ip6template=_DEFAULT_IPTEMPLATE):
         # type: (str) -> None
         super(RandIP6, self).__init__()
         self.tmpl = ip6template
         self.sp = []  # type: List[Union[int, RandNum, str]]
         for v in self.tmpl.split(":"):
-            if not v or v == "**":
+            if not v or v == self._DEFAULT_IPTEMPLATE:
                 self.sp.append(v)
                 continue
             if "-" in v:
@@ -675,31 +1074,43 @@ class RandIP6(_RandString[str]):
 
     def _fix(self):
         # type: () -> str
-        nbm = self.multi
-        ip = []  # type: List[str]
-        for i, n in enumerate(self.sp):
-            if n == "**":
-                nbm -= 1
-                remain = 8 - (len(self.sp) - i - 1) - len(ip) + nbm
-                if "" in self.sp:
-                    remain += 1
-                if nbm or self.variable:
-                    remain = random.randint(0, remain)
-                for j in range(remain):
-                    ip.append("%04x" % random.randint(0, 65535))
-            elif isinstance(n, RandNum):
-                ip.append("%04x" % int(n))
-            elif n == 0:
-                ip.append("0")
-            elif not n:
-                ip.append("")
-            else:
-                ip.append("%04x" % int(n))
-        if len(ip) == 9:
-            ip.remove("")
-        if ip[-1] == "":
-            ip[-1] = "0"
-        return ":".join(ip)
+
+        # Old
+        # nbm = self.multi
+        # ip = []  # type: List[str]
+        # for i, n in enumerate(self.sp):
+        #     if n == "**":
+        #         nbm -= 1
+        #         remain = 8 - (len(self.sp) - i - 1) - len(ip) + nbm
+        #         if "" in self.sp:
+        #             remain += 1
+        #         if nbm or self.variable:
+        #             remain = random.randint(0, remain)
+        #         for j in range(remain):
+        #             ip.append("%04x" % random.randint(0, 65535))
+        #     elif isinstance(n, RandNum):
+        #         ip.append("%04x" % int(n))
+        #     elif n == 0:
+        #         ip.append("0")
+        #     elif not n:
+        #         ip.append("")
+        #     else:
+        #         ip.append("%04x" % int(n))
+        # if len(ip) == 9:
+        #     ip.remove("")
+        # if ip[-1] == "":
+        #     ip[-1] = "0"
+        # return ":".join(ip)
+
+        # New: see RandIP._fix() - the field's own default when this isn't
+        # the field being fuzzed, and index 0 reachable like any other.
+        if self.state_pos is None:
+            if 'default' in self.__dict__ and self.default is not None:
+                return self.default
+
+            return self._COMBINATIONS[0]
+
+        return self._COMBINATIONS[self.state_pos % len(self._COMBINATIONS)]
 
 
 class RandOID(_RandString[str]):

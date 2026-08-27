@@ -30,7 +30,9 @@ from scapy.fields import (
     Emph,
     EnumField,
     Field,
+    FieldListField,
     FlagsField,
+    _FieldContainer,
     FlagValue,
     MultiEnumField,
     MultipleTypeField,
@@ -44,7 +46,7 @@ from scapy.compat import raw, bytes_encode
 from scapy.base_classes import BasePacket, Gen, SetGen, Packet_metaclass, \
     _CanvasDumpExtended
 from scapy.interfaces import _GlobInterfaceType
-from scapy.volatile import RandField, VolatileValue
+from scapy.volatile import MAGIC_BOUNDARIES, RandField, VolatileValue
 from scapy.utils import import_hexcap, tex_escape, colgen, issubtype, \
     pretty_list, EDecimal
 from scapy.error import Scapy_Exception, log_runtime, warning
@@ -77,6 +79,40 @@ except ImportError:
 
 
 _T = TypeVar("_T", Dict[str, Any], Optional[Dict[str, Any]])
+
+
+class FuzzStates(list):
+    """
+    The list Packet.prepare_combinations() returns, plus a cursor.
+
+    Packet.forward() has to find the first state whose 'done' is still
+    False, and used to look for it from index 0 on every call. A state
+    only ever goes from not-done to done, so the finished prefix grows
+    monotonically and that scan re-walks it every time - quadratic in the
+    state count, paid per case sent (a 210-state stack examined 66.6
+    entries per step to reach one live state).
+
+    'first_live' is the index the scan starts at: the finished prefix is
+    everything below it. forward() moves it forward as states complete
+    and never back, so the scan is O(1) amortised over a run.
+
+    A plain list still works everywhere a FuzzStates does - forward()
+    reads the cursor with getattr(states, 'first_live', 0) and skips
+    updating it when it isn't there, so a caller that hands over its own
+    hand-built list (or a filtered subset, as several tests do) gets
+    exactly the old full-scan behaviour rather than an error. Wrap such a
+    list in FuzzStates() to get the cursor back.
+
+    The one thing that would break the cursor is a caller setting a
+    state's 'done' back to False after forward() has passed it; nothing
+    in this fork does that, and prepare_combinations() is the way to get
+    a fresh walk.
+    """
+
+    def __init__(self, iterable=()):
+        # type: (Any) -> None
+        super(FuzzStates, self).__init__(iterable)
+        self.first_live = 0
 
 
 class Packet(
@@ -832,6 +868,1042 @@ class Packet(
         # type: () -> bytes
         return self.payload.build_padding()
 
+    def return_relevant_fields(self, pkt):
+        """
+        Recursively collect all the fields that we can fuzz
+        """
+        relevant_fields = []
+        
+        # If we provided fields in the constrcution, override the default ones
+        for field_name in pkt.fields:
+            current = pkt.default_fields[field_name]
+            if isinstance(current, VolatileValue):
+                continue
+            if isinstance(current, list) and any(
+                isinstance(v, VolatileValue)
+                or (isinstance(v, tuple) and any(isinstance(vv, VolatileValue) for vv in v))
+                for v in current
+            ):
+                # A FieldListField whose items were individually fuzzed
+                # (e.g. Dot11EltRates.rates), or a named-option-style
+                # field whose items' values were individually fuzzed
+                # (e.g. DHCP.options via fuzz_current_value()) - don't
+                # clobber the fuzzed items with the plain constructor-time
+                # value.
+                continue
+            pkt.default_fields[field_name] = pkt.fields[field_name]
+
+        for field_name in pkt.default_fields:
+            if field_name in pkt.overloaded_fields:
+                # This is not actually fuzzable, as it gets overloaded
+                # print(f"Skipping: {pkt._name}-{field_name}")
+                continue
+
+            field = pkt.default_fields[field_name]
+
+            if isinstance(field, list):
+                # If the field is a list, see if it has something inside, if it does
+                #  go into it
+                if len(field) == 0:
+                    # Empty list should be skipped
+                    continue
+
+                for idx, field_value in enumerate(field):
+                    if isinstance(field_value, VolatileValue):
+                        # A FieldListField item (e.g. Dot11EltRates.rates) -
+                        # fuzz() gives each item its own randval taken from
+                        # the field's inner field type, so it's directly
+                        # fuzzable without going through a sub-Packet.
+                        relevant_fields.append(f"{pkt.name}:{field_name}:{idx}")
+                        continue
+
+                    if isinstance(field_value, tuple):
+                        # A named-option-style list item (e.g. DHCP.options'
+                        # ('requested_addr', <VolatileValue>)) - the tuple
+                        # itself isn't fuzzable, but one of its elements is.
+                        if any(isinstance(v, VolatileValue) for v in field_value):
+                            relevant_fields.append(f"{pkt.name}:{field_name}:{idx}")
+                        continue
+
+                    if not isinstance(field_value, Packet):
+                        continue
+
+                    for field_in_list_name in field_value.default_fields.keys():
+                        field_in_list = field_value.default_fields[field_in_list_name]
+
+                        # Only genuinely fuzzed (VolatileValue) sub-fields are
+                        # relevant - anything else is a concrete/unfuzzed
+                        # value (NoneType/int/str/bytes/_ScopedIP/BGPORF/a
+                        # FlagValue whose ConditionalField gate wasn't met/
+                        # RSNCipherSuite/PMKIDListPacket/...). We don't allow
+                        # 'list' inside 'list' (at the moment) either.
+                        if not isinstance(field_in_list, VolatileValue):
+                            continue
+
+                        relevant_fields.append(f"{pkt.name}:{field_name}:{idx}:{field_in_list_name}")
+
+                continue
+
+            if not isinstance(field, VolatileValue):
+                # Concrete/unfuzzed value - covers plain NoneType/int/str/
+                # bytes/_ScopedIP/BGPORF defaults fuzz() never touched, as
+                # well as a FlagValue left concrete because its
+                # ConditionalField's condition wasn't met when fuzz() ran
+                # (RadioTap.hemuou_per_user_known, Dot11.FCfield2, ...), and
+                # RSNCipherSuite/PMKIDListPacket (not yet supported).
+                continue
+
+            # print(f"Adding: {pkt.name}-{field_name}")
+            relevant_fields.append(f"{pkt.name}:{field_name}")
+
+        if type(pkt.payload).__name__ != 'NoPayload':
+            relevant_fields += self.return_relevant_fields(pkt.payload)
+
+        return relevant_fields
+
+    def locate_field(self, pkt, name):
+        """ Locate a given field name inside a pkt (recursively) """
+        packet_type = name[0:name.index(':')]
+        packet_field = name[name.index(':')+1:]
+        field_type = "normal"
+        field_idx = None
+        field_in_list = None
+
+        # Make sure we are in the right place
+        if pkt.name == packet_type:
+            if ":" in packet_field:
+                # There is a subsequent item/value here, it should be the index of 'list'
+                field_list = packet_field[packet_field.index(':')+1:]
+
+                # Remove the 'list' part
+                packet_field = packet_field[:packet_field.index(':')]
+
+                if ":" in field_list:
+                    # A list of sub-Packets: idx:subfield (e.g. IP options)
+                    field_type = "list"
+                    field_idx = field_list[:field_list.index(':')]
+                    field_in_list = field_list[field_list.index(':')+1:]
+                else:
+                    # A list of raw scalar VolatileValues: idx only
+                    #  (e.g. Dot11EltRates.rates)
+                    field_type = "list_scalar"
+                    field_idx = field_list
+                    field_in_list = None
+
+                try:
+                    field_idx = int(field_idx)
+                except:
+                    raise ValueError(f"We expected {field_idx} to be an int ")
+
+                if packet_field not in pkt.default_fields:
+                    raise ValueError(f"We are referencing {packet_field} which is not found inside default_fields")
+
+                val = pkt.default_fields[packet_field]
+                if not isinstance(val, list):
+                    raise ValueError(f"The field {packet_field} isn't a list")
+
+                if field_idx > len(val):
+                    raise ValueError(f"The field {packet_field} cannot accomodate {field_idx} index")
+
+            if (packet_field not in pkt.fields and packet_field not in pkt.default_fields):
+                raise ValueError(f"Cannot find {packet_field} inside {packet_type}")
+
+            if packet_field in pkt.default_fields:
+                if field_type == "list":
+                    if field_idx >= len(pkt.default_fields[packet_field]):
+                        raise ValueError(f"Shouldn't be None, did we not find the obj? {field_idx=}:{field_in_list=}")
+
+                    item_in_list = pkt.default_fields[packet_field][field_idx]
+
+                    if item_in_list.default_fields[field_in_list] is None:
+                        raise ValueError(f"Shouldn't be None, did we not find the obj? {field_idx=}:{field_in_list=}")
+                    return (pkt, item_in_list.default_fields[field_in_list])
+
+                if field_type == "list_scalar":
+                    if field_idx >= len(pkt.default_fields[packet_field]):
+                        raise ValueError(f"Shouldn't be None, did we not find the obj? {field_idx=}")
+
+                    item = pkt.default_fields[packet_field][field_idx]
+                    if isinstance(item, tuple):
+                        # A named-option-style item (e.g. DHCP.options'
+                        # ('requested_addr', <VolatileValue>)) - locate the
+                        # VolatileValue element inside it.
+                        for v in item:
+                            if isinstance(v, VolatileValue):
+                                return (pkt, v)
+                        raise ValueError(
+                            f"No VolatileValue found inside tuple at "
+                            f"{packet_field}[{field_idx}]"
+                        )
+
+                    return (pkt, item)
+
+                return (pkt, pkt.default_fields[packet_field])
+
+            if packet_field in pkt.fields:
+                return (pkt, pkt.fields[packet_field])
+            
+            raise ValueError("Shouldn't have reached this point")
+
+        return pkt.locate_field(pkt.payload, name)
+
+
+    def prepare_combinations(
+        self,
+        complexity: int,
+        max_samples_per_field: int = 128,
+        boundary_values: bool = False,
+    ) -> List:
+        """
+        Prepare fuzzing by returning a 'states' of fields.
+
+        :param complexity: how many fields are fuzzed together per state
+            (as before).
+        :param max_samples_per_field: caps how many distinct values a
+            single field is sampled at before forward() moves on (replaces
+            the previously hardcoded 128). Defaults to 128, matching prior
+            behavior exactly for callers that don't pass this.
+        :param boundary_values: when True, guarantees each field's exact
+            min/max/off-by-one/type-width 'magic' values (0x7F, 0x80, 0xFF,
+            ...) are visited at least once, in addition to the normal
+            uniform sampling - see Packet._boundary_checkpoints(). Defaults
+            to False, so existing callers see no change in the sequence of
+            values produced or in combination counts.
+        """
+        relevant_fields = self.return_relevant_fields(self)
+
+        # If there is more than one field, do a combination, otherwise just put it
+        if len(relevant_fields) > 1:
+            potential_states = itertools.combinations(relevant_fields, complexity)
+        else:
+            potential_states = [relevant_fields]
+
+        states = []
+
+        for potential_state in potential_states:
+            state = {
+                'active': False,
+                'done': False,
+                'combinations': 0
+            }
+
+            fields = []
+            for field in potential_state:
+                fields.append({
+                    'name': field,
+                    'done': False,
+                    'combinations': 0,
+                    'active': False,
+                    'max_samples': max_samples_per_field,
+                    'boundary_values': boundary_values,
+                })
+
+            state['fields'] = fields
+
+            states.append(state)
+
+        # A FuzzStates rather than a plain list: it carries the cursor
+        # forward() scans from, so a long walk doesn't re-examine its own
+        # finished prefix on every call - see FuzzStates.
+        return FuzzStates(states)
+
+    def display_now_fuzzing(self, fields):
+        """
+        Display the 'now fuzzing' in a nicer way
+        """
+        fields_fuzzed = []
+        for field in fields:
+            fields_fuzzed.append(field['name'])
+
+        print(f"Now fuzzing: {', '.join(fields_fuzzed)}")
+
+    def return_active_state(self, states):
+        """
+        Return the state that is active or 'None'
+        """
+
+        # Same cursor as forward() uses: a done state is never active
+        # (forward() clears 'active' when it marks one done), so the
+        # active state - if there is one - is always at or past it.
+        for index in range(getattr(states, 'first_live', 0), len(states)):
+            if states[index]['active']:
+                return states[index]
+
+        return None
+
+    def initialize_volatile_field(self, field_obj, boundary_values=False,
+                                  max_samples=128):
+        """
+        Set up a VolatileValue so forward() can drive it: state_pos, default,
+        min/max all need to be concrete before anything does
+        field_obj.state_pos += 1. Used both the first time a field becomes
+        part of an active fuzzing state, and whenever
+        resync_multiple_type_fields() swaps in a freshly-created
+        VolatileValue for a MultipleTypeField mid-run.
+
+        boundary_values=True additionally seeds a queue of edge-case
+        checkpoints (see _boundary_checkpoints()) that _advance_state_pos()
+        will drain before falling back to uniform jump sampling. Defaults to
+        False so existing callers that don't opt in see no behavior change.
+
+        max_samples is the state's max_samples_per_field. Most volatiles get
+        their density applied by _advance_state_pos() striding over a fixed
+        range, but a volatile that enumerates a list (RandEnumWalk) has to
+        apply it when it *builds* that list - striding would drop the very
+        values it exists to send - so it's offered the budget here, before
+        anything reads its min/max.
+        """
+        plan_budget = getattr(field_obj, 'plan_budget', None)
+        if callable(plan_budget):
+            plan_budget(max_samples)
+
+        if hasattr(field_obj, "default"):
+            # Some fields have a 'default'
+            if type(field_obj.default).__name__ in ['str', 'bytes', 'tuple']:
+                # Store the value so we can use it
+                field_obj.default = field_obj.default
+            elif type(field_obj.default).__name__ == 'int':
+                field_obj.state_pos = field_obj.default
+            else:
+                field_obj.default = None
+
+        # Some fields don't have a 'default', try to use 'min'
+        if hasattr(field_obj, "min") and type(field_obj.min).__name__ == 'int':
+            field_obj.state_pos = field_obj.min
+
+            if not hasattr(field_obj, "default") or field_obj.default is None:
+                # set it to something if it doesn't have a value
+                field_obj.default = field_obj.min
+        else:
+            # Some have nothing
+            field_obj.default = 0
+            field_obj.min = 0
+            field_obj.state_pos = 0
+
+        # RandString has a 'size' rather than max
+        if hasattr(field_obj, 'size'):
+            if isinstance(field_obj.size, int):
+                field_obj.max = field_obj.size
+            else:
+                field_obj.max = field_obj.size.max
+
+        # Make sure it exists
+        if not hasattr(field_obj, 'max'):
+            field_obj.max = field_obj.min
+
+        field_obj._pending_checkpoints = (
+            self._boundary_checkpoints(field_obj) if boundary_values else []
+        )
+        # Independent cursor for the sampling walk, so that draining
+        # boundary checkpoints (which can leave state_pos sitting anywhere,
+        # including field_obj.max) never perturbs where the walk itself has
+        # gotten to - see _advance_state_pos().
+        self._restart_walk(field_obj)
+
+    def _boundary_checkpoints(self, field_obj):
+        """
+        Edge-case state_pos values for field_obj, clipped to [min, max]:
+        the range's own endpoints, their immediate neighbors, the midpoint,
+        and any MAGIC_BOUNDARIES constant that falls inside the range
+        (0x7F/0x80/0xFF/... - classic off-by-one/overflow boundaries).
+        Uniform jump sampling isn't guaranteed to land on any of these when
+        (max - min) doesn't divide evenly by the jump stride.
+        """
+        if getattr(field_obj, 'exhaustive', False):
+            # A RandEnumWalk indexes a value list, so 0x7f/0x80/0xff here would
+            # name list positions rather than values - and its list already
+            # carries the field's real boundaries (see
+            # _EnumField._enum_walk_edges()), which the walk visits anyway.
+            return []
+
+        lo, hi = field_obj.min, field_obj.max
+        if lo > hi:
+            lo, hi = hi, lo
+
+        candidates = {lo, hi}
+        width = hi - lo
+        if width > 0:
+            candidates.add(lo + 1)
+            candidates.add(hi - 1)
+            candidates.add(lo + width // 2)
+
+        for magic in MAGIC_BOUNDARIES:
+            if lo <= magic <= hi:
+                candidates.add(magic)
+
+        return sorted(candidates)
+
+    def _restart_walk(self, field_obj, after_reset=False):
+        """
+        Begin a fresh sampling cycle for field_obj.
+
+        Called from initialize_volatile_field(), where state_pos is the
+        field's min and nothing has been built from this field yet, so the
+        cycle starts there and its first advance emits it.
+
+        Also called from every place forward() force-resets an exhausted
+        field, because a field carried into again at complexity >= 2 walks
+        its range once more. Two things differ there (after_reset=True):
+
+        - **the new cycle climbs from 'min', not from where the reset left
+          state_pos.** The reset puts the field back on the value it
+          renders while it is not being driven - its default - and that is
+          not a starting point for a fresh traversal. For a field whose
+          default is its own max it is the *end* of one: BGPHeader.marker
+          defaults to 2**128-1, so every later cycle spanned nothing and
+          spent its carry sending that one value again (256 of 383 driven
+          steps, 67%, at complexity 2). PPTPStartControlConnectionRequest
+          .maximum_channels is the same shape.
+        - **the first value is skipped when the reset already sent it.**
+          The call that resets a field also builds a case with the field
+          at that value, so re-emitting it on the next call would send a
+          byte-identical packet - one wasted case per carry, which for a
+          4-value field like LWAPP.ver at complexity 2 was 791 of 4,000
+          steps. A field whose default is not its min (or is not an int
+          at all - state_pos is None then, meaning "render your own
+          default") has not sent min, so it starts at index 0.
+        """
+        if after_reset:
+            field_obj._walk_base = field_obj.min
+            field_obj._walk_index = (
+                1 if field_obj.state_pos == field_obj._walk_base else 0
+            )
+            return
+
+        field_obj._walk_base = field_obj.state_pos
+        # 0, not 1: the first advance of a cycle emits _walk_base itself -
+        # see _advance_state_pos().
+        field_obj._walk_index = 0
+
+    def _advance_state_pos(self, field_obj, max_samples):
+        """
+        Move field_obj.state_pos to its next sample.
+
+        The samples of one cycle are spread over [_walk_base, max]
+        *inclusive of both ends*, so a field reaches its own extremes:
+
+        - the first advance of a cycle emits _walk_base itself. forward()
+          advances a field before reading it, so a walk that started by
+          stepping emitted min + 1 .. max and never min - and min is what a
+          reserved-must-be-zero field, a "no such type" branch or a
+          zero-length count turns on. This is the same reason RandEnumWalk
+          used to start its index at -1, which it no longer needs to.
+        - the rest are 'max_samples' points evenly spread to land exactly on
+          max, rather than a fixed integer stride from min. A byte field at
+          the default density used to jump by round(256/128) = 2 and send
+          2, 4, ... 254: one parity of the range, no minimum and no maximum.
+          Counting samples instead of accumulating a rounded stride sends
+          both endpoints and both parities.
+
+        Pending boundary checkpoints (see _boundary_checkpoints()) are
+        drained after the cycle's first value and before the spread ones, so
+        boundary_values=True still supplements the walk rather than
+        replacing it: the spread is driven by the sample count it keeps in
+        _walk_index, which a checkpoint leaving state_pos at max cannot
+        perturb.
+
+        _walk_base/_walk_index always exist by the time a normal
+        (prepare_combinations-driven) field reaches here, seeded by
+        initialize_volatile_field(). The seeding below is only for a field
+        whose state_pos was set directly by the caller instead - e.g. a
+        hand-crafted 'active': True state that bypasses
+        initialize_volatile_field() entirely. It counts that position as a
+        value already emitted, so such a field advances *past* where the
+        caller left it instead of re-sending it.
+        """
+        if not hasattr(field_obj, '_walk_base'):
+            field_obj._walk_base = field_obj.state_pos
+            field_obj._walk_index = 1
+
+        if field_obj._walk_index == 0:
+            field_obj._walk_index = 1
+            field_obj.state_pos = field_obj._walk_base
+            return
+
+        pending = getattr(field_obj, '_pending_checkpoints', None)
+        while pending:
+            candidate = pending.pop(0)
+            if candidate != field_obj.state_pos:
+                field_obj.state_pos = candidate
+                return
+
+        if getattr(field_obj, 'exhaustive', False):
+            # A RandEnumWalk's [min, max] is an index into a value list that is
+            # already the interesting set - the protocol's own vocabulary plus
+            # its edges. Sampling that down at every other index is exactly the
+            # blind spot RandEnumWalk exists to close, so it always steps by 1.
+            max_samples = max(max_samples, field_obj.max - field_obj.min)
+
+        base = field_obj._walk_base
+        index = field_obj._walk_index
+        span = field_obj.max - base
+        if span > max_samples > 1:
+            # index runs 0 .. max_samples - 1 over the cycle, so the last
+            # sample is base + span == max exactly, and the one after it
+            # overshoots and ends the field.
+            field_obj.state_pos = base + round(index * span / (max_samples - 1))
+        else:
+            # The whole range fits in the budget - send every value of it.
+            field_obj.state_pos = base + index
+        field_obj._walk_index = index + 1
+
+    def _is_fuzzed_list(self, value):
+        """
+        Is this default_fields entry a list whose items fuzz() replaced
+        with per-item randvals (see _fuzz_list_items())? Those are driven
+        one index at a time ("Layer:field:index"), so anything that
+        replaces the field wholesale has to keep that shape.
+        """
+        return (
+            isinstance(value, list)
+            and len(value) > 0
+            and any(isinstance(item, VolatileValue) for item in value)
+        )
+
+    def _write_list_index(self, packet_holder, field_name, list_idx, new_value):
+        """
+        Update a single index of a list-shaped field's raw stored value
+        (packet_holder.fields[field_name]), preserving every other item.
+        Collapsing the whole list down to a single-item list (the older
+        behavior) is only correct when the list genuinely has one item
+        (e.g. Dot11EltRates.rates' default [0x82]) - for a multi-item list
+        (Dot11EltRates.rates=[130, 132, 11, 22], DHCP.options with several
+        named options) it would silently discard every other item.
+
+        If the item at that index is a tuple (e.g. DHCP's
+        ('option_name', <value>)), only the element that was the
+        VolatileValue gets replaced - looked up via default_fields, which
+        always keeps the live VolatileValue at that position regardless of
+        what 'fields' currently holds (already-fixed concrete values,
+        which don't carry that information anymore).
+        """
+        if list_idx is None:
+            return
+
+        template = packet_holder.default_fields.get(field_name)
+        if not isinstance(template, list) or list_idx >= len(template):
+            return
+
+        if not hasattr(packet_holder, "default_list_value"):
+            # Snapshot the pristine (pre-fuzzing) list the first time any
+            # index of this field is touched - restoring one index to its
+            # default later needs this, not whatever's mid-cycle by then.
+            setattr(
+                packet_holder,
+                "default_list_value",
+                list(packet_holder.fields.get(field_name, template)),
+            )
+
+        if field_name in packet_holder.fields and isinstance(packet_holder.fields[field_name], list):  # noqa: E501
+            current_list = list(packet_holder.fields[field_name])
+        else:
+            current_list = list(packet_holder.default_list_value)
+
+        while len(current_list) <= list_idx:
+            current_list.append(template[len(current_list)])
+
+        template_item = template[list_idx]
+        if isinstance(template_item, tuple):
+            current_list[list_idx] = tuple(
+                new_value if isinstance(v, VolatileValue) else v
+                for v in template_item
+            )
+        else:
+            current_list[list_idx] = new_value
+
+        packet_holder.fields[field_name] = current_list
+
+    def _reset_list_index(self, packet_holder, field_name, list_idx):
+        """
+        Restore a single index of a list-shaped field back to its
+        pristine (pre-fuzzing) value, leaving every other index (which
+        may still be actively fuzzed as part of a different combination)
+        untouched.
+        """
+        if list_idx is None or not hasattr(packet_holder, "default_list_value"):
+            return
+        if list_idx >= len(packet_holder.default_list_value):
+            return
+
+        if field_name in packet_holder.fields and isinstance(packet_holder.fields[field_name], list):  # noqa: E501
+            current_list = list(packet_holder.fields[field_name])
+        else:
+            current_list = list(packet_holder.default_list_value)
+
+        current_list[list_idx] = packet_holder.default_list_value[list_idx]
+        packet_holder.fields[field_name] = current_list
+
+    def resync_multiple_type_fields(self, pkt, max_samples=128):
+        """
+        A MultipleTypeField's concrete field (and therefore the shape of
+        value it expects - e.g. int vs bytes, and its own min/max/size) is
+        picked by looking at other fields on the packet (e.g. ICMP.type
+        selects whether 'unused' is a Short/Int/StrFixedLen). When one of
+        those selector fields is itself being fuzzed, the VolatileValue we
+        cached in default_fields at fuzz()-time can go stale: it was built
+        for a different concrete field than the one that will actually be
+        used to pack it once the selector's value has moved on. Whenever a
+        field's value changes, re-resolve every MultipleTypeField on the
+        same packet and refresh its cached VolatileValue if the resolved
+        concrete field no longer matches.
+
+        Resolved VolatileValues are cached per concrete variant (keyed by
+        the resolved Field descriptor's identity - MultipleTypeField.flds
+        holds the same descriptor objects across calls, so this is
+        stable) instead of always building a fresh one. Without this, a
+        selector that oscillates between two ranges (e.g.
+        LLDPDUChassisID.subtype cycling through the value that selects
+        RandMAC for 'id' and then back out of it) would rebuild 'id' from
+        scratch - with state_pos reset to the start - on every single
+        oscillation, wiping out whatever progress 'id' had accumulated
+        and livelocking forward() (it can never reach 'done').
+
+        max_samples is passed through to initialize_volatile_field() for a
+        freshly-built volatile: a MultipleTypeField can resolve to an enum
+        field (rtmsg_rtattr.rta_data has an EnumField(fmt="=I") variant), and
+        one of those sizes its value list to the sampling budget, so handing it
+        the default here would silently pin it to a density the run isn't at.
+        """
+        if not hasattr(pkt, '_multiple_type_field_cache'):
+            pkt._multiple_type_field_cache = {}
+        cache = pkt._multiple_type_field_cache
+
+        for outer in pkt.fields_desc:
+            # Unwrap the same way fuzz() does: a MultipleTypeField can sit
+            # inside a single-field container (rtmsg_rtattr.rta_data is a
+            # PadField around one), and fuzz() looks through those when it
+            # decides which fields need a resolved randval - so this has to
+            # look through them too, or the fields fuzz() cached are exactly
+            # the ones that never get refreshed. Reached once an enum
+            # selector started walking its declared values: rta_type's
+            # integer sweep only ever produced multiples of 512, none of
+            # which select a variant, so this stayed latent.
+            f = _unwrap_field(outer)
+            if not isinstance(f, MultipleTypeField):
+                continue
+
+            resolved_fld = f._find_fld_pkt(pkt)
+            cache_key = id(resolved_fld)
+            field_cache = cache.setdefault(f.name, {})
+
+            if field_cache.get('_active_key') == cache_key:
+                # Still resolved to the same variant as last time, nothing to do
+                continue
+
+            if cache_key in field_cache:
+                # Seen this concrete variant before on this packet -
+                # restore its previous progress rather than starting over
+                pkt.default_fields[f.name] = field_cache[cache_key]
+            elif self._is_fuzzed_list(pkt.default_fields.get(f.name)):
+                # This MultipleTypeField is driven per list item (fuzz()
+                # found the caller holding a list here - see
+                # _fuzz_list_items()), so the replacement has to be a list
+                # too: assigning a scalar randval would throw the caller's
+                # value away, which is the whole reason the list branch
+                # exists.
+                current_list = pkt.default_fields[f.name]
+                originals = [
+                    item.default if isinstance(item, VolatileValue) else item
+                    for item in current_list
+                ]
+                fresh_list = _fuzz_list_items(resolved_fld, originals)
+
+                if all(
+                    type(was).__name__ == type(now).__name__
+                    for (was, now) in zip(current_list, fresh_list)
+                ):
+                    # Same per-item type as what's already there (e.g.
+                    # fuzz()'s own initial assignment) - adopt it as-is,
+                    # preserving each item's state_pos, rather than
+                    # restarting every item's walk.
+                    field_cache[cache_key] = current_list
+                else:
+                    for item in fresh_list:
+                        if isinstance(item, VolatileValue):
+                            self.initialize_volatile_field(
+                                item, max_samples=max_samples)
+                    field_cache[cache_key] = fresh_list
+                    pkt.default_fields[f.name] = fresh_list
+
+                    # The raw list in 'fields' was built for the previous
+                    # variant's item type (an IPv4 address where the
+                    # variant now wants an IPv6 one), so it can't be
+                    # packed by this one.
+                    pkt.fields.pop(f.name, None)
+
+                field_cache['_active_key'] = cache_key
+                # Deliberately not falling through to the 'fields' cleanup
+                # below: for a per-item walk 'fields' holds the live list
+                # forward() is writing single indexes of.
+                continue
+            else:
+                fresh = resolved_fld.randval()
+                if fresh is None:
+                    continue
+
+                current = pkt.default_fields.get(f.name)
+                if current is not None and type(current).__name__ == type(fresh).__name__:
+                    # Already the right concrete type (e.g. fuzz()'s own
+                    # initial assignment) - adopt it as-is, preserving its
+                    # identity/state_pos, instead of discarding it for a
+                    # fresh, uninitialized replacement.
+                    field_cache[cache_key] = current
+                else:
+                    fresh.default = resolved_fld.default
+                    self.initialize_volatile_field(fresh, max_samples=max_samples)
+                    field_cache[cache_key] = fresh
+                    pkt.default_fields[f.name] = fresh
+
+            field_cache['_active_key'] = cache_key
+
+            # Drop any raw value of the now-wrong type sitting in 'fields'
+            # (used by command()/show() to display non-default values)
+            if f.name in pkt.fields:
+                del pkt.fields[f.name]
+
+
+    def forward(self, states):
+        """
+        Go through each field, find if they can still move
+        if they can great, move them, otherwise reset them to default
+        and move to the next one
+        """
+        if states is None:
+            raise ValueError("Please provide states")
+
+        if len(states) == 0:
+            raise ValueError("States should include at least one permutation")
+
+        # Find the first state that has 'done' False, starting from the
+        # cursor rather than from index 0: everything below it finished on
+        # an earlier call and a state never becomes live again, so
+        # re-examining that prefix is pure overhead - see FuzzStates. A
+        # caller's own plain list has no cursor, and then this is the
+        # original full scan.
+        state_fuzzed = None
+        state = None
+        first_live = getattr(states, 'first_live', 0)
+        for index in range(first_live, len(states)):
+            state = states[index]
+            if not state['done']:
+                if index != first_live and hasattr(states, 'first_live'):
+                    # Everything we just walked past is done for good, so
+                    # the next call can start here. Advancing lazily (here)
+                    # rather than at the moment a state completes keeps the
+                    # cursor right no matter who marked the state done.
+                    states.first_live = index
+                state_fuzzed = state
+                fields = state['fields']
+
+                # Mark it as active, and print the transition once
+                was_active = state['active']
+                if not was_active:
+                    self.display_now_fuzzing(fields)
+                    # print(f"Now fuzzing: {fields}")
+                    state['active'] = True
+
+                # Initialize every field the first time THIS state/pair
+                # becomes active (was_active False), regardless of
+                # whatever a field's own state_pos/default happens to be
+                # left at from a *different*, earlier pair reusing the
+                # same field object - a field whose default isn't its own
+                # min (e.g. a ShortField defaulting to its own max, like
+                # PPTPStartControlConnectionRequest.maximum_channels)
+                # would otherwise resume from that leftover value instead
+                # of a fresh min-to-max climb, silently collapsing this
+                # pair's combination count. ALSO initialize whenever
+                # state_pos is still None even though was_active was
+                # already True - covers a state handed to forward()
+                # pre-marked active=True (e.g. a hand-crafted state
+                # targeting one specific field directly, skipping
+                # prepare_combinations()); without this, such a field's
+                # state_pos stays None forever and 'state_pos += jump'
+                # below raises TypeError.
+                for field_item in fields:
+                    (_, field_obj) = self.locate_field(self, field_item['name'])
+
+                    if not isinstance(field_obj, VolatileValue):
+                        err = (f"field_obj: '{field_item['name']}' "
+                               f"isn't VolatileValue: {type(field_obj)=}, was scapy.all.fuzz called?")
+                        raise ValueError(err)
+
+                    # getattr(..., None), not a direct attribute read: a
+                    # VolatileValue subclass that doesn't declare
+                    # state_pos at all (anything outside this fork's own
+                    # Rand* classes) would otherwise fall through
+                    # VolatileValue.__getattr__ into _fix() and raise
+                    # AttributeError on the fixed value instead.
+                    if not was_active or getattr(field_obj, 'state_pos', None) is None:
+                        self.initialize_volatile_field(
+                            field_obj,
+                            boundary_values=field_item.get('boundary_values', False),
+                            max_samples=field_item.get('max_samples', 128),
+                        )
+
+                break
+
+        if state_fuzzed is None: # Means we couldn't find a state to fuzz
+            return (states, False)
+
+        # Find the first field that is not done and move it forward
+        found_a_fuzzable_field = False
+        next_field = None
+        for (field_idx, field) in enumerate(state_fuzzed['fields']):
+            if not field['done']:
+                (packet_holder, field_fuzzed) = self.locate_field(self, field['name'])
+                if field_fuzzed.max == field_fuzzed.min and field_fuzzed.max == 0:
+                    print(f"Why is '{field['name']}' max == 0? this is not going to do anything")
+
+                if not hasattr(field_fuzzed, "state_pos"):
+                    # Make sure next_field exists, as it might be the first element
+                    if next_field is not None:
+                        next_field['done'] = True # Mark it as done
+                    continue
+
+                # print(f"'{field['name']}' {field_fuzzed.state_pos=}")
+                self._advance_state_pos(field_fuzzed, field.get('max_samples', 128))
+
+                field_split = field['name'].split(":")
+                field_name = None
+                list_idx = None
+                if len(field_split) > 1:
+                    field_name = field_split[1]
+                if len(field_split) == 3:
+                    # "pkt:field:idx" - a list-of-scalar-VolatileValue item
+                    # (e.g. Dot11EltRates.rates, DHCP.options) - part 2 is
+                    # the index into that list, not a sub-field name.
+                    try:
+                        list_idx = int(field_split[2])
+                    except ValueError:
+                        list_idx = None
+
+                # If we reached max for this field, try the next one
+                if field_fuzzed.state_pos > field_fuzzed.max:
+                    # Reset the position back to default
+                    if type(field_fuzzed.default).__name__ in ['str', 'bytes', 'tuple']:
+                        # None, not 0: every Rand* reads 'state_pos is
+                        # None' as "not the field being fuzzed, render the
+                        # value the packet would have had" and hands back
+                        # its default. 0 used to be written here as if it
+                        # meant the same thing, and it does not - it is a
+                        # position like any other, so a finished RandBin
+                        # rendered chars[0:0], the empty string, and a
+                        # finished RandIP rendered _COMBINATIONS[0],
+                        # 0.0.0.0, for the rest of the run rather than the
+                        # address the field carries.
+                        field_fuzzed.state_pos = None
+                    elif type(field_fuzzed.default).__name__ != 'int':
+                        raise ValueError("field_fuzzed.default is not int")
+                    else:
+                        field_fuzzed.state_pos = field_fuzzed.default
+                    # Start a fresh sampling cycle from the value we just
+                    # reset to - a field that gets carried into again later
+                    # (complexity >= 2) counts its samples from _walk_base,
+                    # not from state_pos; leaving that stale at its old
+                    # near-max value would overshoot on the very next call
+                    # and end this field's new cycle instantly.
+                    self._restart_walk(field_fuzzed, after_reset=True)
+
+                    if field_name is not None and field_name in packet_holder.fields:
+                        if isinstance(packet_holder.fields[field_name], list):
+                            # Make sure that the first item is not 'obj'
+                            if len(packet_holder.fields[field_name]) > 0:
+                                if isinstance(packet_holder.fields[field_name][0], Packet):
+                                    # We don't touch it
+                                    pass
+                                elif list_idx is not None:
+                                    self._reset_list_index(packet_holder, field_name, list_idx)
+                                else:
+                                    if hasattr(packet_holder, "default_list_value"):
+                                        # Keep record of what was there by default, which is better than putting an empty array (fixes VRRP edge case of 'addrlist')
+                                        packet_holder.fields[field_name] = packet_holder.default_list_value
+
+                                        # Remove the attr, so that it can be placed again if relevant
+                                        delattr(packet_holder, 'default_list_value')
+                                    else:
+                                        packet_holder.fields[field_name] = []
+                        else:
+                            del packet_holder.fields[field_name]
+
+                    if field_name is not None:
+                        self.resync_multiple_type_fields(
+                            packet_holder, field.get('max_samples', 128))
+
+                    # Breaks send, shows 'int' error
+                    # # Make the 'fields' no longer list this value as non-default
+                    # field_name = field['name']
+                    # packet_field = field_name[field_name.index(':')+1:]
+                    # del packet_holder.fields[packet_field]
+
+                    field['done'] = True
+                    field['active'] = False
+
+                    curr_pos = field_idx
+
+                    # Make sure we aren't the last one
+                    are_we_last = (curr_pos + 1) == len(state_fuzzed['fields'])
+
+                    while not are_we_last:
+                        next_field = state_fuzzed['fields'][curr_pos+1]
+
+                        if not next_field['done']:
+                            # Try to move to the next item
+                            (next_field_holder, field_fuzzed) = self.locate_field(self, next_field['name'])
+
+                            if not hasattr(field_fuzzed, 'state_pos'):
+                                err = f"We will fail for: {field_fuzzed}"
+                                raise ValueError(err)
+
+                            # Same jump-scaling as the main advance path
+                            # above - without it, a wide-range field
+                            # advanced via carry (i.e. it isn't the
+                            # fastest/innermost field in its combo) only
+                            # ever moves by 1 per carry, needing up to
+                            # (max - min) carries - millions of iterations
+                            # for something like a ShortField - to finish.
+                            self._advance_state_pos(field_fuzzed, next_field.get('max_samples', 128))
+                            if field_fuzzed.state_pos > field_fuzzed.max:
+                                if type(field_fuzzed.default).__name__ in ['str', 'bytes', 'tuple']:
+                                    # See the matching comment on the main
+                                    # reset path above: None is what says
+                                    # "render your own default".
+                                    field_fuzzed.state_pos = None
+                                elif type(field_fuzzed.default).__name__ != 'int':
+                                    raise ValueError("field_fuzzed.default is not int")
+                                else:
+                                    field_fuzzed.state_pos = field_fuzzed.default
+                                # See the matching comment on the main
+                                # advance path above - this field may
+                                # itself be carried into again by a still
+                                # further-out field at higher complexity.
+                                self._restart_walk(field_fuzzed, after_reset=True)
+                                next_field['done'] = True
+
+                            self.resync_multiple_type_fields(
+                                next_field_holder,
+                                next_field.get('max_samples', 128))
+
+                            if not next_field['done']:
+                                # Reset the item before us to not done
+                                state_fuzzed['fields'][curr_pos]['done'] = False
+
+                                # Reset the previous item pos to the begining
+                                (curr_field_holder, field_fuzzed) = self.locate_field(
+                                    self,
+                                    state_fuzzed['fields'][curr_pos]['name']
+                                )
+
+                                if type(field_fuzzed.default).__name__ in ['str', 'bytes', 'tuple']:
+                                    # See the matching comment on the main
+                                    # reset path above: None is what says
+                                    # "render your own default".
+                                    field_fuzzed.state_pos = None
+                                elif type(field_fuzzed.default).__name__ != 'int':
+                                    raise ValueError("field_fuzzed.default is not int")
+                                else:
+                                    field_fuzzed.state_pos = field_fuzzed.default
+                                # This is the actual carry restart: without
+                                # restarting the walk here too, the next
+                                # _advance_state_pos() call on this field
+                                # counts on from its stale near-max cursor
+                                # and overshoots immediately, ending the
+                                # new cycle before it visits anything past
+                                # this reset value.
+                                self._restart_walk(field_fuzzed, after_reset=True)
+
+                                self.resync_multiple_type_fields(
+                                    curr_field_holder,
+                                    field.get('max_samples', 128))
+
+                                field['combinations'] += 1
+                                field['active'] = True
+                                state_fuzzed['combinations'] += 1
+                                found_a_fuzzable_field = True
+                                break
+
+                        curr_pos += 1
+                        are_we_last = (curr_pos + 1) == len(state_fuzzed['fields'])
+
+                    if found_a_fuzzable_field:
+                        # The inner while's own 'break' above only exits
+                        # IT, not this outer 'for field_idx, field in
+                        # enumerate(...)' loop - without this, control
+                        # falls through to the next outer iteration, which
+                        # lands on the very field the inner while just
+                        # carried into, finds it not done, and advances it
+                        # AGAIN via the normal branch below - incrementing
+                        # combinations (and fuzzing a second, different
+                        # value) twice within a single forward() call.
+                        break
+
+                else:
+                    # Put the new value (fuzzed) in the 'fields' so that ".commmand()" will display it
+                    if field_name is not None:
+                        if list_idx is not None:
+                            # A list-of-scalar-VolatileValue item (e.g.
+                            # Dot11EltRates.rates, DHCP.options) - update
+                            # just this index, preserving every other item
+                            # (which may belong to a different active
+                            # combination, or simply not be fuzzed at all).
+                            self._write_list_index(packet_holder, field_name, list_idx, field_fuzzed._fix())
+                        # If the field_name exists already and is a list (i.e. it is a list from 'init', keep the structure)
+                        elif field_name in packet_holder.fields:
+                            if isinstance(packet_holder.fields[field_name], list):
+                                if len(packet_holder.fields[field_name]) > 0:
+                                    if isinstance(packet_holder.fields[field_name][0], Packet):
+                                        # We don't touch it
+                                        pass
+                                    else:
+                                        if not hasattr(packet_holder, "default_list_value"):
+                                            # Keep record of what was there by default
+                                            setattr(packet_holder, 'default_list_value', packet_holder.fields[field_name])
+                                        packet_holder.fields[field_name] = [field_fuzzed._fix()]
+                                else:
+                                    packet_holder.fields[field_name] = [field_fuzzed._fix()]
+                            else:
+                                packet_holder.fields[field_name] = field_fuzzed._fix()
+                        else:
+                            packet_holder.fields[field_name] = field_fuzzed._fix()
+
+                        self.resync_multiple_type_fields(
+                            packet_holder, field.get('max_samples', 128))
+
+                    field['combinations'] += 1
+                    field['active'] = True
+                    state_fuzzed['combinations'] += 1
+
+                    found_a_fuzzable_field = True
+
+                    break
+
+        if not found_a_fuzzable_field and state is not None:
+            # We reached the end...
+            state['done'] = True
+            state['active'] = False
+
+            # Try to find the next one that is fuzzable (state)
+            (states, found_a_fuzzable_field) = self.forward(states)
+
+        # Breaks send
+        # if found_a_fuzzable_field:
+        #     # If we found a field to fuzz, put it in the 'fields' so that
+        #     #  command() will return its non-default value
+        #     for state in states:
+        #         if not state['active']:
+        #             continue
+
+        #         fields = state['fields']
+        #         for field in fields:
+        #             field_name = field["name"]
+        #             packet_field = field_name[field_name.index(':')+1:]
+
+        #             (packet_holder, field_obj) = self.locate_field(self, field_name)
+        #             packet_holder.fields[packet_field] = field_obj._fix()
+
+        #         break
+
+        return (states, found_a_fuzzable_field)
+
     def build(self):
         # type: () -> bytes
         """
@@ -1487,12 +2559,23 @@ values.
         """Deprecated. Use show() method."""
         self.show(*args, **kargs)
 
+    def break_highlight_field(self, highlight_field):
+        # type(str) -> Tuple[str, str]:
+        if ":" not in highlight_field:
+            msg = f"This is unexpected structure: {highlight_field}"
+            raise ValueError(msg)
+
+        values = highlight_field.split(":")
+        return values
+
+
     def _show_or_dump(self,
                       dump=False,  # type: bool
                       indent=3,  # type: int
                       lvl="",  # type: str
                       label_lvl="",  # type: str
-                      first_call=True  # type: bool
+                      first_call=True,  # type: bool
+                      highlight_fields=[] # type: List[str]
                       ):
         # type: (...) -> Optional[str]
         """
@@ -1536,8 +2619,38 @@ values.
             else:
                 ncol = ct.field_name
                 vcol = ct.field_value
+
             pad = max(0, 10 - len(f.name)) * " "
             fvalue = self.getfieldval(f.name)
+
+            # Check if we should highlight the field as fuzzed
+            highlight_value = False
+            sub_highlight_fields = highlight_fields
+            for highlight_field in highlight_fields:
+                values = self.break_highlight_field(highlight_field)
+                # Highlighting can be either:
+                #  2 -> Holder and field
+                #  4 -> Holder, field, item in list and field (like ip IPv4 with Option) = 'IP:options:0:pointer'
+
+                if len(values) == 2:
+                    layer_name = values[0]
+                    field_name = values[1]
+                    if layer_name == ct.layer_name(self.name):
+                        if field_name == f.name:
+                            highlight_value = True
+                            break
+                    
+                if len(values) == 4:
+                    layer_name = values[0]
+                    field_name = values[1]
+                    if layer_name == ct.layer_name(self.name):
+                        if field_name == f.name:
+                            # Combine the fvalue[0] with the rest
+                            #  IP:options:0:pointer => "IP Option ..:pointer"
+                            #  IP Option comes from the fvalue[0]
+                            sub_highlight_field = values[2] + ":" + fvalue[0].name + ":" + ":".join(values[3:])
+                            sub_highlight_fields = [sub_highlight_field]
+
             if isinstance(fvalue, Packet) or (f.islist and f.holds_packets and isinstance(fvalue, list)):  # noqa: E501
                 s += "%s  %s%s%s%s\n" % (label_lvl + lvl,
                                          ct.punct("\\"),
@@ -1548,8 +2661,20 @@ values.
                     fvalue,
                     _iterpacket=0
                 )  # type: SetGen[Packet]
-                for fvalue in fvalue_gen:
-                    s += fvalue._show_or_dump(dump=dump, indent=indent, label_lvl=label_lvl + lvl + "   |", first_call=False)  # noqa: E501
+                for idx, fvalue in enumerate(fvalue_gen):
+                    relevant_highlight_fields = []
+                    idx_highlight = None
+                    try:
+                        sub_highlight_field = sub_highlight_fields[idx].split(":")
+                        idx_highlight = int(sub_highlight_field[0])
+                    except Exception:
+                        pass
+
+                    if idx == idx_highlight:
+                        relevant_highlight_fields = [":".join(sub_highlight_field[1:])]
+                        relevant_highlight_fields += sub_highlight_fields[1:]
+
+                    s += fvalue._show_or_dump(dump=dump, indent=indent, label_lvl=label_lvl + lvl + "   |", first_call=False, highlight_fields=relevant_highlight_fields)  # noqa: E501
             else:
                 begn = "%s  %s%s%s " % (label_lvl + lvl,
                                         ncol(f.name),
@@ -1561,6 +2686,8 @@ values.
                                                                   len(lvl) +
                                                                   len(f.name) +
                                                                   4))
+                if highlight_value:
+                    reprval += " (fuzzed)"
                 s += "%s%s\n" % (begn, vcol(reprval))
         if self.payload:
             s += self.payload._show_or_dump(  # type: ignore
@@ -1568,7 +2695,8 @@ values.
                 indent=indent,
                 lvl=lvl + (" " * indent * self.show_indent),
                 label_lvl=label_lvl,
-                first_call=False
+                first_call=False,
+                highlight_fields=highlight_fields
             )
 
         if first_call and not dump:
@@ -1577,8 +2705,8 @@ values.
         else:
             return s
 
-    def show(self, dump=False, indent=3, lvl="", label_lvl=""):
-        # type: (bool, int, str, str) -> Optional[Any]
+    def show(self, dump=False, indent=3, lvl="", label_lvl="", highlight_fields=[]):
+        # type: (bool, int, str, str, List[str]) -> Optional[Any]
         """
         Prints or returns (when "dump" is true) a hierarchical view of the
         packet.
@@ -1589,10 +2717,10 @@ values.
         :param str label_lvl: additional information about the layer fields
         :return: return a hierarchical view if dump, else print it
         """
-        return self._show_or_dump(dump, indent, lvl, label_lvl)
+        return self._show_or_dump(dump, indent, lvl, label_lvl, True, highlight_fields)
 
-    def show2(self, dump=False, indent=3, lvl="", label_lvl=""):
-        # type: (bool, int, str, str) -> Optional[Any]
+    def show2(self, dump=False, indent=3, lvl="", label_lvl="", highlight_fields=[]):
+        # type: (bool, int, str, str, List[str]) -> Optional[Any]
         """
         Prints or returns (when "dump" is true) a hierarchical view of an
         assembled version of the packet, so that automatic fields are
@@ -1604,7 +2732,7 @@ values.
         :param str label_lvl: additional information about the layer fields
         :return: return a hierarchical view if dump, else print it
         """
-        return self.__class__(raw(self)).show(dump, indent, lvl, label_lvl)
+        return self.__class__(raw(self)).show(dump, indent, lvl, label_lvl, highlight_fields)
 
     def sprintf(self, fmt, relax=1):
         # type: (str, int) -> str
@@ -1780,6 +2908,48 @@ values.
             pp = pp.underlayer
         self.payload.dissection_done(pp)
 
+    def _command_fields(self):
+        # type: () -> Iterator[Tuple[str, Any]]
+        """
+        The (name, value) pairs command() renders: everything set in
+        'fields', then every field fuzz() left a volatile on.
+
+        fuzz() installs its random values as *defaults*, and command()
+        reports 'fields', so a packet mid-walk used to render only the one
+        field forward() had promoted - the other field of a complexity-2
+        pair, and everything else fuzz() touched, was missing from the
+        example entirely. Evaluating that example rebuilt a different
+        packet than the one that was sent, which is the only thing the
+        example is for.
+
+        The volatiles are rendered by the value they resolve to, not by
+        their constructor: '_fix()' is exactly what build() will pack, so
+        this is what makes the example reproduce the bytes. A volatile the
+        caller put in 'fields' themselves (IP(ttl=RandByte())) is left
+        alone and still renders as 'RandByte()' - that packet is a
+        generator, and re-evaluating it is meant to draw again.
+        """
+        for name, value in self.fields.items():
+            yield (name, value)
+
+        # An overloaded field (IP.proto under a TCP payload) is skipped:
+        # it isn't fuzzable - return_relevant_fields() skips it too - and
+        # the overload is what both the sent and the rebuilt packet use, so
+        # naming it in the example would pin the wrong value.
+        for field in self.fields_desc:
+            name = field.name
+            if name in self.fields or name in self.overloaded_fields:
+                continue
+
+            value = self.default_fields.get(name)
+            if isinstance(value, VolatileValue):
+                yield (name, value._fix())
+            elif self._is_fuzzed_list(value):
+                yield (name, [
+                    item._fix() if isinstance(item, VolatileValue) else item
+                    for item in value
+                ])
+
     def _command(self, json=False):
         # type: (bool) -> List[Tuple[str, Any]]
         """
@@ -1790,7 +2960,7 @@ values.
         if json:
             iterator = ((x.name, self.getfieldval(x.name)) for x in self.fields_desc)
         else:
-            iterator = iter(self.fields.items())
+            iterator = self._command_fields()
         for fn, fv in iterator:
             fld = self.get_field(fn)
             if isinstance(fv, (list, dict, set)) and not fv and not fld.default:
@@ -1830,7 +3000,16 @@ values.
                     else:
                         fv = fld.i2h(self, fv)
                 else:
-                    fv = repr(fld.i2h(self, fv))
+                    fv = fld.i2h(self, fv)
+                    if isinstance(fv, FlagValue):
+                        # A flags field's i2h() wraps the int back up, and
+                        # repr() of that is '<Flag 2 (S)>' - not something
+                        # the command can be evaluated back from. Reached
+                        # when the value comes in as a plain int, which is
+                        # what a fuzzed field resolves to (a FlagValue set
+                        # through the packet is caught further up).
+                        fv = int(fv)
+                    fv = repr(fv)
             f.append((fn, fv))
         return f
 
@@ -2692,7 +3871,59 @@ def rfc(cls, ret=False, legend=True):
 _P = TypeVar('_P', bound=Packet)
 
 
+def _unwrap_field(f):
+    # type: (AnyField) -> Any
+    """
+    Peel away single-field container wrappers (MayEnd, Emph, PadField,
+    TrailerField, ActionField, ...) to get at the real field underneath, so
+    fuzz() can tell e.g. a MayEnd(PacketListField(...)) apart from a plain
+    scalar field. MultipleTypeField is deliberately left alone - it has its
+    own dedicated handling below and isn't a single-field wrapper.
+    """
+    while isinstance(f, _FieldContainer) and not isinstance(f, MultipleTypeField):
+        f = f.fld
+    return f
+
+
 @conf.commands.register
+def _fuzz_list_items(fld, values):
+    # type: (Any, List[Any]) -> List[Any]
+    """
+    A per-item randval for each item of a list-valued field.
+
+    fld.randval() would build one value from the *container's* own fmt
+    (e.g. FieldListField's default "!H"), which has nothing to do with the
+    type or range of the items it holds - and assigning that to the field
+    replaces the caller's whole list with a single scalar. The items are
+    what gets fuzzed, so each one gets a randval from the inner field's
+    type instead, carrying the caller's own item as its default so the
+    walk fuzzes around the value that was set rather than losing it.
+    return_relevant_fields()/locate_field() know how to target list items
+    directly ("Layer:field:index").
+
+    An item whose type has no randval is left exactly as it was.
+    """
+    inner = getattr(fld, 'field', None)
+    if inner is None:
+        # Not a container (a MultipleTypeField can resolve to a plain
+        # StrField while the value the caller set is still a list) - the
+        # field's own randval is then the right per-item type.
+        inner = fld
+
+    new_list = []
+    for item in values:
+        try:
+            item_rnd = inner.randval()
+        except Exception:
+            item_rnd = None
+        if item_rnd is None:
+            new_list.append(item)
+        else:
+            item_rnd.default = item
+            new_list.append(item_rnd)
+    return new_list
+
+
 def fuzz(p,  # type: _P
          _inplace=0,  # type: int
          ):
@@ -2711,30 +3942,91 @@ def fuzz(p,  # type: _P
         new_default_fields = {}
         multiple_type_fields = []  # type: List[str]
         for f in q.fields_desc:
-            if isinstance(f, PacketListField):
-                for r in getattr(q, f.name):
-                    fuzz(r, _inplace=1)
-            elif isinstance(f, MultipleTypeField):
+            real_f = _unwrap_field(f)
+            # A PacketListField/FieldListField can itself be wrapped in a
+            # ConditionalField (e.g. RadioTap.Ext). When that condition
+            # isn't currently met, getattr(q, f.name) returns None (that's
+            # ConditionalField.i2h()'s contract), not the field's actual
+            # list default - so these branches must not run at all then,
+            # same as the generic scalar branch below already guards for.
+            field_is_active = not isinstance(f, ConditionalField) or f._evalcond(q)
+
+            if field_is_active and hasattr(real_f, 'fuzz_current_value'):
+                # Optional hook: lets a field type produce something that
+                # preserves/extends the packet's CURRENT value for this
+                # field (e.g. DHCPOptionsField replacing each of the
+                # user's actual options' values with a properly-typed
+                # randval, keeping option names/order intact) instead of
+                # generating something unrelated from scratch the way a
+                # plain f.randval() call would. Return None to fall
+                # through to the generic handling below.
+                rnd = real_f.fuzz_current_value(q)
+                if rnd is not None:
+                    new_default_fields[f.name] = rnd
+                    continue
+
+            if isinstance(real_f, PacketListField):
+                if field_is_active:
+                    for r in getattr(q, f.name):
+                        fuzz(r, _inplace=1)
+            elif isinstance(real_f, FieldListField):
+                # Fuzz each item with the inner field's own randval, keeping
+                # the list shape intact - see _fuzz_list_items().
+                current_list = getattr(q, f.name) if field_is_active else None
+                if isinstance(current_list, list) and len(current_list) > 0:
+                    new_default_fields[f.name] = _fuzz_list_items(
+                        real_f, current_list)
+            elif isinstance(real_f, MultipleTypeField):
                 # the type of the field will depend on others
                 multiple_type_fields.append(f.name)
             elif f.default is not None:
                 if not isinstance(f, ConditionalField) or f._evalcond(q):
                     rnd = f.randval()
+
+                    # Store the default value of the field
+                    rnd.default = f.default
                     if rnd is not None:
+                        # print(f"Adding: {f.name} with {f.default=}")
                         new_default_fields[f.name] = rnd
+                        # if f.name in p.fields:
+                        #     # Remove the override found inside fields
+                        #     del p.fields[f.name]
+
         # Process packets with MultipleTypeFields
         if multiple_type_fields:
+            # We don't want this freeze - 2025-08-18 - we want to fuzz all
+            #  fields, even if they are dependent on something else
             # freeze the other random values
-            new_default_fields = {
-                key: (val._fix() if isinstance(val, VolatileValue) else val)
-                for key, val in new_default_fields.items()
-            }
-            q.default_fields.update(new_default_fields)
-            new_default_fields.clear()
+            # new_default_fields = {
+            #     key: (val._fix() if isinstance(val, VolatileValue) else val)
+            #     for key, val in new_default_fields.items()
+            # }
+            # q.default_fields.update(new_default_fields)
+            # new_default_fields.clear()
+
             # add the random values of the MultipleTypeFields
             for name in multiple_type_fields:
                 fld = cast(MultipleTypeField, q.get_field(name))
-                rnd = fld._find_fld_pkt(q).randval()
+                resolved = fld._find_fld_pkt(q)
+
+                # A MultipleTypeField can resolve to a list-valued field
+                # (VRRPv3.addrlist is a FieldListField of IPField once
+                # there's an IP underlayer, a StrField without one), and
+                # then a single scalar randval would replace the caller's
+                # whole list - their address list, their option list - on
+                # the first step of the walk, with nothing downstream able
+                # to recover the value. Fuzz within the list instead,
+                # exactly as the FieldListField branch above does. Keyed on
+                # the value the packet actually carries rather than on the
+                # resolved field's own class, because it's the caller's
+                # value that is at stake and it stays a list either way.
+                current_list = getattr(q, name, None)
+                if isinstance(current_list, list) and len(current_list) > 0:
+                    new_default_fields[name] = _fuzz_list_items(
+                        resolved, current_list)
+                    continue
+
+                rnd = resolved.randval()
                 if rnd is not None:
                     new_default_fields[name] = rnd
         q.default_fields.update(new_default_fields)

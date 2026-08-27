@@ -26,10 +26,10 @@ from enum import Enum
 
 from scapy.config import conf
 from scapy.dadict import DADict
-from scapy.volatile import RandBin, RandByte, RandEnumKeys, RandInt, \
-    RandIP, RandIP6, RandLong, RandMAC, RandNum, RandShort, RandSInt, \
-    RandSByte, RandTermString, RandUUID, VolatileValue, RandSShort, \
-    RandSLong, RandFloat
+from scapy.volatile import MAGIC_BOUNDARIES, RandBin, RandByte, RandEnum, \
+    RandEnumWalk, RandInt, RandIP, RandIP6, RandLong, RandMAC, RandNum, \
+    RandShort, RandSInt, RandSByte, RandTermString, RandUUID, VolatileValue, \
+    RandSShort, RandSLong, RandFloat
 from scapy.data import EPOCH
 from scapy.error import log_runtime, Scapy_Exception
 from scapy.compat import bytes_hex, plain_str, raw, bytes_encode
@@ -1490,6 +1490,75 @@ class StrField(_StrField[bytes]):
     pass
 
 
+
+def reverse_string(string):
+    ret = b''
+
+    for c in string:
+        ch = c ^ 0xff
+        ret += chr(ch).encode('latin1')
+
+    return ret
+
+class FuzzingString(VolatileValue):
+    """ Custom fuzzing string, so that we don't use RandBin """
+    min = 0
+    max = 0
+    state_pos = None
+    suffix = None
+    default_value = None
+
+    fuzzing_states = [
+        {"name": "default", "count": 1, "return": lambda val: val[0]},
+        {"name": "Bit flip", "count": 1, "return": lambda val: reverse_string(val[0])},
+        {"name": "'A' overflow", "count": 16, "return": lambda val : b"A" * pow(2, val[1])},
+        {"name": "Number range", "count": 32, "return": lambda val: str(pow(2, val[1])).encode()},
+    ]
+
+    def __init__(self, default = None, suffix = None):
+        self.suffix = suffix
+        self.default_value = default
+
+        for fuzzing_state in self.fuzzing_states:
+            self.max += fuzzing_state['count']
+
+    def _fix(self):
+        if self.state_pos is None:
+            if self.default_value is None:
+                return b''
+
+            if self.suffix is not None:
+                return self.default_value + self.suffix
+
+            return self.default_value
+
+        count_so_far = 0
+        current_fuzzing_state = None
+        for fuzzing_state in self.fuzzing_states:
+            if self.state_pos <= (fuzzing_state["count"] + count_so_far):
+                current_fuzzing_state = fuzzing_state
+                break
+
+            count_so_far += fuzzing_state["count"]
+
+        if current_fuzzing_state is None:
+            self.state_pos = 0
+            return self.default_value
+
+        ret = current_fuzzing_state["return"]([self.default_value, self.state_pos - count_so_far])
+
+        if self.suffix is not None:
+            ret += self.suffix
+
+        # print(f"{ret=}")
+        return ret
+
+class StrFieldWithFuzzingString(StrField):
+    """StrField that has a FuzzingString payload"""
+
+    def randval(self):
+        return FuzzingString(default=self.default)
+
 class StrFieldUtf16(StrField):
     def any2i(self, pkt, x):
         # type: (Optional[Packet], Optional[str]) -> bytes
@@ -2594,6 +2663,93 @@ class _EnumField(Field[Union[List[I], I], I]):
                 s2i[value] = k
         Field.__init__(self, name, default, fmt)
 
+    def randval(self):
+        # type: () -> VolatileValue[Any]
+        return self._enum_randval(super(_EnumField, self).randval())
+
+    def _enum_randval(self, base, keys=None):
+        # type: (VolatileValue[Any], Optional[List[Any]]) -> VolatileValue[Any]
+        """Walk this field's declared values instead of its integer width
+
+        ``base`` is whatever the inherited ``randval()`` produced - it is the
+        authority on the range the field can actually carry (``!B`` -> 0..255,
+        a 3-bit ``BitEnumField`` -> 0..7), which is all this needs from it. Any
+        field shape ``RandEnumWalk`` can't improve on falls straight back to
+        ``base``, so this is safe to call from every enum flavour.
+
+        See ``RandEnumWalk`` for why walking the enum matters at all.
+        """
+        if not isinstance(base, RandNum) or isinstance(base, RandEnum):
+            # 's'-format enums (RandBin), UUIDEnumField (RandUUID) and
+            # anything drawing at random (RandEnum) carry no integer range
+            # for an index to walk.
+            return base
+
+        if keys is None:
+            i2s = getattr(self, "i2s", None)
+            # getattr: _MultiEnumField never sets i2s at all - it overrides
+            # this and passes its own keys in.
+            keys = list(i2s) if i2s else []
+
+        low, high = base.min, base.max
+        # Integer keys only, and only ones the field can carry. A string- or
+        # bytes-keyed enum has no integer vocabulary to walk (__init__ swaps
+        # i2s/s2i for those), and a single stray out-of-width key - such as
+        # CommonAuthVerifier.auth_type declaring 0xffffffff in a byte enum -
+        # would raise struct.error on build.
+        declared = list(dict.fromkeys(
+            key for key in keys
+            if isinstance(key, int) and low <= key <= high
+        ))
+        if not declared:
+            return base
+
+        return RandEnumWalk(
+            declared, self._enum_walk_edges(declared, low, high), low, high
+        )
+
+    @staticmethod
+    def _enum_walk_edges(declared, low, high):
+        # type: (List[int], int, int) -> List[int]
+        """The undefined values sent whatever the sampling budget
+
+        The enum's own vocabulary says nothing about the *width* it travels in,
+        and that width is where the interesting undefined values sit: a byte
+        field whose enum declares 1..30 should still be made to carry 0, 31,
+        127, 128, 254 and 255. So this is the ends of the range and their
+        neighbours, plus every MAGIC_BOUNDARIES constant that fits - the same
+        values Packet._boundary_checkpoints() guarantees for the integer walk,
+        which wants them for the same reason - plus the two the enum itself
+        defines: one past the highest declared key, and the undefined value
+        nearest mid-range. Anything the enum already declares is dropped, so
+        this only ever adds cases the walk wasn't already going to cover.
+
+        This is only the *guaranteed* block. The bulk of the undefined values
+        come from RandEnumWalk._undefined_fill(), which spends whatever
+        max_samples_per_field leaves over on the rest of the range - these are
+        the ones worth sending even when that budget is nothing.
+        """
+        edges = [low, low + 1, high - 1, high, max(declared) + 1]
+        edges.extend(MAGIC_BOUNDARIES)
+
+        known = set(declared)
+        # Mid-range, but the *undefined* value nearest to it: a dense enum
+        # (IP.proto declares 0..142) can easily declare its own midpoint.
+        # Bounded by len(known) + 1 steps.
+        for candidate in range(low + (high - low) // 2, high + 1):
+            if candidate not in known:
+                edges.append(candidate)
+                break
+
+        # Ascending, so 0 (the single most valuable of these - unreachable
+        # under the integer sweep at any density, and what a
+        # reserved-must-be-zero check turns on) leads, and so a truncated run
+        # gets a predictable prefix rather than an arbitrary one.
+        return sorted({
+            edge for edge in edges
+            if low <= edge <= high and edge not in known
+        })
+
     def any2i_one(self, pkt, x):
         # type: (Optional[Packet], Any) -> I
         if isinstance(x, Enum):
@@ -2698,6 +2854,15 @@ class BitEnumField(_BitField[Union[List[int], int]], _EnumField[int]):
         # type: (...) -> None
         _EnumField.__init__(self, name, default, enum)
         _BitField.__init__(self, name, default, size, **kwargs)
+
+    def randval(self):
+        # type: () -> VolatileValue[Any]
+        # _BitField comes first in the MRO, so _EnumField.randval() is never
+        # reached here - and _BitField.randval()'s RandNum(0, 2**size - 1) is
+        # exactly the range _enum_randval() wants as its base. (BitLenEnumField
+        # deliberately has no such override: its size comes from length_from()
+        # and is still 0 at randval() time, so there is no width to walk in.)
+        return self._enum_randval(_BitField.randval(self))
 
     def any2i(self, pkt, x):
         # type: (Optional[Packet], Any) -> Union[List[int], int]
@@ -2896,6 +3061,26 @@ class _MultiEnumField(_EnumField[I]):
                 self.s2i_all[v] = k
         Field.__init__(self, name, default, fmt)
 
+    def randval(self):
+        # type: () -> VolatileValue[Any]
+        return self._enum_randval(
+            super(_MultiEnumField, self).randval(), self._multi_enum_keys()
+        )
+
+    def _multi_enum_keys(self):
+        # type: () -> List[Any]
+        """Every key any of the sub-enums declares
+
+        i2s_multi is one enum per depends_on value and this field never sets
+        i2s at all, so there is no single enum to walk. depends_on is itself
+        fuzzed, which makes the union the right vocabulary: any of these keys
+        is a declared value under *some* reachable value of the field it
+        depends on.
+        """
+        return list(dict.fromkeys(
+            key for sub_enum in self.i2s_multi.values() for key in sub_enum
+        ))
+
     def any2i_one(self, pkt, x):
         # type: (Optional[Packet], Any) -> I
         if isinstance(x, str):
@@ -2939,6 +3124,13 @@ class BitMultiEnumField(_BitField[Union[List[int], int]],
         self.size = abs(size)
         self.sz = self.size / 8.  # type: ignore
 
+    def randval(self):
+        # type: () -> VolatileValue[Any]
+        # See BitEnumField.randval() - _BitField wins the MRO here too.
+        return self._enum_randval(
+            _BitField.randval(self), self._multi_enum_keys()
+        )
+
     def any2i(self, pkt, x):
         # type: (Optional[Packet], Any) -> Union[List[int], int]
         return _MultiEnumField[int].any2i(
@@ -2960,28 +3152,26 @@ class BitMultiEnumField(_BitField[Union[List[int], int]],
         )
 
 
+# The three *EnumKeysField classes below exist because EnumField used to be
+# fuzzed as a plain integer of its own width, so a field that needed valid
+# values had to opt out by hand. _EnumField.randval() now walks the declared
+# values for every enum field, which is what these asked for and more (it also
+# visits the field's boundaries, and does it in walk order rather than at
+# random - RandEnumKeys._fix() draws again on every call, so the same walk step
+# would not even build the same packet twice). They are kept as names their
+# users already import.
+
+
 class ByteEnumKeysField(ByteEnumField):
     """ByteEnumField that picks valid values when fuzzed. """
-
-    def randval(self):
-        # type: () -> RandEnumKeys
-        return RandEnumKeys(self.i2s or {})
 
 
 class ShortEnumKeysField(ShortEnumField):
     """ShortEnumField that picks valid values when fuzzed. """
 
-    def randval(self):
-        # type: () -> RandEnumKeys
-        return RandEnumKeys(self.i2s or {})
-
 
 class IntEnumKeysField(IntEnumField):
     """IntEnumField that picks valid values when fuzzed. """
-
-    def randval(self):
-        # type: () -> RandEnumKeys
-        return RandEnumKeys(self.i2s or {})
 
 
 # Little endian fixed length field

@@ -1,0 +1,283 @@
+% Regression tests for the sequential (non-random) fuzzing state machine
+% prepare_combinations()'s new max_samples_per_field/boundary_values knobs
+
+# Uniform jump sampling (round((max-min)/128) starting at min) is never
+# guaranteed to land exactly on a field's own boundary values - min, max,
+# their immediate neighbors, or width-specific 'magic' constants like
+# 0x7fff/0x8000/0xffff. Several bugs already found on this branch
+# (PPTPStartControlConnectionRequest.maximum_channels sitting exactly on
+# its own max, magic_cookie's boundary) were specifically about these exact
+# edge values. prepare_combinations() gained two opt-in parameters:
+# boundary_values=True front-loads a queue of such checkpoints for every
+# fuzzed field (Packet._boundary_checkpoints()/_advance_state_pos()), and
+# max_samples_per_field replaces the previously hardcoded 128-sample cap.
+#
+# Both default to today's exact prior behavior (max_samples_per_field=128,
+# boundary_values=False) so any existing caller that doesn't pass these
+# keeps producing the exact same sequence of fuzzed values and combination
+# counts as before this change.
+#
+# Each test below isolates a SINGLE field's state out of
+# prepare_combinations()'s full result (the same "drive one field's state
+# in isolation" pattern used by forward_reused_field_complexity_undercount
+# .uts), so the collected state_pos sequence is driven by that field alone
+# - not interleaved with every other fuzzable field on the packet.
+
+############
+############
++ prepare_combinations() boundary_values/max_samples_per_field
+
+= boundary_values=True guarantees edge state_pos values for a wide ShortField
+~ fuzzing pptp
+
+FIELD = "PPTP Start Control Connection Request:maximum_channels"
+
+def isolate_field_state(states, field_name):
+    return [s for s in states if s['fields'][0]['name'] == field_name]
+
+def collect_state_pos_sequence(boundary_values, max_samples_per_field=128):
+    pkt = fuzz(PPTP() / PPTPStartControlConnectionRequest())
+    states = pkt.prepare_combinations(
+        1, max_samples_per_field=max_samples_per_field, boundary_values=boundary_values
+    )
+    target_states = isolate_field_state(states, FIELD)
+    seen = []
+    continue_to_fuzz = True
+    iterations = 0
+    while continue_to_fuzz and iterations < 5000:
+        target_states, continue_to_fuzz = pkt.forward(target_states)
+        (_, field_obj) = pkt.locate_field(pkt, FIELD)
+        seen.append(field_obj.state_pos)
+        iterations += 1
+    return seen
+
+with_boundaries = collect_state_pos_sequence(boundary_values=True)
+
+# maximum_channels is a ShortField: min=0, max=65535. min itself is never
+# externally observed even without boundary_values (initializing state_pos
+# to min and advancing it happen within the same forward() call), so the
+# guarantee is about min's neighbor and every other edge/magic value.
+for edge in (1, 127, 128, 255, 32767, 32768, 65534, 65535):
+    assert edge in with_boundaries, f"boundary value {edge} was never sampled"
+
+without_boundaries = collect_state_pos_sequence(boundary_values=False)
+assert 1 not in without_boundaries, (
+    "boundary_values=False must not inject checkpoints - only min's "
+    "neighbor (1) should ever appear if the plain jump stride happens to "
+    "land there, which it doesn't for this field's 512-wide jump"
+)
+
+
+= boundary_values=True supplements the uniform jump walk instead of replacing it
+
+# Regression: _boundary_checkpoints() always includes the field's own max
+# as a candidate, and checkpoints drain in ascending sorted order, so max
+# is always the LAST checkpoint popped. The very next _advance_state_pos()
+# call then did state_pos += jump from max, immediately overshooting it and
+# marking the field done - the uniform jump walk never got to run at all,
+# so boundary_values=True silently replaced sampling instead of
+# supplementing it, contradicting prepare_combinations()'s own docstring.
+
+FIELD4 = "PPTP Start Control Connection Request:maximum_channels"
+
+def isolate_field_state4(states, field_name):
+    return [s for s in states if s['fields'][0]['name'] == field_name]
+
+def collect_state_pos_sequence4(boundary_values, max_samples_per_field=128):
+    pkt = fuzz(PPTP() / PPTPStartControlConnectionRequest())
+    states = pkt.prepare_combinations(
+        1, max_samples_per_field=max_samples_per_field, boundary_values=boundary_values
+    )
+    target_states = isolate_field_state4(states, FIELD4)
+    seen = []
+    continue_to_fuzz = True
+    iterations = 0
+    while continue_to_fuzz and iterations < 5000:
+        target_states, continue_to_fuzz = pkt.forward(target_states)
+        (_, field_obj) = pkt.locate_field(pkt, FIELD4)
+        seen.append(field_obj.state_pos)
+        iterations += 1
+    return seen
+
+without = collect_state_pos_sequence4(boundary_values=False)
+with_boundaries = collect_state_pos_sequence4(boundary_values=True)
+
+assert len(set(with_boundaries)) >= len(set(without)), (
+    f"boundary_values=True sampled only {len(set(with_boundaries))} distinct "
+    f"values for {FIELD4!r}, fewer than the {len(set(without))} "
+    "boundary_values=False samples - checkpoints are replacing uniform "
+    "sampling instead of supplementing it"
+)
+
+# Values only the uniform spread (65535 over 127 intervals, i.e. samples
+# at round(i * 65535 / 127)) would produce - none of these are boundary
+# checkpoints (0/1/127/128/255/32767/32768/65534/65535). These were
+# 512/1024/2048/... while the walk stepped by a rounded stride of
+# round(65535/128) = 512 from min; it now spreads its samples to land on
+# both endpoints instead, so the same intervals fall 4-129 higher (see
+# Packet._advance_state_pos()).
+uniform_only_samples = {516, 1032, 1548, 2064, 4128, 8256, 16513}
+assert uniform_only_samples & set(with_boundaries), (
+    "boundary_values=True never reached any plain uniform-jump sample "
+    f"({sorted(uniform_only_samples)}) for {FIELD4!r} - it stopped as soon "
+    "as its boundary checkpoints ran out instead of continuing the normal "
+    "jump walk"
+)
+
+
+= max_samples_per_field tunes how many distinct values a field gets sampled at
+~ fuzzing pptp
+
+FIELD2 = "PPTP Start Control Connection Request:maximum_channels"
+
+def isolate_field_state2(states, field_name):
+    return [s for s in states if s['fields'][0]['name'] == field_name]
+
+def distinct_sample_count(max_samples_per_field):
+    pkt = fuzz(PPTP() / PPTPStartControlConnectionRequest())
+    states = pkt.prepare_combinations(1, max_samples_per_field=max_samples_per_field)
+    target_states = isolate_field_state2(states, FIELD2)
+    seen = set()
+    continue_to_fuzz = True
+    iterations = 0
+    while continue_to_fuzz and iterations < 5000:
+        target_states, continue_to_fuzz = pkt.forward(target_states)
+        (_, field_obj) = pkt.locate_field(pkt, FIELD2)
+        seen.add(field_obj.state_pos)
+        iterations += 1
+    return len(seen)
+
+narrow = distinct_sample_count(16)
+default_width = distinct_sample_count(128)
+wide = distinct_sample_count(512)
+
+assert narrow < default_width < wide
+
+
+= Calling prepare_combinations() with no new arguments samples the full range, endpoints included
+~ fuzzing pptp
+
+# This used to pin forward()'s original jump math - state_pos += round(
+# (max - min) / 128) starting at min, which emitted min + 1 .. max and so
+# reached neither the field's minimum nor (for a range that doesn't divide
+# evenly) its maximum, and only one parity of a byte-wide range. The walk
+# now emits the cycle's own starting value first and spreads its remaining
+# samples to land exactly on max; the reference below is re-derived for
+# that, still independently of _advance_state_pos()'s implementation.
+
+FIELD3 = "PPTP Start Control Connection Request:maximum_channels"
+
+def isolate_field_state3(states, field_name):
+    return [s for s in states if s['fields'][0]['name'] == field_name]
+
+def expected_sample_sequence(min_val, max_val, default_val, samples=128):
+    # Re-derives _advance_state_pos()'s sampling as a pinned reference: the
+    # cycle's starting value, then 'samples' points evenly spread over
+    # [min, max] inclusive, then the reset to the field's default.
+    span = max_val - min_val
+    if span > samples > 1:
+        seq = [min_val + round(i * span / (samples - 1)) for i in range(samples)]
+    else:
+        seq = list(range(min_val, max_val + 1))
+    seq.append(default_val)
+    return seq
+
+pkt = fuzz(PPTP() / PPTPStartControlConnectionRequest())
+states = pkt.prepare_combinations(1)  # no kwargs at all
+target_states = isolate_field_state3(states, FIELD3)
+
+actual = []
+continue_to_fuzz = True
+iterations = 0
+while continue_to_fuzz and iterations < 5000:
+    target_states, continue_to_fuzz = pkt.forward(target_states)
+    (_, field_obj) = pkt.locate_field(pkt, FIELD3)
+    actual.append(field_obj.state_pos)
+    iterations += 1
+
+expected = expected_sample_sequence(0, 65535, 65535)
+assert actual == expected
+
+# The two gaps the re-derivation closes, spelled out: the field's own
+# minimum is now sent, and so is its maximum.
+assert actual[0] == 0, "the field's own minimum is still unreachable"
+assert 65535 in actual, "the field's own maximum is still unreachable"
+
+
+############
+############
++ Backward compatibility: default-argument behavior is byte-for-byte unchanged
+
+= prepare_combinations(1) with no new kwargs reproduces the pinned fingerprint
+~ fuzzing pptp
+
+# This pins the ACTUAL output of a full prepare_combinations(1) + forward()
+# run to completion (all ~18 relevant fields on PPTP()/
+# PPTPStartControlConnectionRequest(), every field driven to its own
+# 'done'). Unlike the pinned-math reference above (which only re-derives
+# the sampling formula for a single isolated field), this drives the real
+# multi-field prepare_combinations(1) output end-to-end and hashes every
+# built packet's raw bytes - the strongest available guarantee that a
+# caller who doesn't pass the new arguments gets exactly the behavior
+# derived below, not just an equivalent re-implementation.
+#
+# The number has moved twice on purpose since it was first captured
+# (2167/2166 and 25c5b316... from the implementation before
+# max_samples_per_field/boundary_values existed):
+#
+# 1. EnumField.randval() started walking enums instead of integer widths -
+#    all four of this packet's enum fields are ShortEnumFields, swept as
+#    16-bit integers at 127 samples before and sending 128 walked values
+#    now; that took it to 2171/2170 and 431c749d...
+# 2. _advance_state_pos() started emitting each cycle's own starting value
+#    and spreading its samples to land on max - so a plain field sends 128
+#    values against 127 (and a narrow one its whole range, 65 against 64)
+#    where it used to send min + 1 .. max at a rounded stride; that took it
+#    to 2179/2178 and 1e3a18b7...
+# 3. forward() started resetting an exhausted string-shaped field to
+#    state_pos = None rather than 0. 0 is a position like any other - a
+#    finished RandBin rendered chars[0:0], the empty string - where None is
+#    what every Rand* reads as "not the field being fuzzed, render your own
+#    default". Same number of cases, different bytes in the ones that follow
+#    a finished string field, which is the whole of the move below.
+#
+# Rather than just re-capture the total, it is re-derived from each field's
+# own range below, which is what says the change is only the intended one.
+
+import hashlib
+
+pkt = fuzz(PPTP() / PPTPStartControlConnectionRequest())
+states = pkt.prepare_combinations(1)  # no kwargs at all
+
+total_iterations = 0
+h = hashlib.sha256()
+continue_to_fuzz = True
+while continue_to_fuzz:
+    states, continue_to_fuzz = pkt.forward(states)
+    h.update(bytes(pkt))
+    total_iterations += 1
+
+total_combinations = sum(s['combinations'] for s in states)
+
+# One state per field at complexity 1, so the run's combination count is
+# just the sum of each field's own sample count: an enum walk sends every
+# value on its list, and any other field sends the whole of a range that
+# fits the 128 budget, or 128 points spread across one that doesn't.
+# min/max are read after the walk because initialize_volatile_field() is
+# what resolves them (a RandBin's max comes from its size).
+expected_combinations = 0
+for state in states:
+    (_, volatile) = pkt.locate_field(pkt, state['fields'][0]['name'])
+    if isinstance(volatile, RandEnumWalk):
+        expected_combinations += len(volatile.values)
+    elif volatile.max - volatile.min > 128:
+        expected_combinations += 128
+    else:
+        expected_combinations += volatile.max - volatile.min + 1
+
+assert expected_combinations == 2178, expected_combinations
+assert total_combinations == 2178
+# One forward() call per combination, plus the final one that finds no
+# more work and returns False.
+assert total_iterations == 2179
+assert h.hexdigest() == "fb23f712fdcfaee76053a875313cf2cebbacfe85992e3f263d769768046f2b24"

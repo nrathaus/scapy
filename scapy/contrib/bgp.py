@@ -22,6 +22,7 @@ from scapy.fields import (Field, BitField, BitEnumField, XBitField, ByteField,
                           FieldListField, PacketField, PacketListField,
                           IPField, FlagsField, ConditionalField,
                           MultiEnumField)
+from scapy.volatile import VolatileValue
 from scapy.layers.inet import TCP
 from scapy.layers.inet6 import IP6Field
 from scapy.config import conf, ConfClass
@@ -91,6 +92,13 @@ class BGPFieldIPv4(Field):
     IPv4 Field (CIDR)
     """
 
+    def __init__(self, name, default):
+        # The correct format should be "B" as can be seen in the i2m and not the default
+        #  'H'
+        Field.__init__(
+            self, name, default, "B"
+        )
+
     def mask2iplen(self, mask):
         """Get the IP field mask length (in bytes)."""
         return (mask + 7) // 8
@@ -103,6 +111,9 @@ class BGPFieldIPv4(Field):
     def i2h(self, pkt, i):
         """"Internal" representation to "human" representation
         (x.x.x.x/y)."""
+        if isinstance(i, VolatileValue):
+            # If its a fuzzed value, display the default for pkt.show
+            i = i.default
         mask, ip = i
         return ip + "/" + str(mask)
 
@@ -2143,6 +2154,10 @@ class BGPPathAttr(Packet):
         length = None
         packet = None
         extended_length = False
+
+        # if 'state_pos' in dir(self.default_fields) and self.default_fields['type_flags'].state_pos is not None and self.default_fields['type_flags'].state_pos > 0:
+        #     # We want the type_flags to be overwritten if default_field has a non-default value
+        #     self.type_flags.value = self.default_fields['type_flags'].state_pos
 
         # Set default flags value ?
         if self.type_flags is None:
