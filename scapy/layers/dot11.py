@@ -944,7 +944,8 @@ class _Dot11EltUtils(Packet):
                     crypto.add(wpa_version)
             elif p.ID == 221:
                 if isinstance(p, Dot11EltMicrosoftWPA):
-                    if p.akm_suites:
+
+                  if p.akm_suites:
                         auth = p.akm_suites[0].sprintf("%suite%")
                         crypto.add("WPA/%s" % auth)
                     else:
