@@ -3438,12 +3438,23 @@ class BluetoothCommandError(BaseException):
 class BluetoothL2CAPSocket(SuperSocket):
     desc = "read/write packets on a connected L2CAP socket"
 
-    def __init__(self, bt_address):
+    def __init__(self, bt_address, adapter_address=None):
+        """
+        :param bt_address: the address of the peer to connect to.
+        :param adapter_address: address of the local controller to send from,
+            as reported by ``btmgmt info``. Defaults to None, letting the
+            kernel choose - which on a host with more than one controller
+            means the connection may not go out over the one you expect.
+        """
         if WINDOWS:
             warning("Not available on Windows")
             return
         s = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_RAW,
                           socket.BTPROTO_L2CAP)
+        if adapter_address is not None:
+            # Scopes the connection to one controller. psm 0 on the local
+            # side means "any", as a source port of 0 does on an IP socket.
+            s.bind((adapter_address, 0))
         s.connect((bt_address, 0))
         self.ins = self.outs = s
 
