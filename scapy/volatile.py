@@ -807,7 +807,13 @@ class RandString(_RandString[str]):
             # self.chars[:self.max] used to be returned unconditionally here,
             # which for the default 256-byte charset silently inflated every
             # not-yet-active string/bin field to up to 256 bytes.
-            if 'default' in self.__dict__:
+            #
+            # 'is not None' matches RandIP/RandMAC/RandIP6 below: a field
+            # whose declared default is None (ARP.psrc, IP.len - resolved at
+            # build time rather than stored) reaches us with default=None,
+            # and bytes_encode(None) raises. None means 'no usable default'
+            # here exactly as it does to those three.
+            if 'default' in self.__dict__ and self.default is not None:
                 return bytes_encode(self.default)
 
             return b""
@@ -880,7 +886,13 @@ class RandBin(_RandString[bytes]):
             # self.chars[:self.max] used to be returned unconditionally here,
             # which for the default 256-byte charset silently inflated every
             # not-yet-active string/bin field to up to 256 bytes.
-            if 'default' in self.__dict__:
+            #
+            # 'is not None' matches RandIP/RandMAC/RandIP6 below: a field
+            # whose declared default is None (ARP.psrc, IP.len - resolved at
+            # build time rather than stored) reaches us with default=None,
+            # and bytes_encode(None) raises. None means 'no usable default'
+            # here exactly as it does to those three.
+            if 'default' in self.__dict__ and self.default is not None:
                 return bytes_encode(self.default)
 
             return b""

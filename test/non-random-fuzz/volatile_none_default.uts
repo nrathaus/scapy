@@ -1,0 +1,145 @@
+% Regression tests for the sequential (non-random) fuzzing state machine
+% A volatile whose declared default is None must not raise when probed
+
+# Several fields declare None as their default because the value is resolved
+# at build time rather than stored - ARP's psrc, pdst and hwdst are the
+# clearest example, and IP's len and chksum behave the same way. When such a
+# field sits behind a MultipleTypeField, resync_multiple_type_fields() builds
+# a fresh volatile for it and copies the declared default across:
+#
+#     fresh.default = resolved_fld.default        # None
+#     self.initialize_volatile_field(fresh, ...)
+#
+# initialize_volatile_field() then asked the *instance* whether it offers an
+# optional method:
+#
+#     plan_budget = getattr(field_obj, 'plan_budget', None)
+#
+# and VolatileValue.__getattr__() answers an unknown attribute with
+# getattr(self._fix(), attr) - so probing for a method that does not exist
+# computes the field. _RandString._fix() returned bytes_encode(self.default)
+# for a stored default, and bytes_encode(None) raises TypeError. The probe is
+# asking a question, not requesting a value, so it must not be able to raise.
+#
+# It surfaced from the middle of a forward() walk, so the traceback named
+# packet.py and compat.py rather than the field that caused it, and read as a
+# malformed packet rather than as an attribute lookup on a volatile.
+#
+# Fixed on both halves: RandString/RandBin now treat a None default as no
+# default (which is what RandIP/RandMAC/RandIP6 have always done), and the
+# plan_budget probe now looks at type(field_obj), so asking whether an
+# optional method exists can never compute a value.
+
+############
+############
++ A None default is not a usable default
+
+= RandBin/RandString render empty for a None default rather than raising
+~ fuzzing volatile
+
+for cls in [RandBin, RandString]:
+    rnd = cls()
+    rnd.default = None
+    assert rnd.state_pos is None
+    assert rnd._fix() == b""
+
+# ... and a real default is still rendered, unchanged
+rnd = RandBin()
+rnd.default = b"kept"
+assert rnd._fix() == b"kept"
+
+
+= The None guard matches what the sibling volatiles already do
+~ fuzzing volatile
+
+# RandIP/RandMAC/RandIP6 have always fallen back rather than trusting a
+# None default; RandString and RandBin were the two outliers.
+for cls in [RandIP, RandMAC, RandIP6]:
+    rnd = cls()
+    rnd.default = None
+    assert rnd.state_pos is None
+    assert rnd._fix() == rnd._COMBINATIONS[0]
+
+
+= Probing a volatile for an absent attribute must not compute it
+~ fuzzing volatile
+
+rnd = RandBin()
+rnd.default = None
+
+# getattr()'s third argument only swallows AttributeError, so a _fix() that
+# raises anything else escapes a probe that never wanted the value
+assert getattr(rnd, "a_method_this_class_does_not_have", None) is None
+
+
+= initialize_volatile_field() survives a volatile carrying a None default
+~ fuzzing volatile packet
+
+rnd = RandBin()
+rnd.default = None
+
+pkt = Ether()
+pkt.initialize_volatile_field(rnd, max_samples=128)
+
+# Initialisation normalises the unusable default to the field's min
+assert rnd.default == rnd.min
+assert rnd.state_pos == rnd.min
+
+
+= plan_budget() is still found and still applied
+~ fuzzing volatile packet
+
+# Probing the type must find exactly the implementations probing the
+# instance found - RandEnumWalk defines plan_budget() on the class.
+assert hasattr(type(RandEnumWalk([0, 1], [], 0, 255)), 'plan_budget')
+
+small = RandEnumWalk(list(range(8)), [], 0, 255, budget=512)
+Ether().initialize_volatile_field(small, max_samples=16)
+assert len(small.values) <= 16 + 8
+
+
+############
+############
++ Walking a fuzzed packet whose declared defaults are restored
+
+= forward() survives a MultipleTypeField restored to its declared None default
+~ fuzzing packet l2
+
+# Restoring a field to the default the layer itself declares is how a caller
+# says "leave this one alone"; for ARP that value is None.
+pkt = Ether() / fuzz(ARP())
+arp = pkt[ARP]
+fresh = ARP()
+
+for name in ["op", "psrc", "pdst", "hwdst", "plen", "hwlen"]:
+    arp.default_fields[name] = fresh.default_fields[name]
+
+assert arp.default_fields['psrc'] is None
+
+states = pkt.prepare_combinations(2)
+
+steps = 0
+keep_going = True
+while keep_going and steps < 300:
+    states, keep_going = pkt.forward(states)
+    steps += 1
+
+# Used to raise TypeError out of forward() on the very first call
+assert steps == 300
+
+
+= The same packet with nothing restored still walks (control)
+~ fuzzing packet l2
+
+# Here so a build that "fixes" this by breaking the ordinary walk is not
+# mistaken for a build that fixes it.
+pkt = Ether() / fuzz(ARP())
+states = pkt.prepare_combinations(2)
+
+steps = 0
+keep_going = True
+while keep_going and steps < 300:
+    states, keep_going = pkt.forward(states)
+    steps += 1
+
+assert steps == 300

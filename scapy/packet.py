@@ -1153,9 +1153,15 @@ class Packet(
         values it exists to send - so it's offered the budget here, before
         anything reads its min/max.
         """
-        plan_budget = getattr(field_obj, 'plan_budget', None)
-        if callable(plan_budget):
-            plan_budget(max_samples)
+        # Probed on the type, not the instance: VolatileValue.__getattr__()
+        # answers an unknown attribute with getattr(self._fix(), attr), so
+        # asking an instance whether it has an optional method *computes the
+        # field* - and a volatile that can't currently be computed then turns
+        # this lookup into an exception, at a call site that never wanted the
+        # value. Every volatile offering plan_budget() defines it on the
+        # class, so this finds the same implementations.
+        if hasattr(type(field_obj), 'plan_budget'):
+            field_obj.plan_budget(max_samples)
 
         if hasattr(field_obj, "default"):
             # Some fields have a 'default'
