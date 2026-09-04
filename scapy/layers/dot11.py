@@ -1921,6 +1921,255 @@ class Dot11EltOBSS(Dot11Elt):
     ]
 
 
+# 802.11-2020 9.4.2.26, Table 9-153
+
+def _dot11_extcap_octet(index):
+    """Condition: octet `index` of the Extended Capabilities field is present.
+
+    The element is variable length -- a STA transmits as many octets as it has
+    capabilities to declare and the receiver ignores anything beyond what it
+    knows -- so every octet has to be gated on the declared length. While
+    building with an automatic length, all of them are emitted.
+    """
+    return lambda pkt: pkt.len is None or pkt.len > index
+
+
+class Dot11EltExtendedCapabilities(Dot11Elt):
+    name = "802.11 Extended Capabilities"
+    match_subclass = True
+    fields_desc = [
+        ByteEnumField("ID", 127, _dot11_id_enum),
+        ByteField("len", None),
+        # Bit n lives in octet n // 8 at bit n % 8, least significant bit
+        # first, so each octet is declared from its bit 7 down to its bit 0.
+        # Octet 0: bits 0-7
+        ConditionalField(BitField("event", 0, 1), _dot11_extcap_octet(0)),
+        ConditionalField(BitField("s_psmp_support", 0, 1),
+                         _dot11_extcap_octet(0)),
+        ConditionalField(BitField("reserved5", 0, 1), _dot11_extcap_octet(0)),
+        ConditionalField(BitField("psmp_capability", 0, 1),
+                         _dot11_extcap_octet(0)),
+        ConditionalField(BitField("glk_gcr", 0, 1), _dot11_extcap_octet(0)),
+        ConditionalField(BitField("extended_channel_switching", 0, 1),
+                         _dot11_extcap_octet(0)),
+        ConditionalField(BitField("glk", 0, 1), _dot11_extcap_octet(0)),
+        ConditionalField(BitField("bss_coexistence_management", 0, 1),
+                         _dot11_extcap_octet(0)),
+        # Octet 1: bits 8-15
+        ConditionalField(BitField("geospatial_location", 0, 1),
+                         _dot11_extcap_octet(1)),
+        ConditionalField(BitField("civic_location", 0, 1),
+                         _dot11_extcap_octet(1)),
+        ConditionalField(BitField("colocated_interference_reporting", 0, 1),
+                         _dot11_extcap_octet(1)),
+        ConditionalField(BitField("proxy_arp_service", 0, 1),
+                         _dot11_extcap_octet(1)),
+        ConditionalField(BitField("fms", 0, 1), _dot11_extcap_octet(1)),
+        ConditionalField(BitField("location_tracking", 0, 1),
+                         _dot11_extcap_octet(1)),
+        ConditionalField(BitField("multicast_diagnostics", 0, 1),
+                         _dot11_extcap_octet(1)),
+        ConditionalField(BitField("diagnostics", 0, 1),
+                         _dot11_extcap_octet(1)),
+        # Octet 2: bits 16-23
+        ConditionalField(BitField("timing_measurement", 0, 1),
+                         _dot11_extcap_octet(2)),
+        ConditionalField(BitField("multiple_bssid", 0, 1),
+                         _dot11_extcap_octet(2)),
+        ConditionalField(BitField("ac_station_count", 0, 1),
+                         _dot11_extcap_octet(2)),
+        ConditionalField(BitField("qos_traffic_capability", 0, 1),
+                         _dot11_extcap_octet(2)),
+        ConditionalField(BitField("bss_transition", 0, 1),
+                         _dot11_extcap_octet(2)),
+        ConditionalField(BitField("tim_broadcast", 0, 1),
+                         _dot11_extcap_octet(2)),
+        ConditionalField(BitField("wnm_sleep_mode", 0, 1),
+                         _dot11_extcap_octet(2)),
+        ConditionalField(BitField("tfs", 0, 1), _dot11_extcap_octet(2)),
+        # Octet 3: bits 24-31
+        ConditionalField(BitField("interworking", 0, 1),
+                         _dot11_extcap_octet(3)),
+        ConditionalField(BitField("tdls_channel_switching", 0, 1),
+                         _dot11_extcap_octet(3)),
+        ConditionalField(BitField("tdls_peer_psm_support", 0, 1),
+                         _dot11_extcap_octet(3)),
+        ConditionalField(BitField("tpu_buffer_sta_support", 0, 1),
+                         _dot11_extcap_octet(3)),
+        ConditionalField(BitField("utc_tsf_offset", 0, 1),
+                         _dot11_extcap_octet(3)),
+        ConditionalField(BitField("dms", 0, 1), _dot11_extcap_octet(3)),
+        ConditionalField(BitField("ssid_list", 0, 1), _dot11_extcap_octet(3)),
+        ConditionalField(BitField("channel_usage", 0, 1),
+                         _dot11_extcap_octet(3)),
+        # Octet 4: bits 32-39
+        ConditionalField(BitField("tdls_channel_switching_prohibited", 0, 1),
+                         _dot11_extcap_octet(4)),
+        ConditionalField(BitField("tdls_prohibited", 0, 1),
+                         _dot11_extcap_octet(4)),
+        ConditionalField(BitField("tdls_support", 0, 1),
+                         _dot11_extcap_octet(4)),
+        ConditionalField(BitField("msgcf_capability", 0, 1),
+                         _dot11_extcap_octet(4)),
+        ConditionalField(BitField("reserved35", 0, 1), _dot11_extcap_octet(4)),
+        ConditionalField(BitField("sspn_interface", 0, 1),
+                         _dot11_extcap_octet(4)),
+        ConditionalField(BitField("ebr", 0, 1), _dot11_extcap_octet(4)),
+        ConditionalField(BitField("qos_map", 0, 1), _dot11_extcap_octet(4)),
+        # Octet 5: bits 40-47. Bits 41-43 are a value, not three flags.
+        ConditionalField(BitField("qab_capability", 0, 1),
+                         _dot11_extcap_octet(5)),
+        ConditionalField(BitField("wnm_notification", 0, 1),
+                         _dot11_extcap_octet(5)),
+        ConditionalField(BitField("uapsd_coexistence", 0, 1),
+                         _dot11_extcap_octet(5)),
+        ConditionalField(BitField("identifier_location", 0, 1),
+                         _dot11_extcap_octet(5)),
+        ConditionalField(
+            BitEnumField("service_interval_granularity", 0, 3,
+                         {i: "%d ms" % (5 * i + 5) for i in range(8)}),
+            _dot11_extcap_octet(5)),
+        ConditionalField(BitField("reject_unadmitted_frame", 0, 1),
+                         _dot11_extcap_octet(5)),
+        # Octet 6: bits 48-55
+        ConditionalField(BitField("qload_report", 0, 1),
+                         _dot11_extcap_octet(6)),
+        ConditionalField(BitField("scs", 0, 1), _dot11_extcap_octet(6)),
+        ConditionalField(BitField("mesh_gcr", 0, 1), _dot11_extcap_octet(6)),
+        ConditionalField(BitField("advanced_gcr", 0, 1),
+                         _dot11_extcap_octet(6)),
+        ConditionalField(BitField("robust_av_streaming", 0, 1),
+                         _dot11_extcap_octet(6)),
+        ConditionalField(BitField("qmf_reconfiguration_activated", 0, 1),
+                         _dot11_extcap_octet(6)),
+        ConditionalField(BitField("qmf_activated", 0, 1),
+                         _dot11_extcap_octet(6)),
+        ConditionalField(BitField("utf8_ssid", 0, 1), _dot11_extcap_octet(6)),
+        # Octet 7: bits 56-63. Max Number Of MSDUs In A-MSDU is a 2-bit value
+        # straddling the octet boundary: its low bit is 63 and its high bit is
+        # 64, which a 8-octet element carries only half of, so the two halves
+        # are separate fields.
+        ConditionalField(BitField("max_msdus_in_amsdu_low", 0, 1),
+                         _dot11_extcap_octet(7)),
+        ConditionalField(BitField("operating_mode_notification", 0, 1),
+                         _dot11_extcap_octet(7)),
+        ConditionalField(BitField("tdls_wider_bandwidth", 0, 1),
+                         _dot11_extcap_octet(7)),
+        ConditionalField(BitField("protected_qload_report", 0, 1),
+                         _dot11_extcap_octet(7)),
+        ConditionalField(BitField("reserved59", 0, 1), _dot11_extcap_octet(7)),
+        ConditionalField(BitField("protected_txop_negotiation", 0, 1),
+                         _dot11_extcap_octet(7)),
+        ConditionalField(BitField("unprotected_txop_negotiation", 0, 1),
+                         _dot11_extcap_octet(7)),
+        ConditionalField(BitField("alternate_edca", 0, 1),
+                         _dot11_extcap_octet(7)),
+        # Octet 8: bits 64-71
+        ConditionalField(BitField("ftm_initiator", 0, 1),
+                         _dot11_extcap_octet(8)),
+        ConditionalField(BitField("ftm_responder", 0, 1),
+                         _dot11_extcap_octet(8)),
+        ConditionalField(BitField("channel_availability_query", 0, 1),
+                         _dot11_extcap_octet(8)),
+        ConditionalField(BitField("white_space_map", 0, 1),
+                         _dot11_extcap_octet(8)),
+        ConditionalField(BitField("network_channel_control", 0, 1),
+                         _dot11_extcap_octet(8)),
+        ConditionalField(BitField("geodatabase_inband_enabling_signal", 0, 1),
+                         _dot11_extcap_octet(8)),
+        ConditionalField(BitField("channel_schedule_management", 0, 1),
+                         _dot11_extcap_octet(8)),
+        ConditionalField(BitField("max_msdus_in_amsdu_high", 0, 1),
+                         _dot11_extcap_octet(8)),
+        # Octet 9: bits 72-79
+        ConditionalField(
+            BitField("obss_narrow_bandwidth_ru_in_ofdma_tolerance", 0, 1),
+            _dot11_extcap_octet(9)),
+        ConditionalField(BitField("twt_responder_support", 0, 1),
+                         _dot11_extcap_octet(9)),
+        ConditionalField(BitField("twt_requester_support", 0, 1),
+                         _dot11_extcap_octet(9)),
+        ConditionalField(BitField("reserved76", 0, 1), _dot11_extcap_octet(9)),
+        ConditionalField(BitField("preassociation_discovery", 0, 1),
+                         _dot11_extcap_octet(9)),
+        ConditionalField(BitField("future_channel_guidance", 0, 1),
+                         _dot11_extcap_octet(9)),
+        ConditionalField(BitField("extended_spectrum_management_capable",
+                                  0, 1),
+                         _dot11_extcap_octet(9)),
+        ConditionalField(BitField("fils_capability", 0, 1),
+                         _dot11_extcap_octet(9)),
+        # Octet 10: bits 80-87
+        ConditionalField(BitField("local_mac_address_policy", 0, 1),
+                         _dot11_extcap_octet(10)),
+        ConditionalField(BitField("oct", 0, 1), _dot11_extcap_octet(10)),
+        ConditionalField(BitField("mirrored_scs", 0, 1),
+                         _dot11_extcap_octet(10)),
+        ConditionalField(BitField("beacon_protection_enabled", 0, 1),
+                         _dot11_extcap_octet(10)),
+        ConditionalField(
+            BitField("enhanced_multi_bssid_advertisement_support", 0, 1),
+            _dot11_extcap_octet(10)),
+        ConditionalField(BitField("sae_passwords_used_exclusively", 0, 1),
+                         _dot11_extcap_octet(10)),
+        ConditionalField(BitField("sae_password_identifiers_in_use", 0, 1),
+                         _dot11_extcap_octet(10)),
+        ConditionalField(
+            BitField("complete_list_of_nontxbssid_profiles", 0, 1),
+            _dot11_extcap_octet(10)),
+        # Octet 11: bits 88-95
+        ConditionalField(BitField("phase_shift_feedback_support", 0, 1),
+                         _dot11_extcap_octet(11)),
+        ConditionalField(BitField("aoa_measurement_available", 0, 1),
+                         _dot11_extcap_octet(11)),
+        ConditionalField(
+            BitField("tb_ranging_initiator_measurement_support", 0, 1),
+            _dot11_extcap_octet(11)),
+        ConditionalField(
+            BitField("tb_ranging_responder_measurement_support", 0, 1),
+            _dot11_extcap_octet(11)),
+        ConditionalField(BitField("tb_ranging_responder", 0, 1),
+                         _dot11_extcap_octet(11)),
+        ConditionalField(BitField("non_tb_ranging_responder", 0, 1),
+                         _dot11_extcap_octet(11)),
+        ConditionalField(BitField("twt_parameters_range_support", 0, 1),
+                         _dot11_extcap_octet(11)),
+        ConditionalField(BitField("sae_pk_passwords_used_exclusively", 0, 1),
+                         _dot11_extcap_octet(11)),
+        # Octet 12: bits 96-103
+        ConditionalField(BitField("reserved103", 0, 1),
+                         _dot11_extcap_octet(12)),
+        ConditionalField(BitField("known_sta_identification_enabled", 0, 1),
+                         _dot11_extcap_octet(12)),
+        ConditionalField(BitField("multiple_bssid_role_switch_support", 0, 1),
+                         _dot11_extcap_octet(12)),
+        ConditionalField(BitField("peer_to_peer_twt_support", 0, 1),
+                         _dot11_extcap_octet(12)),
+        ConditionalField(BitField("ebcs_relaying_support", 0, 1),
+                         _dot11_extcap_octet(12)),
+        ConditionalField(BitField("ebcs_support", 0, 1),
+                         _dot11_extcap_octet(12)),
+        ConditionalField(BitField("i2r_lmr_feedback_policy", 0, 1),
+                         _dot11_extcap_octet(12)),
+        ConditionalField(BitField("dmg_location", 0, 1),
+                         _dot11_extcap_octet(12)),
+        # Octet 13: bits 104-111
+        ConditionalField(BitField("reserved106", 0, 6),
+                         _dot11_extcap_octet(13)),
+        ConditionalField(BitField("gas_query_request_fragmentation", 0, 1),
+                         _dot11_extcap_octet(13)),
+        ConditionalField(BitField("capability_notification_support", 0, 1),
+                         _dot11_extcap_octet(13)),
+        # Octets past the ones named above, so that a longer element from a
+        # newer amendment is still consumed whole rather than leaking into the
+        # next element.
+        ConditionalField(
+            StrLenField("reserved_octets", b"",
+                        length_from=lambda pkt: max(0, (pkt.len or 0) - 14)),
+            lambda pkt: pkt.len is None or pkt.len > 14),
+    ]
+
+
 # 802.11-2016 9.4.2.159
 
 class Dot11VHTOperationInfo(Packet):
@@ -1948,7 +2197,7 @@ class Dot11EltVHTOperation(Dot11Elt):
         ),
         FieldListField(
             "mcs_set",
-            [0x00],
+            [0x00] * 8,
             BitField('SS', 0x00, size=2),
             count_from=lambda x: 8
         )
@@ -2054,7 +2303,7 @@ class Dot11EltHEOperation(Dot11EltExtension):
         # Basic HE-MCS and NSS Set: 2B
         FieldListField(
             "basic_he_mcs_and_nss_set",
-            [0x00],
+            [0x00] * 8,
             BitField('SS', 0x00, size=2),
             count_from=lambda x: 8
         ),

@@ -654,6 +654,90 @@ assert pkt.notdecoded == b""
 for i in range(10):
     assert isinstance(raw(fuzz(Dot11Elt())), bytes)
 
+= Every packet class in scapy.layers.dot11 builds, from defaults and fuzzed
+~ dot11
+
+# Dot11EltHEOperation used to raise "can only concatenate tuple (not 'bytes')
+# to tuple" straight out of the box, and so did Dot11EltVHTOperation: both
+# declare a FieldListField of 2-bit BitFields with count_from=8, but gave it
+# a one-element default. count_from only constrains dissection - on build,
+# FieldListField.addfield just chains the inner field's addfield, so two bits
+# went in instead of sixteen, BitField.addfield handed post_build its
+# still-open (bytes, bit count, value) accumulator tuple rather than bytes,
+# and Dot11Elt.post_build blew up on `p + pay`.
+#
+# The old "fuzz() calls for Dot11Elt()" test above could never catch that:
+# it only ever instantiates the generic Dot11Elt base class, so not one of
+# the ~50 registered subclasses is exercised. Neither could the hand-written
+# Dot11EltHEOperation tests further down, which all start from captured bytes
+# - dissection goes through count_from and yields a correctly sized list, so
+# the round-trip realigns and the broken default never appears. Only building
+# a bare Dot11EltHEOperation() reaches it. Hence this sweep over everything
+# the module defines.
+#
+# fuzz() is included because it reaches field combinations no hand-written
+# test enumerates, and deliberately keeps list-valued fields' shape intact
+# (see _fuzz_list_items), so a bad list default survives into the build.
+
+import scapy.layers.dot11 as _dot11_mod
+
+dot11_classes = sorted(
+    {c for c in vars(_dot11_mod).values()
+     if isinstance(c, type) and issubclass(c, Packet) and
+     c.__module__ == "scapy.layers.dot11"},
+    key=lambda c: c.__name__)
+
+# Guard against the sweep quietly turning into a no-op if the module is
+# refactored and this stops finding anything.
+assert len(dot11_classes) > 50, len(dot11_classes)
+
+failures = []
+for cls in dot11_classes:
+    if cls is Dot11WEP and not conf.crypto_valid:
+        # Building it needs python-cryptography, unrelated to what's tested here
+        continue
+    for fuzzed in (False, True):
+        try:
+            pkt = fuzz(cls()) if fuzzed else cls()
+            for i in range(5):
+                assert isinstance(raw(pkt), bytes)
+        except Exception as e:
+            failures.append("%s (fuzzed=%s): %s: %s" % (
+                cls.__name__, fuzzed, type(e).__name__, e))
+            break
+
+assert not failures, "\n".join(failures)
+
+= Dot11EltVHTOperation and Dot11EltHEOperation - fixed-size 2-bit MCS lists
+~ dot11
+
+# Both lists are eight 2-bit entries, i.e. exactly two octets. A default of
+# any other length leaves the bit accumulator unaligned and breaks the build.
+assert Dot11EltVHTOperation().mcs_set == [0] * 8
+assert Dot11EltHEOperation().basic_he_mcs_and_nss_set == [0] * 8
+
+pkt = Dot11EltVHTOperation()
+assert raw(pkt) == b"\xc0\x05\x00\x24\x00\x00\x00"
+assert Dot11EltVHTOperation(raw(pkt)).mcs_set == [0] * 8
+
+# Dot11EltExtension hardcodes len=0 instead of None, so Dot11Elt.post_build
+# never computes it and a built extension element can't be dissected back.
+# That's a separate pre-existing bug; set len here so the round-trip below
+# exercises the MCS list rather than that.
+pkt = Dot11EltHEOperation(len=7)
+assert raw(pkt) == b"\xff\x07\x24\x00\x00\x00\x00\x00\x00"
+assert Dot11EltHEOperation(raw(pkt)).basic_he_mcs_and_nss_set == [0] * 8
+
+# The list really is the last two octets of each element, MSB-first
+pkt = Dot11EltVHTOperation(mcs_set=[1, 2, 3, 0, 0, 0, 0, 2])
+assert raw(pkt)[-2:] == b"\x6c\x02"
+assert Dot11EltVHTOperation(raw(pkt)).mcs_set == [1, 2, 3, 0, 0, 0, 0, 2]
+
+pkt = Dot11EltHEOperation(len=7, basic_he_mcs_and_nss_set=[1, 2, 3, 0, 0, 0, 0, 2])
+assert raw(pkt)[-2:] == b"\x6c\x02"
+assert Dot11EltHEOperation(raw(pkt)).basic_he_mcs_and_nss_set == \
+    [1, 2, 3, 0, 0, 0, 0, 2]
+
 = PMKIDListPacket - Check computation of nb_pmkids
 assert PMKIDListPacket(raw(PMKIDListPacket())).nb_pmkids == 0
 assert PMKIDListPacket(raw(PMKIDListPacket(pmkid_list=["AZEDFREZSDERFGTY"]))).nb_pmkids == 1
@@ -1252,3 +1336,90 @@ assert [type(a) for a in elt.attributes] == [Dot11P2PAttribute]
 assert elt.attributes[0].attr_id == 13
 assert elt.attributes[0].info == body
 assert raw(elt) == b"\xdd" + chb(len(attr) + 4) + b"Po\x9a\x09" + attr
+
+= Dot11EltExtendedCapabilities - a full element names each capability bit
+~ dot11
+
+# A 14-octet element with 20/40 BSS Coexistence Management (bit 0), BSS
+# Transition (19), Interworking (31), QMF Activated (49) and Fine Timing
+# Measurement Responder (70) set, and Service Interval Granularity (41-43)
+# carrying 5. Bit n is octet n // 8 bit n % 8, least significant bit first.
+data = b"\x7f\x0e\x01\x00\x08\x80\x00\x0a\x02\x00\x40\x00\x00\x00\x00\x00"
+elt = Dot11Elt(data)
+
+assert type(elt) is Dot11EltExtendedCapabilities
+assert elt.len == 14
+assert elt.bss_coexistence_management == 1
+assert elt.bss_transition == 1
+assert elt.interworking == 1
+assert elt.qmf_activated == 1
+assert elt.ftm_responder == 1
+assert elt.extended_channel_switching == 0
+assert elt.ftm_initiator == 0
+
+# Service Interval Granularity is a 3 bit value, not three flags
+assert elt.service_interval_granularity == 5
+assert raw(elt) == data
+
+= Dot11EltExtendedCapabilities - a short element does not invent the bits it omits
+~ dot11
+
+# The element is variable length: a STA sends only as many octets as it has
+# capabilities to declare. Octets the frame never carried have to be absent
+# rather than read as zero out of a padded field.
+short = Dot11Elt(b"\x7f\x03\x01\x00\x08")
+
+assert type(short) is Dot11EltExtendedCapabilities
+assert short.len == 3
+assert short.bss_coexistence_management == 1
+assert short.bss_transition == 1
+assert short.ftm_responder is None          # octet 8 is not in the element
+assert short.service_interval_granularity is None
+assert raw(short) == b"\x7f\x03\x01\x00\x08"
+
+# One octet is legal too, and so is none at all
+minimal = Dot11Elt(b"\x7f\x01\x01")
+assert type(minimal) is Dot11EltExtendedCapabilities
+assert minimal.bss_coexistence_management == 1
+assert minimal.diagnostics is None
+assert raw(minimal) == b"\x7f\x01\x01"
+assert raw(Dot11Elt(b"\x7f\x00")) == b"\x7f\x00"
+
+= Dot11EltExtendedCapabilities - octets past the ones named are kept, not leaked
+~ dot11
+
+# A longer element from an amendment this table does not cover yet must still
+# be consumed whole, or its tail is dissected as the element that follows it.
+pkt = Dot11Elt(b"\x7f\x10\x01\x00\x08\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\xaa\xbb" + b"\x03\x01\x06")
+
+assert type(pkt) is Dot11EltExtendedCapabilities
+assert pkt.len == 16
+assert pkt.reserved_octets == b"\xaa\xbb"
+assert pkt[Dot11Elt::{"ID": 3}].channel == 6
+assert raw(pkt) == b"\x7f\x10\x01\x00\x08\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\xaa\xbb\x03\x01\x06"
+
+= Dot11EltExtendedCapabilities - building
+~ dot11
+
+# Built without a length, the element declares every octet it knows
+built = Dot11EltExtendedCapabilities(bss_transition=1, ftm_responder=1,
+                                     service_interval_granularity=5)
+assert raw(built) == b"\x7f\x0e\x00\x00\x08\x00\x00\x0a\x00\x00\x40\x00\x00\x00\x00\x00"
+
+# Given a length, it declares exactly that many and drops the rest
+built = Dot11EltExtendedCapabilities(len=3, bss_coexistence_management=1,
+                                     bss_transition=1, ftm_responder=1)
+assert raw(built) == b"\x7f\x03\x01\x00\x08"
+
+# The frames round-trip inside a beacon, at any length
+beacon = RadioTap()/Dot11(type=0, subtype=8, addr1="ff:ff:ff:ff:ff:ff",
+                          addr2="02:11:22:33:44:55",
+                          addr3="02:11:22:33:44:55")/Dot11Beacon()
+for length in [0, 1, 3, 8, 14, 16]:
+    body = bytes(range(1, length + 1))
+    frame = raw(beacon/Dot11Elt(ID=0, info=b"EXTCAP")) + b"\x7f" + chb(length) + body
+    assert raw(RadioTap(frame)) == frame
+    assert type(RadioTap(frame)[Dot11Elt::{"ID": 127}]) is Dot11EltExtendedCapabilities
+
+# The opaque body stays reachable for code written before the element was named
+assert Dot11Elt(b"\x7f\x03\x01\x00\x08").info == b"\x01\x00\x08"
