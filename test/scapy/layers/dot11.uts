@@ -708,6 +708,137 @@ for cls in dot11_classes:
 
 assert not failures, "\n".join(failures)
 
+= Every packet class in scapy.layers.dot11 survives a build/dissect/build round-trip
+~ dot11
+
+# The build-only sweep above would not have caught the Dot11EltExtension len
+# bug: a hardcoded len=0 builds perfectly happily, it only falls apart when you
+# try to read the result back. Rebuilding what was dissected is what pins that
+# down, so do it for everything the module defines.
+
+import scapy.layers.dot11 as _dot11_mod
+
+dot11_classes = sorted(
+    {c for c in vars(_dot11_mod).values()
+     if isinstance(c, type) and issubclass(c, Packet) and
+     c.__module__ == "scapy.layers.dot11"},
+    key=lambda c: c.__name__)
+assert len(dot11_classes) > 50, len(dot11_classes)
+
+failures = []
+for cls in dot11_classes:
+    if cls is Dot11WEP and not conf.crypto_valid:
+        continue
+    try:
+        once = raw(cls())
+        twice = raw(cls(once))
+        if once != twice:
+            failures.append("%s: %r -> %r" % (cls.__name__, once, twice))
+    except Exception as e:
+        failures.append("%s: %s: %s" % (cls.__name__, type(e).__name__, e))
+
+assert not failures, "\n".join(failures)
+
+# Every element's declared len must match the octets that actually follow it.
+# This is the invariant Dot11EltExtension broke outright.
+failures = []
+for cls in dot11_classes:
+    if not issubclass(cls, Dot11Elt):
+        continue
+    built = raw(cls())
+    if built[1] != len(built) - 2:
+        failures.append("%s: len=%d, but %d octets follow" % (
+            cls.__name__, built[1], len(built) - 2))
+
+assert not failures, "\n".join(failures)
+
+= Dot11Elt dispatch - registered element IDs and extension IDs, alone and chained
+~ dot11
+
+# A registered IE must dissect back to the very class that registered it. This
+# catches an ID registered against the wrong class, or a match_subclass slip.
+
+import scapy.layers.dot11 as _dot11_mod
+
+failures = []
+for elt_id, cls in sorted(_dot11_mod.Dot11Elt.registered_ies.items()):
+    if cls is Dot11EltExtension:
+        # The extension base class deliberately hands unknown extension IDs
+        # (including its own default ext_ID of 0) to Dot11EltExtensionGeneric
+        continue
+    got = type(Dot11Elt(raw(cls())))
+    if got is not cls:
+        failures.append("ID %d: %s dissected back as %s" % (
+            elt_id, cls.__name__, got.__name__))
+
+for ext_id, cls in sorted(_dot11_mod.Dot11EltExtension.registered_ext_ids.items()):
+    got = type(Dot11Elt(raw(cls())))
+    if got is not cls:
+        failures.append("ext_ID %d: %s dissected back as %s" % (
+            ext_id, cls.__name__, got.__name__))
+
+assert not failures, "\n".join(failures)
+
+# The same elements chained into one real beacon: every one must come back, in
+# order, as its own class, and the frame must rebuild byte-identically. An
+# element with a wrong len or a broken extract_padding swallows its successors
+# here even though it looks fine on its own.
+elts = [cls() for elt_id, cls in sorted(_dot11_mod.Dot11Elt.registered_ies.items())
+        if cls is not Dot11EltExtension]
+elts += [cls() for _, cls in
+         sorted(_dot11_mod.Dot11EltExtension.registered_ext_ids.items())]
+assert len(elts) > 10, len(elts)
+
+frame = Dot11(addr1="ff:ff:ff:ff:ff:ff", addr2="00:11:22:33:44:55",
+              addr3="00:11:22:33:44:55") / Dot11Beacon()
+for elt in elts:
+    frame = frame / elt
+
+built = raw(frame)
+dissected = Dot11(built)
+assert raw(dissected) == built
+
+recovered = []
+layer = dissected.getlayer(Dot11Elt)
+while layer is not None:
+    recovered.append(type(layer))
+    layer = layer.payload.getlayer(Dot11Elt) if layer.payload else None
+
+assert recovered == [type(e) for e in elts], recovered
+
+= show(), repr() and summary() do not raise on dot11 packets, fuzzed included
+~ dot11
+
+# Rendering a packet has its own failure modes - Dot11(type=<volatile>).show()
+# raising TypeError, further down, is one - and none of them show up in a build.
+
+import scapy.layers.dot11 as _dot11_mod
+
+dot11_classes = sorted(
+    {c for c in vars(_dot11_mod).values()
+     if isinstance(c, type) and issubclass(c, Packet) and
+     c.__module__ == "scapy.layers.dot11"},
+    key=lambda c: c.__name__)
+
+failures = []
+for cls in dot11_classes:
+    if cls is Dot11WEP and not conf.crypto_valid:
+        continue
+    for fuzzed in (False, True):
+        pkt = fuzz(cls()) if fuzzed else cls()
+        for what, render in [
+            ("show", lambda p: p.show(dump=True)),
+            ("repr", repr),
+            ("summary", lambda p: p.summary()),
+        ]:
+            try:
+                assert render(pkt)
+            except Exception as e:
+                failures.append("%s (fuzzed=%s) %s(): %s: %s" % (
+                    cls.__name__, fuzzed, what, type(e).__name__, e))
+
+assert not failures, "\n".join(failures)
+
 = Dot11EltVHTOperation and Dot11EltHEOperation - fixed-size 2-bit MCS lists
 ~ dot11
 
@@ -720,11 +851,7 @@ pkt = Dot11EltVHTOperation()
 assert raw(pkt) == b"\xc0\x05\x00\x24\x00\x00\x00"
 assert Dot11EltVHTOperation(raw(pkt)).mcs_set == [0] * 8
 
-# Dot11EltExtension hardcodes len=0 instead of None, so Dot11Elt.post_build
-# never computes it and a built extension element can't be dissected back.
-# That's a separate pre-existing bug; set len here so the round-trip below
-# exercises the MCS list rather than that.
-pkt = Dot11EltHEOperation(len=7)
+pkt = Dot11EltHEOperation()
 assert raw(pkt) == b"\xff\x07\x24\x00\x00\x00\x00\x00\x00"
 assert Dot11EltHEOperation(raw(pkt)).basic_he_mcs_and_nss_set == [0] * 8
 
@@ -733,10 +860,40 @@ pkt = Dot11EltVHTOperation(mcs_set=[1, 2, 3, 0, 0, 0, 0, 2])
 assert raw(pkt)[-2:] == b"\x6c\x02"
 assert Dot11EltVHTOperation(raw(pkt)).mcs_set == [1, 2, 3, 0, 0, 0, 0, 2]
 
-pkt = Dot11EltHEOperation(len=7, basic_he_mcs_and_nss_set=[1, 2, 3, 0, 0, 0, 0, 2])
+pkt = Dot11EltHEOperation(basic_he_mcs_and_nss_set=[1, 2, 3, 0, 0, 0, 0, 2])
 assert raw(pkt)[-2:] == b"\x6c\x02"
 assert Dot11EltHEOperation(raw(pkt)).basic_he_mcs_and_nss_set == \
     [1, 2, 3, 0, 0, 0, 0, 2]
+
+= Dot11EltExtension - built elements carry a computed len and their ext_ID
+~ dot11
+
+# Dot11EltExtension used to hardcode ByteField("len", 0) where every other
+# Dot11Elt uses None. Dot11Elt.post_build only computes len when it is None,
+# so built extension elements went out with len=0 - and because ext_ID is a
+# ConditionalField keyed on that same len, the Element ID Extension octet was
+# silently dropped too, making the result impossible to dissect back.
+pkt = Dot11EltExtensionGeneric(ext_ID=1, info=b"abc")
+assert raw(pkt) == b"\xff\x04\x01abc"
+
+pkt = Dot11EltExtensionGeneric(raw(pkt))
+assert pkt.len == 4
+assert pkt.ext_ID == 1
+assert pkt.getfieldval("info") == b"abc"
+
+# The len is computed, not taken from the field's default
+assert Dot11EltHEOperation(raw(Dot11EltHEOperation())).len == 7
+assert Dot11EltEHTOperation(raw(Dot11EltEHTOperation())).ext_ID == 106
+
+# An explicit len is still honoured, so malformed elements stay expressible
+assert raw(Dot11EltExtensionGeneric(len=99, ext_ID=1, info=b"abc")) == \
+    b"\xff\x63\x01abc"
+
+# A dissected zero-length extension element carries no ext_ID octet, and
+# rebuilding it must not invent one
+pkt = Dot11EltExtension(b"\xff\x00")
+assert pkt.len == 0
+assert raw(pkt) == b"\xff\x00"
 
 = PMKIDListPacket - Check computation of nb_pmkids
 assert PMKIDListPacket(raw(PMKIDListPacket())).nb_pmkids == 0

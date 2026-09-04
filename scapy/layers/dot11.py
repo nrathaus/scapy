@@ -2214,10 +2214,17 @@ class Dot11EltExtension(Dot11Elt):
     ID = 255
     fields_desc = [
         ByteEnumField("ID", 255, _dot11_id_enum),
-        ByteField("len", 0),
+        # None, like every other Dot11Elt: post_build then computes it.
+        # A hardcoded 0 would be emitted verbatim on build, and the result
+        # could not be dissected back - the condition below would drop the
+        # Element ID Extension octet too.
+        ByteField("len", None),
         ConditionalField(
             ByteField("ext_ID", 0),
-            lambda pkt: pkt.len > 0
+            # A dissected zero-length extension element carries no Element ID
+            # Extension octet. When building, len is still None here, and the
+            # octet is always part of the element.
+            lambda pkt: pkt.len is None or pkt.len > 0
         ),
     ]
 
