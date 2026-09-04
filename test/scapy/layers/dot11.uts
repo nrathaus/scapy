@@ -1075,3 +1075,180 @@ except TypeError:
     ok = False
 
 assert ok, "Dot11(type=<volatile value>).show() must not raise TypeError"
+
+= Dot11EltP2P - dissection
+~ dot11
+
+# A P2P Probe Request: a Capability attribute with the Group Owner bit set,
+# and a Device Info attribute. Cross-checked against tshark.
+pkt = RadioTap(b'\x00\x00\x08\x00\x00\x00\x00\x00@\x00\x00\x00\xff\xff\xff\xff\xff\xff\x02\x11"3DU\xff\xff\xff\xff\xff\xff\x00\x00\x00\tDIRECT-xy\xdd%Po\x9a\t\x02\x02\x00%\x01\r\x19\x00\x02\x11"3DU\x00\x88\x00\n\x00P\xf2\x04\x00\x05\x00\x10\x11\x00\x04TEST')
+
+assert Dot11EltP2P in pkt
+elt = pkt[Dot11EltP2P]
+assert elt.oui == 0x506f9a
+assert elt.oui_type == 0x09
+assert len(elt.attributes) == 2
+
+cap = elt.attributes[0]
+assert isinstance(cap, Dot11P2PCapability)
+assert cap.attr_id == 2 and cap.len == 2
+assert cap.group_capability.group_owner
+assert cap.device_capability.service_discovery
+assert cap.device_capability.concurrent_operation
+
+info = elt.attributes[1]
+assert isinstance(info, Dot11P2PDeviceInfo)
+assert info.attr_id == 13 and info.len == 25
+assert info.device_address == "02:11:22:33:44:55"
+assert info.config_methods.PushButton and info.config_methods.Display
+assert info.primary_device_category == 10
+assert info.primary_device_oui == 0x0050f204
+assert info.primary_device_subcategory == 5
+assert info.num_secondary_device_types == 0
+assert info.device_name_type == 0x1011
+assert info.device_name == b"TEST"
+
+assert raw(RadioTap(raw(pkt))) == raw(pkt)
+
+= Dot11EltP2P - the other Wi-Fi Alliance elements share the OUI and are not P2P
+~ dot11
+
+# Only OUI type 9 is P2P: Wi-Fi Display, Wi-Fi Aware and HS 2.0 Indication
+# carry the same OUI and must stay on Dot11EltVendorSpecific.
+assert type(Dot11Elt(b"\xdd\x07Po\x9a\x09\x01\x02\x03")) is Dot11EltP2P
+for oui_type in (0x0a, 0x10, 0x12, 0x1a):
+    elt = Dot11Elt(b"\xdd\x07Po\x9a" + chb(oui_type) + b"\x01\x02\x03")
+    assert type(elt) is Dot11EltVendorSpecific
+    assert raw(elt) == b"\xdd\x07Po\x9a" + chb(oui_type) + b"\x01\x02\x03"
+
+# An element too short to hold an OUI type is not P2P either
+assert type(Dot11Elt(b"\xdd\x03Po\x9a")) is Dot11EltVendorSpecific
+
+= Dot11P2PGroupOwnerIntent - the tie breaker shares the byte with the intent
+~ dot11
+
+# Bits 1 to 7 are the intent, bit 0 is the tie breaker: reading the byte as
+# a whole gives twice the intent value.
+intent = Dot11P2PAttribute(b"\x04\x01\x00\x0f")
+assert isinstance(intent, Dot11P2PGroupOwnerIntent)
+assert intent.intent == 7
+assert intent.tie_breaker == 1
+assert raw(intent) == b"\x04\x01\x00\x0f"
+assert raw(Dot11P2PGroupOwnerIntent(intent=7, tie_breaker=1)) == b"\x04\x01\x00\x0f"
+
+= Dot11P2PAttribute - the length is little endian and is computed on build
+~ dot11
+
+assert raw(Dot11P2PAttribute(attr_id=221, info=b"\x01" * 300)) == b"\xdd,\x01" + b"\x01" * 300
+assert Dot11P2PAttribute(b"\xdd,\x01" + b"\x01" * 300).len == 300
+
+elt = Dot11Elt(raw(Dot11EltP2P(attributes=[
+    Dot11P2PCapability(group_capability="group_owner"),
+    Dot11P2PGroupOwnerIntent(intent=15),
+    Dot11P2PDeviceInfo(device_address="02:11:22:33:44:55", device_name="TEST"),
+])))
+assert type(elt) is Dot11EltP2P
+assert elt.len == 41
+assert [(a.attr_id, a.len) for a in elt.attributes] == [(2, 2), (4, 1), (13, 25)]
+assert elt.attributes[2].device_name == b"TEST"
+
+= Dot11P2PPublicAction - dissection
+~ dot11
+
+# A GO Negotiation Request: category 4 (Public), action 9 (Vendor Specific),
+# the Wi-Fi Alliance OUI, OUI type 9, then the subtype and dialog token.
+pkt = RadioTap(b'\x00\x00\x08\x00\x00\x00\x00\x00\xd0\x00\x00\x00\x02\xaa\xbb\xcc\xdd\xee\x02\x11"3DU\x02\xaa\xbb\xcc\xdd\xee\x00\x00\x04\tPo\x9a\t\x00\x01\xdd%Po\x9a\t\x02\x02\x00%\x01\r\x19\x00\x02\x11"3DU\x00\x88\x00\n\x00P\xf2\x04\x00\x05\x00\x10\x11\x00\x04TEST')
+
+assert Raw not in pkt
+assert pkt[Dot11Action].category == 0x04
+assert pkt[Dot11Public].action == 9
+action = pkt[Dot11P2PPublicAction]
+assert action.oui == 0x506f9a
+assert action.oui_type == 0x09
+assert action.subtype == 0
+assert action.dialog_token == 1
+
+# The P2P element follows the action header
+assert pkt[Dot11EltP2P].attributes[0].group_capability.group_owner
+
+assert raw(RadioTap(raw(pkt))) == raw(pkt)
+
+= Dot11Public - only the Wi-Fi Alliance vendor specific action is P2P
+~ dot11
+
+# Action 9 is vendor specific, so another vendor's OUI, or the Wi-Fi
+# Alliance's with a different OUI type, must not be read as P2P.
+assert Dot11P2PPublicAction in Dot11Action(b"\x04\x09Po\x9a\x09\x00\x01")
+for tail in (b"Po\x9a\x0a\x00\x01", b"\x00\x37*\x09\x00\x01", b"Po"):
+    pkt = Dot11Action(b"\x04\x09" + tail)
+    assert Dot11P2PPublicAction not in pkt
+    assert raw(pkt) == b"\x04\x09" + tail
+
+# Another public action code keeps the bytes it had
+pkt = Dot11Action(b"\x04\x0a\x00\x01\x02")
+assert pkt[Dot11Public].action == 10
+assert raw(pkt) == b"\x04\x0a\x00\x01\x02"
+
+= Dot11EltP2P - a P2P IE split over several elements
+~ dot11
+
+# A Group Owner's Probe Request whose P2P IE does not fit one element: a
+# Group Info attribute with six client descriptors passes 251 bytes on its
+# own, so the Device Info attribute that follows straddles the boundary -
+# here the split lands inside its device name TLV.
+#
+# A receiver concatenates the bodies of every matching element and cuts the
+# attributes out of the result, as hostap's ieee802_11_vendor_ie_concat()
+# does, so nothing aligns an attribute to an element boundary.
+pkt = RadioTap(b'\x00\x00\x08\x00\x00\x00\x00\x00@\x00\x00\x00\xff\xff\xff\xff\xff\xff\x02\x11"3DU\xff\xff\xff\xff\xff\xff\x00\x00\x00\tDIRECT-xy\xdd\xffPo\x9a\t\x02\x02\x00%\x01\x0e\xde\x00$\x02\x11"3D`\x02\x11"3D`%\x00\x88\x00\n\x00P\xf2\x04\x00\x05\x00\x10\x11\x00\x08CLIENT-0$\x02\x11"3Da\x02\x11"3Da%\x00\x88\x00\n\x00P\xf2\x04\x00\x05\x00\x10\x11\x00\x08CLIENT-1$\x02\x11"3Db\x02\x11"3Db%\x00\x88\x00\n\x00P\xf2\x04\x00\x05\x00\x10\x11\x00\x08CLIENT-2$\x02\x11"3Dc\x02\x11"3Dc%\x00\x88\x00\n\x00P\xf2\x04\x00\x05\x00\x10\x11\x00\x08CLIENT-3$\x02\x11"3Dd\x02\x11"3Dd%\x00\x88\x00\n\x00P\xf2\x04\x00\x05\x00\x10\x11\x00\x08CLIENT-4$\x02\x11"3De\x02\x11"3De%\x00\x88\x00\n\x00P\xf2\x04\x00\x05\x00\x10\x11\x00\x08CLIENT-5\r\x19\x00\x02\x11"3DU\x00\x88\x00\n\x00P\xf2\x04\x00\x05\x00\x10\xdd\x0bPo\x9a\t\x11\x00\x04TEST')
+
+elements = pkt[Dot11EltP2P].p2p_elements()
+assert len(elements) == 2
+assert [e.len for e in elements] == [255, 11]
+
+# The first element holds two attributes whole and the head of a third; the
+# straddling bytes are exposed rather than cut into a wrong answer.
+first, second = elements
+assert [type(a) for a in first.attributes] == [
+    Dot11P2PCapability, Dot11P2PAttribute, Dot11P2PAttributePartial]
+assert first.attributes[1].attr_id == 14        # P2P Group Info
+assert first.attributes[2].attr_id == 13        # cut short
+assert first.attributes[2].len == 25
+assert len(first.attributes[2].data) == 18   # of the 25 it declares
+
+# The continuation element repeats the OUI and the OUI type and then carries
+# the tail of that attribute, so its first bytes are not an attribute header
+assert [type(a) for a in second.attributes] == [Dot11P2PAttributeFragment]
+assert second.attributes[0].data == b"\x11\x00\x04TEST"
+
+# Reassembled, the attribute is whole and reachable from either element
+for element in elements:
+    attributes = element.p2p_attributes()
+    assert [(a.attr_id, a.len) for a in attributes] == [(2, 2), (14, 222), (13, 25)]
+    assert isinstance(attributes[2], Dot11P2PDeviceInfo)
+    assert attributes[2].device_address == "02:11:22:33:44:55"
+    assert attributes[2].device_name == b"TEST"
+
+assert len(first.p2p_reassembled()) == 258
+
+# The split must not change what the frame serialises to
+assert raw(RadioTap(raw(pkt))) == raw(pkt)
+
+= Dot11P2PAttribute - an attribute a typed subclass cannot parse keeps its bytes
+~ dot11
+
+# A Device Info attribute declaring 200 secondary device types it does not
+# hold: the attribute falls back to a plain body rather than costing the
+# dissection, the same fallback PacketListField makes for a malformed
+# element of a list.
+body = (b"\x02\x11\x22\x33\x44\x55" + b"\x00\x88"
+        + b"\x00\x0a\x00P\xf2\x04\x00\x05" + b"\xc8"
+        + b"\x00\x10\x11\x00\x04TEST")
+attr = b"\x0d" + struct.pack("<H", len(body)) + body
+elt = Dot11Elt(b"\xdd" + chb(len(attr) + 4) + b"Po\x9a\x09" + attr)
+
+assert type(elt) is Dot11EltP2P
+assert [type(a) for a in elt.attributes] == [Dot11P2PAttribute]
+assert elt.attributes[0].attr_id == 13
+assert elt.attributes[0].info == body
+assert raw(elt) == b"\xdd" + chb(len(attr) + 4) + b"Po\x9a\x09" + attr

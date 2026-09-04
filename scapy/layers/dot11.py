@@ -45,11 +45,14 @@ from scapy.fields import (
     PacketListField,
     ReversePadField,
     ScalingField,
+    ShortEnumField,
     ShortField,
     StrField,
     StrFixedLenField,
     StrLenField,
     XByteField,
+    XIntField,
+    XShortField,
     XStrFixedLenField,
 )
 from scapy.ansmachine import AnsweringMachine
@@ -1495,6 +1498,397 @@ class Dot11EltMicrosoftWPA(Dot11EltVendorSpecific):
         return cls
 
 
+# Wi-Fi Alliance P2P (Wi-Fi Direct) Technical Specification v1.7, 4.1.1
+
+_p2p_attribute_ids = {
+    0: "Status",
+    1: "Minor Reason Code",
+    2: "P2P Capability",
+    3: "P2P Device ID",
+    4: "Group Owner Intent",
+    5: "Configuration Timeout",
+    6: "Listen Channel",
+    7: "P2P Group BSSID",
+    8: "Extended Listen Timing",
+    9: "Intended P2P Interface Address",
+    10: "P2P Manageability",
+    11: "Channel List",
+    12: "Notice of Absence",
+    13: "P2P Device Info",
+    14: "P2P Group Info",
+    15: "P2P Group ID",
+    16: "P2P Interface",
+    17: "Operating Channel",
+    18: "Invitation Flags",
+    19: "OOB GO Negotiation Channel",
+    221: "Vendor specific",
+}
+
+
+def _p2p_split_attributes(body):
+    """
+    Split *body* into whole attribute slices and the bytes left over.
+
+    An attribute is one byte of ID, two bytes of length and then that many
+    bytes of body. The length is LITTLE endian, unlike the 802.11 element
+    carrying it.
+    """
+    slices = []
+    while len(body) >= 3:
+        size = 3 + struct.unpack("<H", body[1:3])[0]
+        if size > len(body):
+            break
+        slices.append(body[:size])
+        body = body[size:]
+    return slices, body
+
+
+class Dot11P2PAttribute(Packet):
+    """
+    A P2P attribute, with a little endian length.
+    """
+    name = "P2P Attribute"
+    fields_desc = [
+        ByteEnumField("attr_id", 0, _p2p_attribute_ids),
+        LEShortField("len", None),
+        StrLenField("info", "", length_from=lambda pkt: pkt.len)
+    ]
+
+    @classmethod
+    def dispatch_hook(cls, _pkt=None, *args, **kargs):
+        if _pkt and len(_pkt) >= 3:
+            attr_id = _pkt[0]
+            length = struct.unpack("<H", _pkt[1:3])[0]
+            # Only dispatch when the attribute is long enough to hold the
+            # fixed part of the subclass, so a malformed one stays readable
+            # as a plain body rather than being misparsed.
+            if attr_id == 2 and length >= 2:
+                return Dot11P2PCapability
+            elif attr_id == 4 and length >= 1:
+                return Dot11P2PGroupOwnerIntent
+            elif attr_id == 13 and length >= 21:
+                return Dot11P2PDeviceInfo
+        return cls
+
+    def post_build(self, p, pay):
+        if self.len is None:
+            p = p[:1] + struct.pack("<H", len(p) - 3) + p[3:]
+        return p + pay
+
+    def extract_padding(self, s):
+        return b"", s
+
+
+_p2p_device_capability = [
+    "service_discovery",
+    "client_discoverability",
+    "concurrent_operation",
+    "infrastructure_managed",
+    "device_limit",
+    "invitation_procedure",
+    "reserved6",
+    "reserved7",
+]
+
+_p2p_group_capability = [
+    "group_owner",
+    "persistent_group",
+    "group_limit",
+    "intra_bss_distribution",
+    "cross_connection",
+    "persistent_reconnect",
+    "group_formation",
+    "ip_address_allocation",
+]
+
+
+class Dot11P2PCapability(Dot11P2PAttribute):
+    """
+    Group Capability bit 0 is the Group Owner flag, which is the only thing
+    on the air that says which role a device is playing.
+    """
+    name = "P2P Capability"
+    fields_desc = [
+        ByteEnumField("attr_id", 2, _p2p_attribute_ids),
+        LEShortField("len", None),
+        FlagsField("device_capability", 0, 8, _p2p_device_capability),
+        FlagsField("group_capability", 0, 8, _p2p_group_capability)
+    ]
+
+
+class Dot11P2PGroupOwnerIntent(Dot11P2PAttribute):
+    """
+    The intent value shares its byte with the tie breaker, which sits in
+    bit 0: reading the byte as a whole gives twice the intent.
+    """
+    name = "P2P Group Owner Intent"
+    fields_desc = [
+        ByteEnumField("attr_id", 4, _p2p_attribute_ids),
+        LEShortField("len", None),
+        BitField("intent", 0, 7),
+        BitField("tie_breaker", 0, 1)
+    ]
+
+
+# WSC 2.0.5 Table 33
+_wps_device_categories = {
+    1: "Computer",
+    2: "Input Device",
+    3: "Printer/Scanner/Fax/Copier",
+    4: "Camera",
+    5: "Storage",
+    6: "Network Infrastructure",
+    7: "Display",
+    8: "Multimedia Device",
+    9: "Gaming Device",
+    10: "Telephone",
+    11: "Audio Device",
+    255: "Other",
+}
+
+_wps_config_methods = [
+    "USBA",
+    "Ethernet",
+    "Label",
+    "Display",
+    "External_NFC_Token",
+    "Integrated_NFC_Token",
+    "NFC_Interface",
+    "PushButton",
+    "Keypad",
+    "Virtual_PushButton",
+    "Physical_PushButton",
+    "reserved11",
+    "reserved12",
+    "Virtual_Display",
+    "Physical_Display",
+    "reserved15",
+]
+
+
+class Dot11P2PDeviceInfo(Dot11P2PAttribute):
+    """
+    The config methods and the device name TLV are WPS fields and are BIG
+    endian, inside an attribute whose own length is little endian.
+    """
+    name = "P2P Device Info"
+    fields_desc = [
+        ByteEnumField("attr_id", 13, _p2p_attribute_ids),
+        LEShortField("len", None),
+        MACField("device_address", ETHER_ANY),
+        FlagsField("config_methods", 0, 16, _wps_config_methods),
+        # Primary Device Type
+        ShortEnumField("primary_device_category", 0, _wps_device_categories),
+        XIntField("primary_device_oui", 0x0050f204),
+        ShortField("primary_device_subcategory", 0),
+        FieldLenField("num_secondary_device_types", None, fmt="B",
+                      count_of="secondary_device_types"),
+        FieldListField("secondary_device_types", [],
+                       XStrFixedLenField("", b"\0" * 8, 8),
+                       count_from=lambda pkt: pkt.num_secondary_device_types),
+        # The device name, as a WPS TLV
+        XShortField("device_name_type", 0x1011),
+        FieldLenField("device_name_len", None, fmt="H",
+                      length_of="device_name"),
+        StrLenField("device_name", "",
+                    length_from=lambda pkt: pkt.device_name_len)
+    ]
+
+
+class Dot11P2PAttributePartial(Packet):
+    """
+    The head of an attribute that an element boundary cut short.
+
+    The header is whole, so the ID and the length can be read, but the body
+    continues in the next element: see Dot11EltP2P.
+    """
+    name = "P2P Attribute (cut short)"
+    fields_desc = [
+        ByteEnumField("attr_id", 0, _p2p_attribute_ids),
+        LEShortField("len", 0),
+        StrField("data", b"")
+    ]
+
+    def extract_padding(self, s):
+        return b"", s
+
+
+class Dot11P2PAttributeFragment(Packet):
+    """
+    Bytes belonging to an attribute that began in an earlier element.
+
+    They are not an attribute header and are deliberately left uncut: see
+    Dot11EltP2P.
+    """
+    name = "P2P Attribute Fragment"
+    fields_desc = [StrField("data", b"")]
+
+    def extract_padding(self, s):
+        return b"", s
+
+
+def _p2p_attribute(cls, chunk):
+    """
+    One attribute, falling back to its bytes when a typed subclass cannot
+    make sense of them.
+
+    An attribute may declare a count or a length its own body does not hold,
+    which has to cost the attribute rather than the dissection - the same
+    fallback PacketListField makes for a malformed element of a list. The
+    header is valid, so the bytes are kept as a plain body rather than raw.
+    """
+    try:
+        return cls(chunk)
+    except Exception:
+        if conf.debug_dissector:
+            raise
+        return Dot11P2PAttribute(
+            attr_id=chunk[0],
+            len=struct.unpack("<H", chunk[1:3])[0],
+            info=chunk[3:]
+        )
+
+
+def _p2p_tail(leftover):
+    """Expose the bytes an element boundary cut, rather than guessing."""
+    if not leftover:
+        return []
+    if len(leftover) >= 3:
+        return [Dot11P2PAttributePartial(leftover)]
+    return [Dot11P2PAttributeFragment(leftover)]
+
+
+class _Dot11P2PAttributeListField(PacketListField):
+    """
+    The attributes one P2P element holds, cutting only what it holds whole.
+    """
+
+    def getfield(self, pkt, s):
+        length = self.length_from(pkt)
+        body, remain = s[:length], s[length:]
+        boundary = pkt._p2p_boundary(body)
+        attributes = []
+        if boundary:
+            attributes.append(Dot11P2PAttributeFragment(body[:boundary]))
+        slices, leftover = _p2p_split_attributes(body[boundary:])
+        attributes.extend(_p2p_attribute(self.cls, chunk)
+                          for chunk in slices)
+        attributes.extend(_p2p_tail(leftover))
+        return remain, attributes
+
+
+# Wi-Fi Alliance OUI types sharing OUI 50:6f:9a
+_wfa_oui_types = {
+    0x09: "P2P",
+    0x0a: "WFDS",
+    0x10: "Wi-Fi Display",
+    0x12: "Wi-Fi Aware",
+    0x1a: "HS 2.0 Indication",
+}
+
+
+class Dot11EltP2P(Dot11EltVendorSpecific):
+    """
+    A Wi-Fi Alliance P2P (Wi-Fi Direct) element: OUI 50:6f:9a, OUI type 9.
+
+    A P2P IE longer than 251 bytes does not fit one element and is split over
+    several, and an attribute may straddle the boundary: a receiver
+    concatenates the bodies of every matching element and cuts the attributes
+    out of the result, as hostap's ieee802_11_vendor_ie_concat() does. So the
+    'attributes' field of one element holds only the attributes that element
+    carries whole, and the bytes of a straddling one are exposed as
+    Dot11P2PAttributePartial and Dot11P2PAttributeFragment rather than being
+    cut into a confident, wrong answer. p2p_attributes() reassembles.
+    """
+    name = "802.11 Wi-Fi Alliance P2P"
+    match_subclass = True
+    ID = 221
+    oui = 0x506f9a
+    fields_desc = Dot11EltVendorSpecific.fields_desc[:3] + [
+        ByteEnumField("oui_type", 0x09, _wfa_oui_types),
+        _Dot11P2PAttributeListField(
+            "attributes", [], Dot11P2PAttribute,
+            length_from=lambda pkt: max((pkt.len or 0) - 4, 0)
+        )
+    ]
+
+    @classmethod
+    def dispatch_hook(cls, _pkt=None, *args, **kargs):
+        if _pkt:
+            if len(_pkt) >= 6 and _pkt[5] == 0x09:
+                return Dot11EltP2P
+            # The other Wi-Fi Alliance elements share this OUI and are not
+            # P2P: leave them where they were.
+            return Dot11EltVendorSpecific
+        return cls
+
+    def p2p_body(self):
+        """The attribute bytes of this element, after the OUI type."""
+        return b"".join(raw(attribute) for attribute in self.attributes)
+
+    def p2p_elements(self):
+        """
+        Every P2P element of this frame carrying the same OUI type, in order.
+
+        That is the unit the attributes are cut from, rather than one element.
+        """
+        first = self
+        while isinstance(first.underlayer, Dot11Elt):
+            first = first.underlayer
+        elements = []
+        element = first
+        while isinstance(element, Dot11Elt):
+            if isinstance(element, Dot11EltP2P) and \
+                    element.oui_type == self.oui_type:
+                elements.append(element)
+            element = element.payload
+        return elements
+
+    def p2p_reassembled(self):
+        """The attribute bytes of all those elements, concatenated."""
+        return b"".join(element.p2p_body()
+                        for element in self.p2p_elements())
+
+    def p2p_attributes(self):
+        """
+        The attributes of the whole P2P IE, cut after reassembly.
+
+        Use this rather than the per-element 'attributes' field whenever the
+        element may be one of several: an attribute the boundary straddles is
+        only whole here.
+        """
+        slices, leftover = _p2p_split_attributes(self.p2p_reassembled())
+        return [_p2p_attribute(Dot11P2PAttribute, chunk)
+                for chunk in slices] + _p2p_tail(leftover)
+
+    def _p2p_boundary(self, body):
+        """
+        Where in *body* the first attribute this element carries begins.
+
+        The attributes are cut from the concatenation of every matching
+        element, so the first attribute header of this one sits wherever the
+        earlier elements left off, which may be past the start of the body or
+        past its end.
+        """
+        preceding = b""
+        element = self.underlayer
+        while isinstance(element, Dot11Elt):
+            if isinstance(element, Dot11EltP2P) and \
+                    element.oui_type == self.oui_type:
+                preceding = element.p2p_body() + preceding
+            element = element.underlayer
+        if not preceding:
+            return 0
+        stream = preceding + body
+        offset = 0
+        while offset < len(preceding):
+            if len(stream) - offset < 3:
+                # Truncated: nothing here can be located safely.
+                return len(body)
+            offset += 3 + struct.unpack("<H", stream[offset + 1:offset + 3])[0]
+        return min(offset - len(preceding), len(body))
+
+
 # 802.11-2016 9.4.2.19
 
 class Dot11EltCSA(Dot11Elt):
@@ -2283,6 +2677,87 @@ class Dot11RadioMeasurementReport(Packet):
     ]
 
 
+# 802.11-2020 9.6.7.1, Table 9-364
+
+_public_action_codes = {
+    0: "20/40 BSS Coexistence Management",
+    1: "DSE Enablement",
+    2: "DSE Deenablement",
+    3: "DSE Registered Location Announcement",
+    4: "Extended Channel Switch Announcement",
+    5: "DSE Measurement Request",
+    6: "DSE Measurement Report",
+    7: "Measurement Pilot",
+    8: "DSE Power Constraint",
+    9: "Vendor Specific",
+    10: "GAS Initial Request",
+    11: "GAS Initial Response",
+    12: "GAS Comeback Request",
+    13: "GAS Comeback Response",
+    14: "TDLS Discovery Response",
+    15: "Location Track Notification",
+    16: "QAB Request",
+    17: "QAB Response",
+    18: "QMF Policy",
+    19: "QMF Policy Change",
+    20: "QLoad Request",
+    21: "QLoad Report",
+    22: "HCCA TXOP Advertisement",
+    23: "HCCA TXOP Response",
+    24: "Public Key",
+    25: "Channel Availability Query",
+    26: "Channel Schedule Management",
+    27: "Contact Verification Signal",
+    28: "GDD Enablement Request",
+    29: "GDD Enablement Response",
+    30: "Network Channel Control",
+    31: "White Space Map Announcement",
+    32: "Fine Timing Measurement Request",
+    33: "Fine Timing Measurement",
+    34: "FILS Discovery",
+}
+
+# Wi-Fi Alliance P2P Technical Specification v1.7, 4.2.9
+_p2p_public_action_subtypes = {
+    0: "GO Negotiation Request",
+    1: "GO Negotiation Response",
+    2: "GO Negotiation Confirmation",
+    3: "P2P Invitation Request",
+    4: "P2P Invitation Response",
+    5: "Device Discoverability Request",
+    6: "Device Discoverability Response",
+    7: "Provision Discovery Request",
+    8: "Provision Discovery Response",
+}
+
+
+class Dot11Public(Packet):
+    name = "802.11 Public Action"
+    fields_desc = [
+        ByteEnumField("action", 9, _public_action_codes)
+    ]
+
+    def guess_payload_class(self, payload):
+        # Action 9 is vendor specific, so only the Wi-Fi Alliance OUI
+        # followed by OUI type 9 is P2P.
+        if self.action == 9 and payload[:4] == b"\x50\x6f\x9a\x09":
+            return Dot11P2PPublicAction
+        return super(Dot11Public, self).guess_payload_class(payload)
+
+
+class Dot11P2PPublicAction(Packet):
+    """
+    The GO Negotiation, Invitation and Provision Discovery frames.
+    """
+    name = "802.11 Wi-Fi Alliance P2P Public Action"
+    fields_desc = [
+        OUIField("oui", 0x506f9a),
+        ByteEnumField("oui_type", 0x09, _wfa_oui_types),
+        ByteEnumField("subtype", 0, _p2p_public_action_subtypes),
+        ByteField("dialog_token", 0)
+    ]
+
+
 class Dot11S1GBeacon(_Dot11EltUtils):
     name = "802.11 S1G Beacon"
     fields_desc = [LEIntField("timestamp", 0),
@@ -2465,6 +2940,8 @@ bind_layers(Dot11WNM, Dot11BSSTMResponse, action=8)
 bind_layers(Dot11Action, Dot11RadioMeasurement, category=0x05)
 bind_layers(Dot11RadioMeasurement, Dot11RadioMeasurementRequest, action=0)
 bind_layers(Dot11RadioMeasurement, Dot11RadioMeasurementReport, action=1)
+bind_layers(Dot11Action, Dot11Public, category=0x04)
+bind_layers(Dot11P2PPublicAction, Dot11Elt)
 
 
 conf.l2types.register(DLT_IEEE802_11, Dot11)
