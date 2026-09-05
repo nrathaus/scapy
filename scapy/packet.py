@@ -835,6 +835,20 @@ class Packet(
                     except (AttributeError, IndexError):
                         pass
                     raise ex
+        if isinstance(p, tuple):
+            # A bit field left the current byte open, so the bit fields of
+            # this layer do not add up to a whole number of bytes. Report it
+            # here, while the field responsible is still known: otherwise the
+            # tuple escapes into post_build and raises a TypeError that names
+            # neither the field nor the layer.
+            bitsdone = p[1]
+            raise Scapy_Exception(
+                "While building field '%s' of %s: %d bit(s) left over after "
+                "the last whole byte. The bit fields of a layer must add up "
+                "to a whole number of bytes." % (
+                    f.name, self.__class__.__name__, bitsdone
+                )
+            )
         return p
 
     def do_build_payload(self):

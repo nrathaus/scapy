@@ -2211,15 +2211,21 @@ class FieldListField(Field[List[Any], List[Any]]):
         # type: (...) -> str
         return "[%s]" % ", ".join(self.field.i2repr(pkt, v) for v in x)
 
-    def addfield(self,
+    def addfield(self,  # type: ignore
                  pkt,  # type: Packet
-                 s,  # type: bytes
+                 s,  # type: Union[Tuple[bytes, int, int], bytes]
                  val,  # type: Optional[List[Any]]
                  ):
-        # type: (...) -> bytes
+        # type: (...) -> Union[Tuple[bytes, int, int], bytes]
+        # 's' is a tuple when the inner field is a bit field that has left the
+        # current byte open. That state is carried in and out untouched, so a
+        # bit field before or after this one can close the group.
         val = self.i2m(pkt, val)
         for v in val:
-            s = self.field.addfield(pkt, s, v)
+            # Field.addfield is declared to take bytes; only the bit fields
+            # accept and return the open-byte tuple, so this is only a widening
+            # that the base signature cannot express.
+            s = self.field.addfield(pkt, s, v)  # type: ignore
         return s
 
     def getfield(self,
