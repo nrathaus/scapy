@@ -362,12 +362,21 @@ class OID(Gen[str]):
 ######################################
 
 class Packet_metaclass(type):
+    # Bumped once per Packet class defined. Read by scapy.fields, which
+    # derives part of its length-field name set from every fields_desc
+    # currently loaded: scapy pulls layers and contribs on demand - scapy.all
+    # alone reaches 1,995 of 5,652 Packet classes - so a set computed at first
+    # use goes stale the moment a contrib is imported. Counting the classes to
+    # notice that costs 10ms; this costs an integer increment.
+    generation = 0
+
     def __new__(cls: Type[_T],
                 name,  # type: str
                 bases,  # type: Tuple[type, ...]
                 dct  # type: Dict[str, Any]
                 ):
         # type: (...) -> Type['Packet']
+        Packet_metaclass.generation += 1
         if "fields_desc" in dct:  # perform resolution of references to other packets  # noqa: E501
             current_fld = dct["fields_desc"]  # type: List[Union[scapy.fields.Field[Any, Any], Packet_metaclass]]  # noqa: E501
             resolved_fld = []  # type: List[scapy.fields.Field[Any, Any]]

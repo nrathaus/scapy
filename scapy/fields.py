@@ -11,6 +11,7 @@ Fields: basic data structures that make up parts of packets.
 
 import calendar
 import collections
+import collections.abc
 import copy
 import datetime
 import inspect
@@ -42,6 +43,7 @@ from scapy.base_classes import (
     BasePacket,
     Field_metaclass,
     Net,
+    Packet_metaclass,
     ScopedIP,
 )
 
@@ -289,31 +291,59 @@ class Field(Generic[I, M], metaclass=Field_metaclass):
         # type: () -> Field[I, M]
         return copy.copy(self)
 
-    # A plain ByteField/ShortField/BitField carrying one of these names is a
-    # length declaration as surely as a FieldLenField is, and the class name
-    # says nothing about it. Kept small and explicit: a name-based rule that
-    # reaches further starts driving fields that only sound like lengths.
-    _LENGTH_FIELD_NAMES = frozenset((
-        "len", "length", "plen", "hlen", "dlen", "msglen",
-    ))
+    # Six hand-written names plus every name the loaded corpus proves is a
+    # length - see _LengthFieldNames, which is a live view rather than a
+    # frozenset because scapy loads layers on demand.
+    _LENGTH_FIELD_NAMES = None  # type: Any
 
     def declares_length(self):
         # type: () -> bool
         """Is this field the *declaration* of a length, rather than the value?
 
-        ``StrLenField`` and ``PacketLenField`` carry "LenField" in the class
-        name and are the value whose length is declared elsewhere, not the
-        declaration - driving one corrupts the payload while leaving the
-        length honest, which is the opposite of the point. So are
-        ``BitLenField`` and ``TruncPktLenField``, which a rule reading the
-        class name for "LenField" and rejecting "Str"/"Packet" would both get
-        wrong.
+        What separates the two is which way the field points:
+        ``length_of``/``count_of`` name the field being *measured*, while
+        ``length_from`` names where this field's own size is read *from*.
+        ``LenField`` measures the payload and declares neither.
 
-        What actually separates the two is which way the field points:
-        ``length_of``/``count_of`` name the field being *measured*
-        (``FieldLenField`` and its kin), while ``length_from`` names where
-        this field's own size is read *from*. ``LenField`` measures the
-        payload and declares neither.
+        **The four tests below are in this order on purpose, and each one
+        catches something the others get wrong.**
+
+        1. ``_StrField``/``_PacketField`` are rejected outright. They are the
+           value whose length is declared elsewhere, so driving one corrupts a
+           payload and leaves the declared length honest - the opposite of the
+           point. This also stops a ``Str`` field that happens to be called
+           ``len`` from getting in through test 4.
+
+        2. **The attribute test runs before the isinstance test, and it is not
+           redundant.** ``BitFieldLenField`` declares through ``length_of``
+           while subclassing ``BitField``, so it is not a ``FieldLenField``
+           and an isinstance-only rule silently drops it.
+
+           It guards a second case in the other direction, which is the easier
+           one to get wrong: **a declaring class does not always declare
+           anything.** ``contrib.lldp.LLDPDUSystemCapabilities._length`` is a
+           ``BitFieldLenField`` with ``length_of=None``, ``count_of=None`` and
+           a hardcoded default - the fixed body size of that TLV -
+           while ``LLDPDUSystemName._length`` beside it is the real thing.
+           A rule keyed on the class *name* arms the first one, and the walk
+           then has no ``length_of`` to compute an honest value from:
+           ``i2m(pkt, None)`` raises ``ValueError`` on it. The attribute test
+           declines it correctly. Over the LLDP module the two rules disagree
+           on exactly that field, 7/7 by attribute against 8/6 by class name.
+
+           So "it is a ``*LenField``, so it declares a length" is the obvious
+           simplification and it is wrong in *both* directions - this field,
+           and the ``post_build`` lengths of test 4 that are not ``*LenField``
+           at all. ``BitLenField`` and ``TruncPktLenField`` are two more the
+           class-name rule gets wrong, and test 1 already has them.
+
+        3. ``LenField`` measures the payload without naming a field, so it
+           declares nothing to test 2 and has to be named.
+
+        4. The name set - see ``_LengthFieldNames``. This is the only test
+           that can reach a length written in ``post_build``, which has no
+           ``length_of``, is not a ``LenField``, and is indistinguishable from
+           any other integer field by class alone.
         """
         if isinstance(self, (_StrField, _PacketField)):
             return False
@@ -412,6 +442,154 @@ class Field(Generic[I, M], metaclass=Field_metaclass):
                     self.name, self.fmt
                 )
             )
+
+
+# Names a plain integer field carries when it declares a length, where nothing
+# about its class says so. Every one is justified over the FULL corpus - 5,652
+# Packet classes, not the 1,995 scapy.all reaches on its own:
+#
+#     name      declared elsewhere   plain fields it arms
+#     len                     275                    723
+#     length                   69                    399
+#     plen                      5                     11
+#     dlen                      1                      0
+#     msglen                    0                     25   <- post_build, TLS
+#     hlen                      0                      1   <- BOOTP, constant
+#
+# Do NOT delete a name here because no declaring class carries it. That test
+# rejects precisely what this list is for: 'msglen' is a plain ThreeBytesField
+# on 25 TLS handshake classes filled in by post_build, and 'hlen' is BOOTP's
+# constant hardware-address length. Neither has a length_of, neither is a
+# LenField, and neither can be told from any other integer field by class - a
+# length written in post_build is exactly the case a class rule cannot reach.
+# An audit run against a partially loaded scapy reports all three of dlen,
+# msglen and hlen as matching nothing, and it is wrong.
+_HAND_WRITTEN_LENGTH_FIELD_NAMES = frozenset((
+    "len", "length", "plen", "hlen", "dlen", "msglen",
+))
+
+# How many classes must declare a length under a given name before that name
+# is taken as a length name everywhere. Two rather than one because a single
+# coincidence is how an address field gets in - there is a declaring field
+# named 'src' in the corpus - and arming a length ladder on an address is a
+# worse error than missing a length.
+_LENGTH_NAME_CLASS_EVIDENCE = 2
+
+# Names that clear the evidence bar and are still not lengths. The threshold
+# alone does not stop these, and the veto has to exist for it to be safe to
+# derive names at all.
+_NOT_LENGTH_FIELD_NAMES = frozenset(("src", "dst", "src_addr", "dest_addr"))
+
+
+def _declares_length_by_class(field):
+    # type: (Any) -> bool
+    """Is this field a length declaration, judged without reading its name?
+
+    ``length_of``/``count_of`` name the field being *measured*; ``LenField``
+    measures the payload. See ``Field.declares_length()`` for why the
+    attribute test has to come before the isinstance test, and for what
+    ``length_from`` means.
+    """
+    if getattr(field, "length_of", None) or getattr(field, "count_of", None):
+        return True
+    return isinstance(field, (LenField, FieldLenField))
+
+
+def _derive_length_names():
+    # type: () -> Set[str]
+    """Length names the loaded corpus proves, by carrying them on a class
+
+    The same name is a declaration in one class and a plain integer field in
+    another, over and over: ``avplen`` is declared through a class 17 times
+    and left plain 270 times, ``optlen`` 59 against 15, ``bytecount`` 18
+    against 8. 28 names are in that position, between them 412 fields, and the
+    evidence for every one of them is already in the tree. Deriving them means
+    a layer added later that calls its length ``optlen`` needs nobody to
+    remember.
+
+    This ADDS to the hand-written names rather than replacing them: a length
+    written in ``post_build`` carries no declaring class anywhere, so no
+    amount of evidence-gathering can find it.
+    """
+    from scapy.packet import Packet  # late: packet.py imports this module
+
+    evidence = collections.Counter()  # type: collections.Counter[str]
+    seen, stack = set(), [Packet]  # type: Set[Any], List[Any]
+    while stack:
+        cls = stack.pop()
+        if cls in seen:
+            continue
+        seen.add(cls)
+        stack.extend(cls.__subclasses__())
+        for field in getattr(cls, "fields_desc", None) or ():
+            real = _unwrap_length_field(field)
+            name = getattr(real, "name", None)
+            if isinstance(name, str) and _declares_length_by_class(real):
+                evidence[name.lower()] += 1
+
+    return {
+        name for name, count in evidence.items()
+        if count >= _LENGTH_NAME_CLASS_EVIDENCE
+        and name not in _NOT_LENGTH_FIELD_NAMES
+    }
+
+
+def _unwrap_length_field(field):
+    # type: (Any) -> Any
+    """The field itself, past a ConditionalField/MultipleTypeField wrapper."""
+    seen = 0
+    while isinstance(field, _FieldContainer) and seen < 8:
+        field = field.fld
+        seen += 1
+    return field
+
+
+class _LengthFieldNames(collections.abc.Set):  # type: ignore[type-arg]
+    """The hand-written length names, plus the ones the corpus proves
+
+    A live view rather than a frozenset, because the corpus is not fixed at
+    import time: scapy loads layers and contribs on demand, so the set has to
+    be able to grow when one is imported. It is recomputed only when
+    ``Packet_metaclass.generation`` says a class has been defined since the
+    last time, which makes the common case an integer comparison.
+
+    That does mean ``ByteField("optlen", 0).declares_length()`` answers False
+    before ``scapy.contrib.diameter`` is imported and True after. That is the
+    intended reading - the claim is "this name is a length *in this corpus*" -
+    but it is worth knowing before writing a test against it.
+    """
+
+    def __init__(self):
+        # type: () -> None
+        self._names = _HAND_WRITTEN_LENGTH_FIELD_NAMES  # type: Any
+        self._generation = -1
+
+    def _live(self):
+        # type: () -> Any
+        generation = Packet_metaclass.generation
+        if generation != self._generation:
+            self._generation = generation
+            self._names = _HAND_WRITTEN_LENGTH_FIELD_NAMES | _derive_length_names()
+        return self._names
+
+    def __contains__(self, name):
+        # type: (Any) -> bool
+        return name in self._live()
+
+    def __iter__(self):
+        # type: () -> Any
+        return iter(self._live())
+
+    def __len__(self):
+        # type: () -> int
+        return len(self._live())
+
+    def __repr__(self):
+        # type: () -> str
+        return "<length field names: %d>" % len(self)
+
+
+Field._LENGTH_FIELD_NAMES = _LengthFieldNames()
 
 
 class _FieldContainer(object):

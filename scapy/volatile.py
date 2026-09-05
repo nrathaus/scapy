@@ -23,6 +23,7 @@ from scapy.compat import bytes_encode, chb, plain_str
 from scapy.utils import corrupt_bits, corrupt_bytes
 
 from typing import (
+    Iterable,
     List,
     TypeVar,
     Generic,
@@ -541,6 +542,50 @@ class RandEnumKeys(RandEnum):
         return self.enum[next(self.seq)]
 
 
+def _spread_unused(used, low, high, room, enumerable_span=1024):
+    # type: (Iterable[int], int, int, int, int) -> List[int]
+    """``room`` values of ``[low, high]`` that ``used`` does not already hold
+
+    Spread across the range rather than clustered at its edges, and
+    deterministic - a state-driven walk cannot draw at random. Shared by
+    ``RandEnumWalk`` (filling out the budget past its declared values) and
+    ``RandLengthWalk`` (filling out the budget past its ladder), which want
+    the same thing for the same reason: a short list of values chosen because
+    the protocol names them, followed by an even sample of everything else, so
+    that neither half costs the other anything.
+
+    ``enumerable_span`` is the width above which listing the unused values
+    costs more than it buys - past it they are sparse enough that proportional
+    striding lands on distinct values without enumerating anything.
+    """
+    seen = set(used)
+    if room <= 0:
+        return []
+
+    span = high - low + 1
+    if span - len(seen) <= room:
+        # The whole value space fits in the budget - send all of it, which is
+        # what a density of 512 on a byte field should mean.
+        return [v for v in range(low, high + 1) if v not in seen]
+
+    if span <= enumerable_span:
+        unused = [v for v in range(low, high + 1) if v not in seen]
+        return [unused[(i * len(unused)) // room] for i in range(room)]
+
+    # Too wide to enumerate: step proportionally through the range and walk
+    # forward off the rare collision with a value already spoken for.
+    filled = []  # type: List[int]
+    for i in range(room):
+        candidate = low + (i * span) // room
+        while candidate <= high and candidate in seen:
+            candidate += 1
+        if candidate > high:
+            break
+        seen.add(candidate)
+        filled.append(candidate)
+    return filled
+
+
 class RandEnumWalk(RandNum):
     """State-driven walk over an enum field's own declared values, then the rest
 
@@ -642,36 +687,12 @@ class RandEnumWalk(RandNum):
         0..40, 90 is as likely to matter as 254. Deterministic in ``state_pos``,
         which the state-based walk requires - no randomness anywhere here.
         """
-        used = set(self.values)
-        room = budget - len(self.values)
-        if room <= 0:
-            # A wide enum can exceed the budget on its own (IP.proto declares
-            # 138 against a default 128). The declared block wins.
-            return []
-
-        span = self.high - self.low + 1
-        unused_count = span - len(used)
-        if unused_count <= room:
-            # The whole value space fits in the budget - send all of it, which
-            # is what a density of 512 on a byte field should mean.
-            return [v for v in range(self.low, self.high + 1) if v not in used]
-
-        if span <= self._ENUMERABLE_SPAN:
-            unused = [v for v in range(self.low, self.high + 1) if v not in used]
-            return [unused[(i * len(unused)) // room] for i in range(room)]
-
-        # Too wide to enumerate: step proportionally through the range and walk
-        # forward off the rare collision with a declared or guaranteed value.
-        filled = []  # type: List[int]
-        for i in range(room):
-            candidate = self.low + (i * span) // room
-            while candidate <= self.high and candidate in used:
-                candidate += 1
-            if candidate > self.high:
-                break
-            used.add(candidate)
-            filled.append(candidate)
-        return filled
+        # A wide enum can exceed the budget on its own (IP.proto declares 138
+        # against a default 128). The declared block wins.
+        return _spread_unused(
+            self.values, self.low, self.high,
+            budget - len(self.values), self._ENUMERABLE_SPAN,
+        )
 
     # Everywhere else in this module 'default' is the field's own default
     # value, and fuzz() assigns it that way ('rnd.default = f.default'). But
@@ -773,9 +794,20 @@ class RandLengthWalk(RandNum):
     # Driven singly the same coverage costs 1.2x on an 802.11 beacon.
     never_combined = True
 
-    # Nearest first. -8/+8 rather than -4/+4 because a word here is the unit a
-    # length is most often expressed in (an IPv6 extension header's own unit is
-    # eight octets), and because +-1 already covers the immediate neighbourhood.
+    # Fixed miscounts, kept as a distinct shape from the proportional ones
+    # below. Where they came from, since the ladder otherwise reads as though
+    # every rung were measured: +-1 is the classic off-by-one and needs no
+    # defence, and +-8 was **picked, not measured** - "off by a word", on the
+    # reasoning that eight octets is a common alignment and a common unit.
+    # That reasoning is weak on its own: plenty of protocols align on 4, a TLV
+    # header is commonly 2, and for a length expressed in units rather than
+    # octets - an IPv6 extension header declares eight-octet units minus one -
+    # a delta of 8 in the declared value is 64 octets on the wire. It is kept
+    # because with the sampled remainder behind the ladder (see plan_budget())
+    # an extra rung displaces a sampled value rather than another rung, so it
+    # costs nothing, and a small fixed miscount really is a different shape
+    # from a proportional one. The proportional rungs are what answers the
+    # objection.
     _OFFSETS = (-1, 1, -8, 8)
 
     def __init__(self, honest, low, high, budget=128):
@@ -793,16 +825,55 @@ class RandLengthWalk(RandNum):
         self._budget = None  # type: Optional[int]
         self.plan_budget(budget)
 
+    @property
+    def describes_nothing(self):
+        # type: () -> bool
+        """Is the value this length declares empty?
+
+        Worth marking rather than suppressing. The under-declaration half of
+        the ladder does not exist when the honest value is 0 - there is
+        nothing below zero - so ``honest - 1``, ``honest // 2`` and
+        ``honest - 8`` all fall away and the ladder is over-declarations only.
+        That is arithmetically right and it is also the weakest the axis ever
+        is, and it is the common case: a packet built from defaults usually
+        carries an empty list. 58 of the 79 count fields that resolve on a
+        default instance are honest-0.
+
+        The sampled remainder keeps the *case count* the same either way (see
+        ``plan_budget()``), which is exactly why the count cannot be read as a
+        signal here and this has to be asked for directly.
+        """
+        return self.honest == 0
+
     @classmethod
     def ladder(cls, honest, low, high):
         # type: (int, int, int) -> List[int]
         """The lengths worth declaring instead of ``honest``, nearest first
 
+        In increasing order of how big the lie is, for a typical honest value:
+
+        ==================================  =============================
+        off by one                          ``honest -+ 1``
+        off by the size of what it describes  ``honest // 2``, ``honest * 2``
+        off by a word                       ``honest -+ 8``
+        empty and minimal                   ``0``, ``1``
+        the field's own ceiling             ``high``
+        ==================================  =============================
+
+        The proportional pair is derived rather than picked, and it is what a
+        fixed offset cannot do: a length declares the size of something, so
+        half and double that size are miscounts expressed in the length's own
+        units. They stay proportionate at both ends of the scale, where +-8 is
+        a wild lie about a 4-octet value and a rounding error about a
+        4,000-octet one.
+
         Empty when the field has no room for a lie at all (a one-bit length
         whose honest value is its only other state) - the caller declines
         rather than building a walk with nothing in it.
         """
-        candidates = [honest + offset for offset in cls._OFFSETS]
+        candidates = [honest + offset for offset in cls._OFFSETS[:2]]
+        candidates.extend((honest // 2, honest * 2))
+        candidates.extend(honest + offset for offset in cls._OFFSETS[2:])
         # 0 and 1 say "carries nothing" and "carries one octet", which a
         # length check tends to handle in code of its own; 'high' is the
         # field's own ceiling, the largest lie it can tell.
@@ -814,13 +885,21 @@ class RandLengthWalk(RandNum):
 
     def plan_budget(self, budget):
         # type: (int) -> None
-        """Bound the ladder to a max_samples_per_field budget
+        """The ladder, then an even sample of the rest of the field's range
 
         Called by ``Packet.initialize_volatile_field()`` with the budget the
-        state carries, the same way ``RandEnumWalk`` is. The ladder is seven
-        rungs at most, so the default 128 never truncates - this matters only
-        for a caller running at a density below that, and then the ordering is
-        what makes truncation safe: the rungs dropped are the far ones.
+        state carries, the same way ``RandEnumWalk`` is - and split the same
+        way, for the same reason. The ladder is sent whatever the budget; the
+        remainder is what ``max_samples_per_field`` bounds.
+
+        The sample matters because the ladder is not always an addition. Most
+        declared lengths are computed, so ``fuzz()`` skipped them and they
+        could not vary at all - there the ladder is pure gain. But a length
+        that carried a default was already being swept at 128 values, and a
+        ladder that *replaced* that sweep took 123 cases off a field that was
+        already reaching the wire, purely because of what it is called. The
+        ladder's real argument is its ordering, not its exclusivity, and
+        nearest-first survives having the rest of the range behind it.
 
         Idempotent for a given budget, since a field is re-initialized once per
         state it appears in.
@@ -830,6 +909,10 @@ class RandLengthWalk(RandNum):
         self._budget = budget
 
         self.values = self._rungs[:max(budget, 1)]
+        self.values.extend(
+            _spread_unused(self.values, self.low, self.high,
+                           budget - len(self.values))
+        )
         RandNum.__init__(self, 0, len(self.values) - 1)
         # An index into 'values', not a length: Packet.forward() assigns
         # 'default' straight into 'state_pos' when it resets an exhausted

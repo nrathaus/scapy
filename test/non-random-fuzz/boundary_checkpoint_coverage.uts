@@ -240,15 +240,14 @@ assert 65535 in actual, "the field's own maximum is still unreachable"
 #    what every Rand* reads as "not the field being fuzzed, render your own
 #    default". Same number of cases, different bytes in the ones that follow
 #    a finished string field, which is the whole of the move below.
-# 4. A field that declares a length is walked over lengths that disagree
-#    with what the layer carries rather than over its integer width, and
-#    gets a state to itself. Both of this packet's length fields move, in
-#    opposite directions: PPTP.len is declared None - which is what tells
-#    scapy to compute it, and what made fuzz() skip it - so it was not
-#    driven at all before and now sends its 7 rungs; PPTPStartControl
-#    ConnectionRequest.len carries a default, so it was swept as a 16-bit
-#    integer at 128 samples and now sends 7. That took it to 2064/2065 and
-#    e77e5141... See RandLengthWalk.
+# 4. A field that declares a length leads with a ladder of lengths that
+#    disagree with what the layer carries, and gets a state to itself.
+#    PPTP.len is declared None - which is what tells scapy to compute it,
+#    and what made fuzz() skip it - so it was not driven at all before.
+#    PPTPStartControlConnectionRequest.len carries a default, so it was
+#    already being swept at 128 values; the ladder leads that sweep rather
+#    than replacing it, so it keeps its 128 and gains the ordering. One new
+#    state of 128 took it to 2306/2307 and 478d74b9... See RandLengthWalk.
 #
 # Rather than just re-capture the total, it is re-derived from each field's
 # own range below, which is what says the change is only the intended one.
@@ -285,9 +284,9 @@ for state in states:
     else:
         expected_combinations += volatile.max - volatile.min + 1
 
-assert expected_combinations == 2064, expected_combinations
-assert total_combinations == 2064
+assert expected_combinations == 2306, expected_combinations
+assert total_combinations == 2306
 # One forward() call per combination, plus the final one that finds no
 # more work and returns False.
-assert total_iterations == 2065
-assert h.hexdigest() == "e77e514164630dd548f7e83ce2dd1d951f44a04da60b6d6b26e35d545e12605e"
+assert total_iterations == 2307
+assert h.hexdigest() == "478d74b93e056c7d75050e8efbe690f9cf2063fe85cbc52a74b5f77061435113"

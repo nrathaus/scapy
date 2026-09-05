@@ -60,6 +60,132 @@ for cls, name in subjects:
     assert field.declares_length(), (cls.__name__, name)
 
 
+= The corpus extends the name set, and a threshold and a veto keep it safe
+~ fuzzing fields
+
+from scapy.fields import (
+    _HAND_WRITTEN_LENGTH_FIELD_NAMES,
+    _LENGTH_NAME_CLASS_EVIDENCE,
+    _NOT_LENGTH_FIELD_NAMES,
+    _declares_length_by_class,
+    _derive_length_names,
+    _unwrap_length_field,
+)
+
+names = Field._LENGTH_FIELD_NAMES
+
+# The derivation ADDS to the hand-written names rather than replacing them: a
+# length written in post_build carries no declaring class anywhere, so no
+# amount of evidence-gathering can find it.
+for name in _HAND_WRITTEN_LENGTH_FIELD_NAMES:
+    assert name in names, name
+
+# Re-derived here rather than pinned to a list, so a layer added later that
+# calls its length 'optlen' needs nobody to remember.
+derived = _derive_length_names()
+for name in derived:
+    assert name in names, name
+
+# The threshold: a name is only taken from the corpus when more than one
+# class declares a length under it. One coincidence is how an address gets in.
+evidence = {}
+seen, stack = set(), [Packet]
+while stack:
+    cls = stack.pop()
+    if cls in seen:
+        continue
+    seen.add(cls)
+    stack.extend(cls.__subclasses__())
+    for field in getattr(cls, "fields_desc", None) or ():
+        real = _unwrap_length_field(field)
+        fname = getattr(real, "name", None)
+        if isinstance(fname, str) and _declares_length_by_class(real):
+            evidence[fname.lower()] = evidence.get(fname.lower(), 0) + 1
+
+for name in derived:
+    assert evidence[name] >= _LENGTH_NAME_CLASS_EVIDENCE, (name, evidence[name])
+
+# The veto: these clear the bar and are still not lengths. Arming a length
+# ladder on an address is a worse error than missing a length.
+assert "src" in evidence and evidence["src"] >= 1
+for name in _NOT_LENGTH_FIELD_NAMES:
+    assert name not in derived, name
+    assert not ByteField(name, 0).declares_length(), name
+
+
+= The set grows when a layer that proves a new name is loaded
+~ fuzzing fields
+
+# The corpus is not fixed at import time - scapy loads layers and contribs on
+# demand - so the name set is a live view, recomputed when a Packet class has
+# been defined since it was last read.
+
+from scapy.base_classes import Packet_metaclass
+
+before = set(Field._LENGTH_FIELD_NAMES)
+generation = Packet_metaclass.generation
+
+import scapy.contrib.diameter
+
+assert Packet_metaclass.generation > generation
+after = set(Field._LENGTH_FIELD_NAMES)
+assert after >= before
+assert "avplen" in after, sorted(after - before)
+assert ByteField("avplen", 0).declares_length()
+
+
+= A declaring class does not always declare anything
+~ fuzzing fields
+
+# contrib.lldp.LLDPDUSystemCapabilities._length is a BitFieldLenField with
+# length_of=None and a hardcoded default - the fixed body size of that TLV -
+# while LLDPDUSystemName._length beside it is the real thing. "It is a
+# *LenField, so it declares a length" is the obvious simplification and it is
+# wrong in both directions: it arms this one, and it cannot see a post_build
+# length at all.
+
+from scapy.contrib.lldp import LLDPDUSystemCapabilities, LLDPDUSystemName
+from scapy.fields import _declares_length_by_class, _unwrap_length_field
+
+fixed = [f for f in LLDPDUSystemCapabilities.fields_desc if f.name == "_length"][0]
+real = [f for f in LLDPDUSystemName.fields_desc if f.name == "_length"][0]
+
+assert type(fixed).__name__ == type(real).__name__ == "BitFieldLenField"
+assert fixed.length_of is None and fixed.count_of is None
+assert real.length_of == "system_name"
+
+# The attribute test tells them apart; a class-name rule cannot.
+assert not _declares_length_by_class(fixed)
+assert _declares_length_by_class(real)
+assert "LenField" in type(fixed).__name__ and "LenField" in type(real).__name__
+
+# The two rules disagree over the module, and the attribute answer is the one
+# that keeps the evidence count honest - a field that measures nothing is not
+# evidence that its name is a length name.
+by_attribute = by_class_name = 0
+for cls in (LLDPDUSystemCapabilities, LLDPDUSystemName):
+    for field in cls.fields_desc:
+        inner = _unwrap_length_field(field)
+        by_attribute += bool(_declares_length_by_class(inner))
+        by_class_name += "LenField" in type(inner).__name__
+
+assert by_attribute < by_class_name, (by_attribute, by_class_name)
+
+# And this is what a class-name rule walks into: there is nothing to measure.
+try:
+    fixed.i2m(LLDPDUSystemCapabilities(), None)
+    raise AssertionError("expected ValueError")
+except ValueError:
+    pass
+
+# The name set still reaches it - '_length' is a length name elsewhere in the
+# same module - and that is safe because the honest value is established
+# rather than guessed, and here it cannot be established at all.
+assert fixed.declares_length()
+assert fixed.honest_length(LLDPDUSystemCapabilities()) is None
+assert fixed.length_randval(LLDPDUSystemCapabilities()) is None
+
+
 ############
 ############
 + The honest value has to be established, not guessed
@@ -114,37 +240,122 @@ assert elt_len.length_randval(empty) is None
 
 from scapy.volatile import RandLengthWalk
 
-assert RandLengthWalk.ladder(35, 0, 65535) == [34, 36, 27, 43, 0, 1, 65535]
+# off by one, off by the size of what it describes, off by a word, the
+# absolute edges, the field's own ceiling.
+assert RandLengthWalk.ladder(35, 0, 65535) == [34, 36, 17, 70, 27, 43, 0, 1, 65535]
 
 # A value wider than the field is not a length lie but an unbuildable case,
 # so it is dropped; so is a negative one, and so is the honest value itself.
-assert RandLengthWalk.ladder(4, 0, 255) == [3, 5, 12, 0, 1, 255]
-assert RandLengthWalk.ladder(0, 0, 255) == [1, 8, 255]
+assert RandLengthWalk.ladder(4, 0, 255) == [3, 5, 2, 8, 12, 0, 1, 255]
 assert RandLengthWalk.ladder(1, 0, 1) == [0]
 
 # Nothing left to send - the caller declines rather than building an empty walk
 assert RandLengthWalk.ladder(0, 0, 0) == []
 
 
-= The budget bounds the ladder from the far end
+= The proportional rungs are derived, where +/-8 is picked
 ~ fuzzing volatile
 
 from scapy.volatile import RandLengthWalk
 
-walk = RandLengthWalk(35, 0, 65535)
-assert walk.values == [34, 36, 27, 43, 0, 1, 65535]
-assert walk.min == 0 and walk.max == 6
+# A length declares the size of something, so half and double that size are
+# miscounts in the length's own units - they stay proportionate at both ends
+# of the scale, where a fixed +/-8 is a wild lie about a 4-octet value and a
+# rounding error about a 4,000-octet one.
+assert 4 // 2 in RandLengthWalk.ladder(4, 0, 255)
+assert 4 * 2 in RandLengthWalk.ladder(4, 0, 255)
+assert 4000 // 2 in RandLengthWalk.ladder(4000, 0, 65535)
+assert 4000 * 2 in RandLengthWalk.ladder(4000, 0, 65535)
 
-walk.plan_budget(2)
-assert walk.values == [34, 36]
-assert walk.max == 1
+# The fixed pair is still there and is still a distinct shape, and with the
+# sampled remainder behind the ladder it displaces a sampled value rather
+# than another rung.
+assert 4000 - 8 in RandLengthWalk.ladder(4000, 0, 65535)
+assert 4000 + 8 in RandLengthWalk.ladder(4000, 0, 65535)
+
+
+= A length whose described value is empty is marked, not suppressed
+~ fuzzing volatile packet inet
+
+from scapy.volatile import RandLengthWalk
+
+# There is nothing below zero, so honest-1, honest//2 and honest-8 all fall
+# away and the ladder is over-declarations only. That is the weakest the axis
+# ever is and it is the common case, so it is worth being able to ask about.
+empty = RandLengthWalk(0, 0, 255)
+assert empty.describes_nothing
+assert RandLengthWalk.ladder(0, 0, 255) == [1, 8, 255]
+
+assert not RandLengthWalk(4, 0, 255).describes_nothing
+
+# The sampled remainder keeps the case count the same either way, which is
+# exactly why the count cannot be read as a signal here.
+assert len(empty.values) == len(RandLengthWalk(4, 0, 255).values)
+
+packet = fuzz(IP() / UDP() / b"payload")
+assert not packet.length_walks["len"].describes_nothing
+
+
+= The budget bounds the ladder from the far end, then fills with a sample
+~ fuzzing volatile
+
+from scapy.volatile import RandLengthWalk
+
+rungs = [34, 36, 17, 70, 27, 43, 0, 1, 65535]
+
+walk = RandLengthWalk(35, 0, 65535)
+# The ladder leads, and the rest of the range follows it up to the budget.
+assert walk.values[:len(rungs)] == rungs
+assert len(walk.values) == 128
+assert walk.min == 0 and walk.max == 127
+
+# Below the ladder's own length the budget truncates it, and the rungs
+# dropped are the far ones.
+walk.plan_budget(4)
+assert walk.values == rungs[:4]
+assert walk.max == 3
 
 # Idempotent, and it goes back up again - a field is re-initialized once per
 # state it appears in.
-walk.plan_budget(2)
-assert walk.values == [34, 36]
-walk.plan_budget(128)
-assert walk.values == [34, 36, 27, 43, 0, 1, 65535]
+walk.plan_budget(4)
+assert walk.values == rungs[:4]
+walk.plan_budget(512)
+assert walk.values[:len(rungs)] == rungs
+assert len(walk.values) == 512
+
+
+= A field that already varied is not narrowed by being called a length
+~ fuzzing volatile packet
+
+# The same two-byte field twice, differing only in its name. Most declared
+# lengths are computed, so fuzz() skipped them and they could not vary at all
+# - there the ladder is pure gain. But a length that carried a default was
+# already sweeping at 128 values, and a ladder that REPLACED that sweep took
+# 123 cases off a field that was already reaching the wire, purely because of
+# what it is called.
+
+class _PlainTwo(Packet):
+    name = "PlainTwo"
+    fields_desc = [ShortField("value", 2), StrFixedLenField("data", b"AB", 2)]
+
+class _LennyTwo(Packet):
+    name = "LennyTwo"
+    fields_desc = [ShortField("len", 2), StrFixedLenField("data", b"AB", 2)]
+
+def _cases(cls, field_name):
+    packet = fuzz(cls())
+    states = packet.prepare_combinations(1)
+    more = True
+    while more:
+        states, more = packet.forward(states)
+    return sum(entry["combinations"]
+               for state in states for entry in state["fields"]
+               if entry["name"] == field_name)
+
+plain = _cases(_PlainTwo, "PlainTwo:value")
+lenny = _cases(_LennyTwo, "LennyTwo:len")
+assert plain == 128, plain
+assert lenny >= plain, (lenny, plain)
 
 
 = state_pos indexes the ladder, the way RandEnumWalk indexes its value list
@@ -252,7 +463,11 @@ while continue_to_fuzz:
     if state is not None and state['fields'][0]['name'] == "IP:len":
         walked.append(IP(bytes(packet)).len)
 
-assert walked == [34, 36, 27, 43, 0, 1, 65535], walked
+# The ladder leads and every rung reaches the wire, then the sampled
+# remainder of the field's range follows it out to the budget.
+assert walked[:9] == [34, 36, 17, 70, 27, 43, 0, 1, 65535], walked[:9]
+assert len(walked) == 128, len(walked)
+assert len(set(walked)) == 128, len(set(walked))
 
 # Done means absent again, which is what an unfuzzed packet looks like. It is
 # computed rather than remembered, so by the end of the run - other fields
