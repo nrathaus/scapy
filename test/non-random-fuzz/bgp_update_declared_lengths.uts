@@ -1,0 +1,134 @@
+% Regression tests for the sequential (non-random) fuzzing state machine
+% BGPUpdate must build when its lengths are declared rather than computed
+
+# BGPUpdate.post_build rewrote withdrawn_routes_len and path_attr_len over the
+# header self_build had already written - which both FieldLenFields compute
+# correctly on their own, from the very same sum of built sub-packet lengths.
+# It had no path on which it did something useful:
+#
+#   both lengths None        reproduced self_build byte for byte
+#   withdrawn_routes_len set path_attr_len rewritten at 2 + the DECLARED
+#                            length, where the field sits at 2 + the ACTUAL
+#                            one - a declared 100 wrote past the end and put
+#                            two stray octets on the wire
+#   path_attr_len set        first branch only; reproduced self_build
+#   both set                 neither branch ran, so 'packet' was still the
+#                            str "" it was initialised to and 'packet + pay'
+#                            raised TypeError. Even as b"" it would have
+#                            returned the payload with the header dropped
+#
+# The defect is upstream's, unchanged in this fork: FieldLenField.i2m and
+# PacketListField.i2len are identical to upstream/master, and the same four
+# paths behave the same way there. What changed here is only reachability -
+# both fields are declared None, so fuzz() skipped them until a declared
+# length became something the walk drives.
+
+############
+############
++ A declared length reaches the wire
+
+= The computed case is byte-identical to what post_build produced
+~ fuzzing bgp
+
+from scapy.contrib.bgp import (
+    BGPNLRI_IPv4,
+    BGPPAOrigin,
+    BGPPathAttr,
+    BGPUpdate,
+)
+
+def update(**kw):
+    return BGPUpdate(
+        withdrawn_routes=[BGPNLRI_IPv4(prefix="192.168.0.0/16")],
+        path_attr=[BGPPathAttr(type_code=1, attribute=BGPPAOrigin(origin=0))],
+        nlri=[BGPNLRI_IPv4(prefix="10.0.0.0/8")],
+        **kw
+    )
+
+# The control that must not move: three octets of withdrawn routes, four of
+# path attributes, both computed.
+assert raw(update()) == b'\x00\x03\x10\xc0\xa8\x00\x04\x80\x01\x01\x00\x08\n'
+
+back = BGPUpdate(raw(update()))
+assert back.withdrawn_routes_len == 3
+assert back.path_attr_len == 4
+
+
+= Declaring withdrawn_routes_len does not append stray octets
+~ fuzzing bgp
+
+# post_build wrote path_attr_len at 2 + 100, past the end of a 13-octet
+# packet, so p[:102] was the whole packet and p[106:] was empty - the two
+# octets landed on the end of the frame instead of over the field.
+built = raw(update(withdrawn_routes_len=100))
+assert built == b'\x00d\x10\xc0\xa8\x00\x04\x80\x01\x01\x00\x08\n', built
+assert not built.endswith(b'\x00\x04')
+assert len(built) == len(raw(update()))
+
+
+= Declaring both lengths builds instead of raising
+~ fuzzing bgp
+
+# 'packet' was still the str "" it was initialised to, so 'packet + pay'
+# raised TypeError - and as b"" it would have dropped the whole UPDATE
+# header, which is worse.
+built = raw(update(withdrawn_routes_len=100, path_attr_len=100))
+assert built == b'\x00d\x10\xc0\xa8\x00d\x80\x01\x01\x00\x08\n', built
+
+# The header is there, not dropped: same length as the honest frame, with
+# both declared values in place of the computed ones.
+assert len(built) == len(raw(update()))
+assert built[0:2] == b'\x00d'
+assert built[5:7] == b'\x00d'
+
+
+= Every declared value reaches the wire, honest or not
+~ fuzzing bgp
+
+import struct
+
+for declared in (0, 1, 3, 4, 100, 65535):
+    built = raw(update(withdrawn_routes_len=declared))
+    assert struct.unpack("!H", built[0:2])[0] == declared, declared
+    assert len(built) == len(raw(update())), declared
+    built = raw(update(path_attr_len=declared))
+    assert struct.unpack("!H", built[5:7])[0] == declared, declared
+    assert len(built) == len(raw(update())), declared
+
+
+############
+############
++ The walk drives them
+
+= Both length fields are walked, and every rung builds
+~ fuzzing bgp packet
+
+from scapy.contrib.bgp import BGPNLRI_IPv4, BGPUpdate
+
+packet = fuzz(BGPUpdate(nlri=[BGPNLRI_IPv4(prefix="10.0.0.0/8")]))
+
+assert "withdrawn_routes_len" in packet.length_walks
+assert "path_attr_len" in packet.length_walks
+
+# Run the whole walk. Every case must build - the two paths that used to
+# raise or corrupt are exactly the ones a length walk spends most of its time
+# on, since every rung but none declares a length.
+states = packet.prepare_combinations(1)
+built = 0
+continue_to_fuzz = True
+while continue_to_fuzz:
+    states, continue_to_fuzz = packet.forward(states)
+    if not continue_to_fuzz:
+        break
+    frame = raw(packet)
+    assert len(frame) > 0
+    built += 1
+
+per_field = {}
+for state in states:
+    for entry in state["fields"]:
+        per_field[entry["name"]] = entry["combinations"]
+
+assert per_field["UPDATE:withdrawn_routes_len"] == 128, per_field
+assert per_field["UPDATE:path_attr_len"] == 128, per_field
+assert built == sum(per_field.values()), (built, per_field)

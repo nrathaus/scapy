@@ -2260,19 +2260,29 @@ class BGPUpdate(BGP):
                                max_count=20000)
     ]
 
-    def post_build(self, p, pay):
-        subpacklen = lambda p: len(p)
-        packet = ""
-        if self.withdrawn_routes_len is None:
-            wl = sum(map(subpacklen, self.withdrawn_routes))
-            packet = p[:0] + struct.pack("!H", wl) + p[2:]
-        else:
-            wl = self.withdrawn_routes_len
-        if self.path_attr_len is None:
-            length = sum(map(subpacklen, self.path_attr))
-            packet = p[:2 + wl] + struct.pack("!H", length) + p[4 + wl:]
-
-        return packet + pay
+    # No post_build. There was one, and it rewrote withdrawn_routes_len and
+    # path_attr_len over the header self_build had already written - which
+    # both FieldLenFields above compute correctly on their own, from the very
+    # same sum of built sub-packet lengths. It had no path on which it did
+    # something useful and three on which it did harm:
+    #
+    #   both lengths None        the rewrite reproduced self_build byte for
+    #                            byte - dead code on the only path that ran
+    #   withdrawn_routes_len set path_attr_len was rewritten at offset
+    #                            2 + the DECLARED length. The field is at
+    #                            2 + the ACTUAL one, so a declared 100 wrote
+    #                            past the end of the packet and appended two
+    #                            stray octets to the wire
+    #   path_attr_len set        first branch only; reproduced self_build
+    #   both set                 neither branch ran, so 'packet' was still
+    #                            the str "" it was initialised to and
+    #                            'packet + pay' raised TypeError. Even as
+    #                            b"" it would have returned the payload with
+    #                            the whole UPDATE header dropped
+    #
+    # The last two paths are what an assigned length is for - a length that
+    # disagrees with what follows it is the defect an UPDATE parser is most
+    # likely to get wrong - so they have to build, not raise.
 
 
 #
