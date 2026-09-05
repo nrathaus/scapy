@@ -715,6 +715,148 @@ class RandEnumWalk(RandNum):
         return self.values[min(max(self.state_pos, 0), len(self.values) - 1)]
 
 
+class RandLengthWalk(RandNum):
+    """State-driven walk over lengths that disagree with what the packet carries
+
+    A declared length that does not match what follows it is the classic parser
+    defect, and ``fuzz()`` produced one nowhere: across all 1,995 ``Packet``
+    classes, 594 fields declare a length and 0 of them varied. Both reasons are
+    the convention itself. Nearly every length is declared ``None``, because
+    ``None`` is precisely what tells scapy to compute it - and what makes
+    ``fuzz()`` skip the field. The ones that do carry a default got a volatile
+    in ``default_fields``, which a plain ``bytes()`` build re-emits as the
+    declared default rather than resolving.
+
+    The ladder is nearest-first, because an off-by-one is both the likeliest
+    real defect and the likeliest to be parsed far enough to say anything:
+
+    ======================== =================================
+    rung                     value
+    ======================== =================================
+    off by one               ``honest - 1``, ``honest + 1``
+    off by a word            ``honest - 8``, ``honest + 8``
+    empty and minimal        ``0``, ``1``
+    the field's own ceiling  ``high``
+    ======================== =================================
+
+    Values the field cannot carry are dropped rather than clamped in - a length
+    wider than the field is not a length lie but an unbuildable case, spent
+    without reaching anything - and the honest value is excluded, since a case
+    equal to the control tests nothing.
+
+    ``honest`` is the number the class itself computes, which is routinely not
+    ``len(value)``: ``DNSRR.rdlen`` is 6 for one byte of rdata because the TXT
+    wire form carries its own length octet, and an IPv6 extension header
+    declares units of eight octets minus one. It has to be established rather
+    than guessed - see ``Field.honest_length()``, which is where the guessing
+    would have gone wrong.
+
+    Like ``RandEnumWalk``, ``state_pos`` is an *index* into ``values`` rather
+    than the value itself, so ``min``/``max`` bound the ladder and not the
+    field's integer width.
+    """
+
+    # Same reason as RandEnumWalk: the ladder is already the interesting set
+    # and it is short, so Packet._advance_state_pos() steps it one at a time
+    # instead of striding max_samples_per_field over it.
+    exhaustive = True
+
+    # Read by Packet.prepare_combinations(), which gives a field carrying this
+    # a state of its own instead of pairing it with another field.
+    #
+    # Not a tuning knob - a pair whose other half is never parsed is not a
+    # pair. A frame with a bogus length is usually discarded at the length
+    # check, before the second field of the pair is reached, so those cases
+    # pay for a pair and test one thing: armed as a pair axis, 99,569 of
+    # stunudp's 101,385 cases carried a wrong length, leaving 517 with an
+    # honest one - the walk would not gain a length axis, it would become one.
+    # Driven singly the same coverage costs 1.2x on an 802.11 beacon.
+    never_combined = True
+
+    # Nearest first. -8/+8 rather than -4/+4 because a word here is the unit a
+    # length is most often expressed in (an IPv6 extension header's own unit is
+    # eight octets), and because +-1 already covers the immediate neighbourhood.
+    _OFFSETS = (-1, 1, -8, 8)
+
+    def __init__(self, honest, low, high, budget=128):
+        # type: (int, int, int, int) -> None
+        self.honest = honest
+        self.low = low
+        self.high = high
+        self._rungs = self.ladder(honest, low, high)
+        if not self._rungs:
+            raise TypeError(
+                "RandLengthWalk has no value to send: honest=%r is the only "
+                "value in [%r, %r]" % (honest, low, high)
+            )
+        self.values = []  # type: List[int]
+        self._budget = None  # type: Optional[int]
+        self.plan_budget(budget)
+
+    @classmethod
+    def ladder(cls, honest, low, high):
+        # type: (int, int, int) -> List[int]
+        """The lengths worth declaring instead of ``honest``, nearest first
+
+        Empty when the field has no room for a lie at all (a one-bit length
+        whose honest value is its only other state) - the caller declines
+        rather than building a walk with nothing in it.
+        """
+        candidates = [honest + offset for offset in cls._OFFSETS]
+        # 0 and 1 say "carries nothing" and "carries one octet", which a
+        # length check tends to handle in code of its own; 'high' is the
+        # field's own ceiling, the largest lie it can tell.
+        candidates.extend((0, 1, high))
+        return list(dict.fromkeys(
+            value for value in candidates
+            if low <= value <= high and value != honest
+        ))
+
+    def plan_budget(self, budget):
+        # type: (int) -> None
+        """Bound the ladder to a max_samples_per_field budget
+
+        Called by ``Packet.initialize_volatile_field()`` with the budget the
+        state carries, the same way ``RandEnumWalk`` is. The ladder is seven
+        rungs at most, so the default 128 never truncates - this matters only
+        for a caller running at a density below that, and then the ordering is
+        what makes truncation safe: the rungs dropped are the far ones.
+
+        Idempotent for a given budget, since a field is re-initialized once per
+        state it appears in.
+        """
+        if budget == self._budget:
+            return
+        self._budget = budget
+
+        self.values = self._rungs[:max(budget, 1)]
+        RandNum.__init__(self, 0, len(self.values) - 1)
+        # An index into 'values', not a length: Packet.forward() assigns
+        # 'default' straight into 'state_pos' when it resets an exhausted
+        # field, and initialize_volatile_field() reads it the same way.
+        self.default = 0
+
+    def _command_args(self):
+        # type: () -> str
+        return "honest=%r, low=%r, high=%r" % (self.honest, self.low, self.high)
+
+    def _fix(self):
+        # type: () -> int
+        if self.state_pos is None:
+            # Not being driven by forward(). Unlike every other volatile here,
+            # that does not mean "render the value the packet would have had":
+            # a length walk is never put in default_fields, so the only way it
+            # is read with no position is the single draw fuzz() arms it with -
+            # see Packet._arm_length_walk(). The honest value is what the field
+            # renders while idle, and it renders it by not being there at all.
+            return random.choice(self.values)
+
+        # 'max' is len(values) - 1 and Packet.forward() stops the field as soon
+        # as state_pos passes max, so an out-of-range index is a bug rather
+        # than something to wrap around.
+        return self.values[min(max(self.state_pos, 0), len(self.values) - 1)]
+
+
 class RandChoice(RandField[Any]):
     def __init__(self, *args):
         # type: (*Any) -> None

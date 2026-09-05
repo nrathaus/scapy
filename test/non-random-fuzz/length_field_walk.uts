@@ -1,0 +1,394 @@
+% Regression tests for the sequential (non-random) fuzzing state machine
+% A declared length must be walked over lengths that disagree with the packet
+
+# A length that does not match what follows it is the classic parser defect,
+# and fuzz() produced one nowhere: across all 1,995 Packet classes, 594 fields
+# declare a length and 0 of them varied. Both reasons are the convention
+# itself. Nearly every length is declared None, because None is what tells
+# scapy to compute it - and what makes fuzz() skip the field. The ones that do
+# carry a default got a volatile in default_fields, which a plain bytes() build
+# re-emits as the declared default rather than resolving.
+#
+# RandLengthWalk steps a short, nearest-first ladder of wrong lengths instead.
+# The part that is not like any other fuzzed field is where it lives: a
+# length's honest value is *absence* - IP.post_build() computes len only while
+# self.len is None - so the walk is parked on the layer rather than installed
+# in default_fields, and forward() drives it by writing into 'fields' and
+# deletes them again when the field is done. That is what keeps an idle length
+# byte-identical to a packet that was never fuzzed.
+
+############
+############
++ Which fields declare a length
+
+= length_of/count_of point at the field being measured, length_from does not
+~ fuzzing fields
+
+# A rule reading the class name for "LenField" and rejecting "Str"/"Packet"
+# gets BitLenField and TruncPktLenField wrong, both of which are the value
+# whose length is declared elsewhere.
+
+declared = FieldLenField("rdlen", None, fmt="H", length_of="rdata")
+assert declared.declares_length()
+
+assert LenField("len", None).declares_length()
+assert ByteField("len", None).declares_length()
+assert ShortField("length", None).declares_length()
+assert BitField("hlen", None, 4).declares_length()
+
+# The value, not the declaration - driving one of these corrupts the payload
+# while leaving the length honest, which is the opposite of the point.
+assert not StrLenField("data", "", length_from=lambda p: p.len).declares_length()
+assert not BitLenField("data", 0, length_from=lambda p: p.len).declares_length()
+assert not PacketLenField("pay", None, Raw, length_from=lambda p: p.len).declares_length()
+assert not ByteField("ttl", 64).declares_length()
+
+
+= The rule reaches the fields it was measured against
+~ fuzzing fields inet dns dot11
+
+subjects = [
+    (IP, "len"),
+    (UDP, "len"),
+    (DNSRR, "rdlen"),
+    (Dot11Elt, "len"),
+    (ARP, "plen"),
+    (ARP, "hwlen"),
+]
+for cls, name in subjects:
+    field = [f for f in cls.fields_desc if f.name == name][0]
+    assert field.declares_length(), (cls.__name__, name)
+
+
+############
+############
++ The honest value has to be established, not guessed
+
+= i2m() alone cannot answer for a length computed in post_build
+~ fuzzing fields inet
+
+packet = IP() / UDP() / b"payload"
+field = [f for f in packet.fields_desc if f.name == "len"][0]
+
+# i2m() runs length_of/count_of and any adjust=, which covers the
+# FieldLenField family - and answers 0 for a post_build length.
+assert field.i2m(packet, None) == 0
+
+# Building and re-dissecting defers to whichever mechanism the class uses.
+assert field.honest_length(packet) == len(bytes(packet))
+assert field.honest_length(packet) == 35
+
+
+= ... and it agrees with i2m() wherever i2m() is right
+~ fuzzing fields dns dot11
+
+rr = DNSRR(rrname="a.example.com", type="TXT", rdata=b"hello")
+rdlen = [f for f in rr.fields_desc if f.name == "rdlen"][0]
+# 6 for five bytes of rdata: the TXT wire form carries its own length octet.
+assert rdlen.i2m(rr, None) == 6
+assert rdlen.honest_length(rr) == 6
+
+elt = Dot11Elt(ID=221, info=b"AAAA")
+elt_len = [f for f in elt.fields_desc if f.name == "len"][0]
+assert elt_len.honest_length(elt) == 4
+
+
+= A length that cannot be established is declined, not reported as 0
+~ fuzzing fields dot11
+
+# A two-octet vendor element re-dissects as something carrying no len at all.
+# Every rung is an offset from this number, so a guessed 0 would put the whole
+# ladder in the wrong place.
+empty = Dot11Elt(ID=221, info=b"")
+elt_len = [f for f in empty.fields_desc if f.name == "len"][0]
+assert elt_len.honest_length(empty) is None
+assert elt_len.length_randval(empty) is None
+
+
+############
+############
++ The ladder
+
+= Nearest first, honest excluded, out-of-range dropped rather than clamped
+~ fuzzing volatile
+
+from scapy.volatile import RandLengthWalk
+
+assert RandLengthWalk.ladder(35, 0, 65535) == [34, 36, 27, 43, 0, 1, 65535]
+
+# A value wider than the field is not a length lie but an unbuildable case,
+# so it is dropped; so is a negative one, and so is the honest value itself.
+assert RandLengthWalk.ladder(4, 0, 255) == [3, 5, 12, 0, 1, 255]
+assert RandLengthWalk.ladder(0, 0, 255) == [1, 8, 255]
+assert RandLengthWalk.ladder(1, 0, 1) == [0]
+
+# Nothing left to send - the caller declines rather than building an empty walk
+assert RandLengthWalk.ladder(0, 0, 0) == []
+
+
+= The budget bounds the ladder from the far end
+~ fuzzing volatile
+
+from scapy.volatile import RandLengthWalk
+
+walk = RandLengthWalk(35, 0, 65535)
+assert walk.values == [34, 36, 27, 43, 0, 1, 65535]
+assert walk.min == 0 and walk.max == 6
+
+walk.plan_budget(2)
+assert walk.values == [34, 36]
+assert walk.max == 1
+
+# Idempotent, and it goes back up again - a field is re-initialized once per
+# state it appears in.
+walk.plan_budget(2)
+assert walk.values == [34, 36]
+walk.plan_budget(128)
+assert walk.values == [34, 36, 27, 43, 0, 1, 65535]
+
+
+= state_pos indexes the ladder, the way RandEnumWalk indexes its value list
+~ fuzzing volatile
+
+from scapy.volatile import RandLengthWalk
+
+walk = RandLengthWalk(35, 0, 65535)
+for position, value in enumerate(walk.values):
+    walk.state_pos = position
+    assert walk._fix() == value, position
+
+# exhaustive, so _advance_state_pos() steps the ladder rather than striding it,
+# and never_combined, so prepare_combinations() gives it a state of its own.
+assert walk.exhaustive is True
+assert walk.never_combined is True
+
+
+############
+############
++ fuzz() varies a declared length at all
+
+= A fuzzed packet builds a length that disagrees, for all three shapes
+~ fuzzing packet inet dns dot11
+
+# 426 of the 594 are declared None (skipped by fuzz()), and the 164 that carry
+# a default were put in default_fields, which a plain build re-emits as the
+# default. Both produced exactly one distinct value over 60 builds.
+
+def distinct_lengths(cls, name, builds=60):
+    values = set()
+    for _ in range(builds):
+        fuzzed = fuzz(cls())
+        values.add(cls(bytes(fuzzed)).getfieldval(name))
+    return values
+
+# IP.len is computed in post_build, Dot11EltOBSS.len carries a default,
+# DNSRR.rdlen is a FieldLenField declared None.
+assert len(distinct_lengths(IP, "len")) > 1
+assert len(distinct_lengths(Dot11EltOBSS, "len")) > 1
+assert len(distinct_lengths(DNSRR, "rdlen")) > 1
+
+
+= The drawn value is a rung of that field's own ladder
+~ fuzzing packet inet
+
+from scapy.volatile import RandLengthWalk
+
+for _ in range(20):
+    packet = fuzz(IP() / UDP() / b"payload")
+    walk = packet.length_walks["len"]
+    assert isinstance(walk, RandLengthWalk)
+    assert walk.honest == 35
+    assert packet.fields["len"] in walk.values
+    assert IP(bytes(packet)).len == packet.fields["len"]
+
+
+= A length walk is parked on the layer, never put in default_fields
+~ fuzzing packet inet
+
+# This is the whole design rather than an optimization: IP.post_build()
+# computes len only while self.len is None, and a volatile is not None, so a
+# volatile installed there would take the computation away from every case
+# instead of only from the ones driving this field.
+
+packet = fuzz(IP() / UDP() / b"payload")
+assert packet.default_fields["len"] is None
+assert "len" in packet.length_walks
+
+# locate_field() finds it anyway, which is all forward() needs.
+(holder, volatile) = packet.locate_field(packet, "IP:len")
+assert holder is packet
+assert volatile is packet.length_walks["len"]
+
+
+############
+############
++ The walk, and the control it walks away from
+
+= prepare_combinations() disarms, so the walk starts from an honest packet
+~ fuzzing packet inet
+
+packet = fuzz(IP() / UDP() / b"payload")
+assert packet.fields.get("len") is not None
+
+states = packet.prepare_combinations(1)
+assert "len" not in packet.fields
+assert IP(bytes(packet)).len == len(bytes(packet))
+assert IP(bytes(packet)).len == 35
+
+
+= Every rung reaches the wire, and the field goes back to honest afterwards
+~ fuzzing packet inet
+
+packet = fuzz(IP() / UDP() / b"payload")
+states = packet.prepare_combinations(1)
+
+walked = []
+continue_to_fuzz = True
+while continue_to_fuzz:
+    states, continue_to_fuzz = packet.forward(states)
+    if not continue_to_fuzz:
+        break
+    state = packet.return_active_state(states)
+    if state is not None and state['fields'][0]['name'] == "IP:len":
+        walked.append(IP(bytes(packet)).len)
+
+assert walked == [34, 36, 27, 43, 0, 1, 65535], walked
+
+# Done means absent again, which is what an unfuzzed packet looks like. It is
+# computed rather than remembered, so by the end of the run - other fields
+# having been driven since, Raw.load among them - it is the honest length of
+# whatever the packet now carries, not the 35 it started at.
+assert "len" not in packet.fields
+raw = bytes(packet)
+assert IP(raw).len == len(raw), (IP(raw).len, len(raw))
+
+
+= An idle length is byte-identical to one that was never fuzzed
+~ fuzzing packet inet
+
+# The control that must not regress: while some other field is being driven,
+# the length is computed exactly as today. It is computed rather than
+# remembered, so it still follows a payload another field has changed.
+
+packet = fuzz(IP() / UDP() / b"payload")
+states = packet.prepare_combinations(2)
+
+wrong_while_idle = 0
+cases = 0
+continue_to_fuzz = True
+while continue_to_fuzz and cases < 1500:
+    states, continue_to_fuzz = packet.forward(states)
+    if not continue_to_fuzz:
+        break
+    cases += 1
+    state = packet.return_active_state(states)
+    driving = [f['name'] for f in state['fields']]
+    if "IP:len" in driving or "UDP:len" in driving:
+        continue
+    raw = bytes(packet)
+    if IP(raw).len != len(raw):
+        wrong_while_idle += 1
+
+assert cases == 1500, cases
+assert wrong_while_idle == 0, wrong_while_idle
+
+
+############
+############
++ A length is driven singly
+
+= Every length gets a state of its own, and appears in no pair
+~ fuzzing packet inet
+
+# A frame with a bogus length is usually discarded at the length check, before
+# the other field of a pair is ever parsed - so those cases pay for a pair and
+# test one thing. Armed as a pair axis, 99,569 of stunudp's 101,385 cases
+# carried a wrong length and 517 carried an honest one: the walk would not gain
+# a length axis, it would become one.
+
+packet = fuzz(IP() / UDP() / b"payload")
+states = packet.prepare_combinations(2)
+
+solo = [s['fields'][0]['name'] for s in states if len(s['fields']) == 1]
+paired = [f['name'] for s in states if len(s['fields']) > 1 for f in s['fields']]
+
+assert solo == ["IP:len", "UDP:len"], solo
+assert "IP:len" not in paired
+assert "UDP:len" not in paired
+
+# Ahead of the combinations, so a run cut short has spent its cheapest and
+# most self-contained cases first.
+assert states[0]['fields'][0]['name'] == "IP:len"
+
+
+= The property lives on the volatile, so no consumer pins complexity per protocol
+~ fuzzing packet inet volatile
+
+from scapy.volatile import RandLengthWalk
+
+packet = fuzz(IP() / UDP() / b"payload")
+states = packet.prepare_combinations(2)
+for state in states:
+    if len(state['fields']) > 1:
+        for field in state['fields']:
+            (_, volatile) = packet.locate_field(packet, field['name'])
+            assert not getattr(type(volatile), 'never_combined', False), field['name']
+
+
+############
+############
++ What is left alone
+
+= An unfuzzed packet computes its lengths exactly as before
+~ fuzzing packet inet dns dot11
+
+assert Dot11Elt(Dot11Elt(ID=221, info=b"AAAA").build()).len == 4
+
+rr = DNSRR(rrname="a.example.com", type="TXT", rdata=b"hello")
+assert DNSRR(bytes(rr)).rdlen == 6
+
+packet = IP() / UDP() / b"payload"
+assert IP(bytes(packet)).len == 35
+assert not hasattr(packet, "length_walks") or not packet.length_walks
+
+
+= copy() carries the parked walks, so a copied fuzzed packet still disarms
+~ fuzzing packet inet
+
+# copy_fields_dict() only carries 'fields' and 'default_fields', and a length
+# walk is in neither. Without copy() carrying it, the clone kept fuzz()'s
+# arming draw in 'fields' with nothing left that recognised it, and
+# return_relevant_fields() promoted the wrong length into default_fields -
+# permanently, under every case of every field.
+
+base = fuzz(IP() / UDP() / b"payload")
+clone = base.copy()
+
+assert "len" in clone.length_walks
+# Its own volatile, which is what do_copy() gives every other fuzzed field.
+assert clone.length_walks["len"] is not base.length_walks["len"]
+
+states = clone.prepare_combinations(1)
+raw = bytes(clone)
+assert IP(raw).len == len(raw), (IP(raw).len, len(raw))
+assert clone.default_fields["len"] is None
+
+# The original is untouched by the copy - still armed.
+assert base.fields["len"] in base.length_walks["len"].values
+
+
+= A length inside a PacketListField sub-packet keeps today's behaviour
+~ fuzzing packet dns
+
+# forward() drives a sub-packet field only through the volatile rendering at
+# build time - it explicitly does not write into 'fields' for a list of
+# Packets - and a length walk is driven the other way round, so there would be
+# nothing to drive it and its armed value would never come back off.
+
+query = DNS(qd=DNSQR(qname="example.com"),
+            an=DNSRR(rrname="example.com", type="TXT", rdata=b"hello"))
+fuzzed = fuzz(query)
+answer = fuzzed.an[0] if isinstance(fuzzed.an, list) else fuzzed.an
+
+assert not hasattr(answer, "length_walks") or "rdlen" not in answer.length_walks
+assert "rdlen" not in answer.fields

@@ -87,9 +87,15 @@ assert len(rendered) > steps // 2, (len(rendered), steps)
 # return_relevant_fields() skips overloaded fields) - naming it in the
 # example would pin whatever default_fields happens to hold.
 
-command = fuzz(IP() / TCP()).command()
+# One packet, not two independently fuzzed ones: fuzz() arms every length
+# field with a draw of its own (see Packet._arm_length_walk()), so two
+# fuzz() calls no longer agree on IP.len - which was never what this line
+# was asking about. Round-tripping the packet in hand is the stronger
+# statement anyway.
+packet = fuzz(IP() / TCP())
+command = packet.command()
 assert "proto=" not in command, command
-assert bytes(eval(command)) == bytes(fuzz(IP() / TCP()))
+assert bytes(eval(command)) == bytes(packet)
 
 
 + RandIP renders the address its field carries

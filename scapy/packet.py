@@ -537,6 +537,19 @@ class Packet(
         clone.comments = self.comments
         clone.direction = self.direction
         clone.sniffed_on = self.sniffed_on
+        walks = getattr(self, 'length_walks', None)
+        if walks is not None:
+            # A length walk is parked on the layer rather than kept in
+            # default_fields (see _arm_length_walk()), so copy_fields_dict()
+            # does not carry it. Without this the clone keeps fuzz()'s arming
+            # draw in 'fields' with nothing left that recognises it, and
+            # return_relevant_fields() promotes the wrong length into
+            # default_fields - permanently, under every case. Copied rather
+            # than shared, which is what do_copy() does for every other
+            # volatile: the clone gets its own state_pos.
+            clone.length_walks = {
+                name: walk.copy() for name, walk in walks.items()
+            }
         return clone
 
     def _resolve_alias(self, attr):
@@ -882,6 +895,57 @@ class Packet(
         # type: () -> bytes
         return self.payload.build_padding()
 
+    def _arm_length_walk(self, name, walk):
+        # type: (str, VolatileValue[Any]) -> None
+        """
+        Park a length walk on this layer, and make a plain build carry a lie.
+
+        The walk is deliberately NOT put in 'default_fields' the way every
+        other fuzzed field is, and that is the whole design rather than an
+        optimization. A length's honest value is *absence*: IP.post_build()
+        computes 'len' only while 'self.len is None', and Packet.__getattr__
+        hands back whatever sits in default_fields - a volatile is not None.
+        So a volatile installed there takes the computation away from every
+        case, not just from the ones driving this field, and nothing the
+        volatile can render fixes that: 'is None' is an identity test at a
+        call site that never asked the volatile anything.
+
+        Parked here instead, locate_field() still finds it, so
+        initialize_volatile_field() and forward() drive it exactly as they
+        drive any other volatile - and forward() already writes concrete
+        values into 'fields' while a field is being driven and deletes them
+        when it is done, which is "absent" again, byte-identical to a packet
+        that was never fuzzed.
+
+        'fields' is also where the arming draw goes. Acceptance is that
+        fuzz() varies a length *at all*, and fuzz-then-build with no walk
+        behind it is the classic scapy idiom, which parking alone would
+        leave honest. prepare_combinations() takes the draw back off, since
+        a walk over some other field wants an otherwise honest packet.
+        """
+        if not hasattr(self, 'length_walks'):
+            self.length_walks = {}
+        self.length_walks[name] = walk
+        self.fields[name] = walk._fix()
+
+    def _disarm_length_walks(self):
+        # type: () -> None
+        """
+        Take fuzz()'s arming draw back off every length field of every layer.
+
+        Called from prepare_combinations(): from here on the packet is a
+        control that one field at a time is driven away from, and a length
+        left armed would put a wrong length under every case of every other
+        field - which is the measurement this change must not move.
+        """
+        pkt = self  # type: Packet
+        while True:
+            for name in getattr(pkt, 'length_walks', {}):
+                pkt.fields.pop(name, None)
+            if type(pkt.payload).__name__ == 'NoPayload':
+                break
+            pkt = pkt.payload
+
     def return_relevant_fields(self, pkt):
         """
         Recursively collect all the fields that we can fuzz
@@ -889,7 +953,15 @@ class Packet(
         relevant_fields = []
         
         # If we provided fields in the constrcution, override the default ones
+        length_walks = getattr(pkt, 'length_walks', {})
+
         for field_name in pkt.fields:
+            if field_name in length_walks:
+                # fuzz()'s arming draw (see Packet._arm_length_walk()), or a
+                # value forward() is currently driving. Promoting either one
+                # into default_fields would make a wrong length the layer's
+                # permanent default and put it under every honest case.
+                continue
             current = pkt.default_fields[field_name]
             if isinstance(current, VolatileValue):
                 continue
@@ -911,6 +983,12 @@ class Packet(
             if field_name in pkt.overloaded_fields:
                 # This is not actually fuzzable, as it gets overloaded
                 # print(f"Skipping: {pkt._name}-{field_name}")
+                continue
+
+            if field_name in length_walks:
+                # Parked rather than sitting in default_fields, so the
+                # VolatileValue test below would never see it.
+                relevant_fields.append(f"{pkt.name}:{field_name}")
                 continue
 
             field = pkt.default_fields[field_name]
@@ -1052,6 +1130,12 @@ class Packet(
 
                     return (pkt, item)
 
+                walk = getattr(pkt, 'length_walks', {}).get(packet_field)
+                if walk is not None:
+                    # A length walk is parked on the layer rather than put in
+                    # default_fields - see Packet._arm_length_walk().
+                    return (pkt, walk)
+
                 return (pkt, pkt.default_fields[packet_field])
 
             if packet_field in pkt.fields:
@@ -1084,13 +1168,48 @@ class Packet(
             to False, so existing callers see no change in the sequence of
             values produced or in combination counts.
         """
+        # fuzz() leaves every length field carrying a drawn lie so that a
+        # plain fuzz-then-build varies one at all. From here on the packet is
+        # the control that one field at a time is driven away from, so the
+        # lies come back off - see Packet._arm_length_walk().
+        self._disarm_length_walks()
+
         relevant_fields = self.return_relevant_fields(self)
 
+        # A length is driven singly, against an otherwise honest packet.
+        # A frame with a bogus length is usually discarded at the length
+        # check, before the other field of a pair is ever parsed, so those
+        # cases pay for a pair and test one thing: armed as a pair axis,
+        # 99,569 of stunudp's 101,385 cases carried a wrong length and 517
+        # carried an honest one - the walk does not gain a length axis, it
+        # becomes one. Driven singly the same coverage costs 1.2x on an
+        # 802.11 beacon. The volatile says so itself (RandLengthWalk
+        # .never_combined), so no consumer has to pin complexity per
+        # protocol to express it.
+        #
+        # Probed on the type, not the instance: VolatileValue.__getattr__()
+        # answers an unknown attribute by computing the field.
+        solo_fields = []
+        combinable_fields = []
+        for field_name in relevant_fields:
+            (_, field_obj) = self.locate_field(self, field_name)
+            if getattr(type(field_obj), 'never_combined', False):
+                solo_fields.append(field_name)
+            else:
+                combinable_fields.append(field_name)
+
         # If there is more than one field, do a combination, otherwise just put it
-        if len(relevant_fields) > 1:
-            potential_states = itertools.combinations(relevant_fields, complexity)
+        if len(combinable_fields) > 1:
+            potential_states = list(
+                itertools.combinations(combinable_fields, complexity))
+        elif combinable_fields:
+            potential_states = [tuple(combinable_fields)]
         else:
-            potential_states = [relevant_fields]
+            potential_states = []
+
+        # Ahead of the combinations, so a run cut short has spent its
+        # cheapest and most self-contained cases first.
+        potential_states = [(name,) for name in solo_fields] + potential_states
 
         states = []
 
@@ -3946,6 +4065,7 @@ def _fuzz_list_items(fld, values):
 
 def fuzz(p,  # type: _P
          _inplace=0,  # type: int
+         _lengths=True,  # type: bool
          ):
     # type: (...) -> _P
     """
@@ -3953,6 +4073,14 @@ def fuzz(p,  # type: _P
     by random objects.
 
     :param p: the Packet instance to fuzz
+    :param _lengths: internal. False for a sub-packet living inside a
+        PacketListField: Packet.forward() drives such a field only through
+        the volatile rendering at build time - it explicitly does not write
+        into 'fields' for a list of Packets - and a length walk is driven
+        the other way round (see Packet._arm_length_walk()), so there would
+        be nothing to drive it and its armed value would never come back
+        off. Those length fields keep today's behaviour: computed, and not
+        fuzzed.
     :return: the fuzzed packet.
     """
     if not _inplace:
@@ -3961,6 +4089,7 @@ def fuzz(p,  # type: _P
     while not isinstance(q, NoPayload):
         new_default_fields = {}
         multiple_type_fields = []  # type: List[str]
+        length_walks = {}  # type: Dict[str, VolatileValue[Any]]
         for f in q.fields_desc:
             real_f = _unwrap_field(f)
             # A PacketListField/FieldListField can itself be wrapped in a
@@ -3988,7 +4117,7 @@ def fuzz(p,  # type: _P
             if isinstance(real_f, PacketListField):
                 if field_is_active:
                     for r in getattr(q, f.name):
-                        fuzz(r, _inplace=1)
+                        fuzz(r, _inplace=1, _lengths=False)
             elif isinstance(real_f, FieldListField):
                 # Fuzz each item with the inner field's own randval, keeping
                 # the list shape intact - see _fuzz_list_items().
@@ -3999,18 +4128,37 @@ def fuzz(p,  # type: _P
             elif isinstance(real_f, MultipleTypeField):
                 # the type of the field will depend on others
                 multiple_type_fields.append(f.name)
-            elif f.default is not None:
-                if not isinstance(f, ConditionalField) or f._evalcond(q):
-                    rnd = f.randval()
+            else:
+                # A field that declares a length gets a walk over lengths that
+                # disagree with what the layer carries, and it gets it BEFORE
+                # the 'f.default is not None' test below rather than through
+                # it: 426 of the 594 fields that declare a length declare it
+                # None, because None is what tells scapy to compute it, so the
+                # test that skips them is the convention that makes them
+                # correct. See Field.length_randval() and RandLengthWalk.
+                #
+                # Collected rather than applied here: arming one length field
+                # would change the bytes a second one in the same layer reads
+                # its honest value from.
+                walk = None
+                if _lengths and field_is_active and \
+                        hasattr(real_f, 'declares_length'):
+                    walk = real_f.length_randval(q)
 
-                    # Store the default value of the field
-                    rnd.default = f.default
-                    if rnd is not None:
-                        # print(f"Adding: {f.name} with {f.default=}")
-                        new_default_fields[f.name] = rnd
-                        # if f.name in p.fields:
-                        #     # Remove the override found inside fields
-                        #     del p.fields[f.name]
+                if walk is not None:
+                    length_walks[f.name] = walk
+                elif f.default is not None:
+                    if field_is_active:
+                        rnd = f.randval()
+
+                        # Store the default value of the field
+                        rnd.default = f.default
+                        if rnd is not None:
+                            # print(f"Adding: {f.name} with {f.default=}")
+                            new_default_fields[f.name] = rnd
+                            # if f.name in p.fields:
+                            #     # Remove the override found inside fields
+                            #     del p.fields[f.name]
 
         # Process packets with MultipleTypeFields
         if multiple_type_fields:
@@ -4050,5 +4198,7 @@ def fuzz(p,  # type: _P
                 if rnd is not None:
                     new_default_fields[name] = rnd
         q.default_fields.update(new_default_fields)
+        for name, walk in length_walks.items():
+            q._arm_length_walk(name, walk)
         q = q.payload
     return p

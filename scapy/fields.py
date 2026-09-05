@@ -27,9 +27,9 @@ from enum import Enum
 from scapy.config import conf
 from scapy.dadict import DADict
 from scapy.volatile import MAGIC_BOUNDARIES, RandBin, RandByte, RandEnum, \
-    RandEnumWalk, RandInt, RandIP, RandIP6, RandLong, RandMAC, RandNum, \
-    RandShort, RandSInt, RandSByte, RandTermString, RandUUID, VolatileValue, \
-    RandSShort, RandSLong, RandFloat
+    RandEnumWalk, RandInt, RandIP, RandIP6, RandLengthWalk, RandLong, \
+    RandMAC, RandNum, RandShort, RandSInt, RandSByte, RandTermString, \
+    RandUUID, VolatileValue, RandSShort, RandSLong, RandFloat
 from scapy.data import EPOCH
 from scapy.error import log_runtime, Scapy_Exception
 from scapy.compat import bytes_hex, plain_str, raw, bytes_encode
@@ -288,6 +288,108 @@ class Field(Generic[I, M], metaclass=Field_metaclass):
     def copy(self):
         # type: () -> Field[I, M]
         return copy.copy(self)
+
+    # A plain ByteField/ShortField/BitField carrying one of these names is a
+    # length declaration as surely as a FieldLenField is, and the class name
+    # says nothing about it. Kept small and explicit: a name-based rule that
+    # reaches further starts driving fields that only sound like lengths.
+    _LENGTH_FIELD_NAMES = frozenset((
+        "len", "length", "plen", "hlen", "dlen", "msglen",
+    ))
+
+    def declares_length(self):
+        # type: () -> bool
+        """Is this field the *declaration* of a length, rather than the value?
+
+        ``StrLenField`` and ``PacketLenField`` carry "LenField" in the class
+        name and are the value whose length is declared elsewhere, not the
+        declaration - driving one corrupts the payload while leaving the
+        length honest, which is the opposite of the point. So are
+        ``BitLenField`` and ``TruncPktLenField``, which a rule reading the
+        class name for "LenField" and rejecting "Str"/"Packet" would both get
+        wrong.
+
+        What actually separates the two is which way the field points:
+        ``length_of``/``count_of`` name the field being *measured*
+        (``FieldLenField`` and its kin), while ``length_from`` names where
+        this field's own size is read *from*. ``LenField`` measures the
+        payload and declares neither.
+        """
+        if isinstance(self, (_StrField, _PacketField)):
+            return False
+        if getattr(self, "length_of", None) or getattr(self, "count_of", None):
+            return True
+        if isinstance(self, LenField):
+            return True
+        return self.name.lower() in self._LENGTH_FIELD_NAMES
+
+    def honest_length(self, pkt):
+        # type: (Packet) -> Optional[int]
+        """The length this class computes for ``pkt``, read back off the wire
+
+        ``i2m(pkt, None)`` is not sufficient on its own, and this is the trap
+        worth carrying: it runs ``length_of``/``count_of`` and any ``adjust=``,
+        which covers the ``FieldLenField`` family, but a length computed in
+        ``post_build`` answers **0** to it - ``IP.len`` says 0 where the wire
+        says 35, ``UDP.len`` 0 where it says 15. Building and re-dissecting
+        defers to whichever mechanism the class actually uses, and is correct
+        for both shapes.
+
+        It has one limit, and the answer to it is to decline: a two-octet
+        vendor element re-dissects as something carrying no ``len`` at all, so
+        the value cannot be established there. Every rung of the ladder is an
+        offset from this number, so a guess - 0, most temptingly - puts the
+        whole ladder in the wrong place.
+        """
+        try:
+            rebuilt = pkt.__class__(bytes(pkt))
+        except Exception:
+            return None
+        if not isinstance(rebuilt, pkt.__class__):
+            # A dispatch hook resolved the bytes to a sibling class, whose
+            # field of this name need not mean the same thing.
+            return None
+        try:
+            value = rebuilt.getfieldval(self.name)
+        except Exception:
+            return None
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        return None
+
+    def length_randval(self, pkt):
+        # type: (Packet) -> Optional[VolatileValue[Any]]
+        """A walk over lengths that disagree with what ``pkt`` carries
+
+        ``None`` for a field that does not declare a length, and for one whose
+        honest value cannot be established - see ``honest_length()``.
+
+        The inherited ``randval()`` is the authority on the range the field can
+        actually carry (``!B`` -> 0..255, a 3-bit ``BitField`` -> 0..7), which
+        is all this needs from it; ``RandEnumWalk`` is the one shape whose
+        ``min``/``max`` are list indexes rather than values, so its own range
+        is read instead. See ``RandLengthWalk`` for the ladder.
+        """
+        if not self.declares_length():
+            return None
+        try:
+            base = self.randval()
+        except Exception:
+            return None
+        if isinstance(base, RandEnumWalk):
+            low, high = base.low, base.high
+        elif isinstance(base, RandNum) and not isinstance(base, RandEnum):
+            low, high = base.min, base.max
+        else:
+            # 's'-format and anything drawing at random carry no integer range
+            # for a length to be an offset within.
+            return None
+        honest = self.honest_length(pkt)
+        if honest is None:
+            return None
+        if not RandLengthWalk.ladder(honest, low, high):
+            return None
+        return RandLengthWalk(honest, low, high)
 
     def randval(self):
         # type: () -> VolatileValue[Any]
