@@ -479,6 +479,67 @@ assert raw(m) == b"\x03"
 assert m.default_fields['f'] == []
 assert m.fields['f'] == [3]
 
+= Assembly of a list of bit fields that fills whole bytes
+~ field
+class TestFLFBits(Packet):
+    fields_desc = [ FieldListField("lst", [0] * 8, BitField("elt", 0, 2),
+                                   count_from=lambda pkt: 8) ]
+    def extract_padding(self, s):
+        return b"", s
+
+a = TestFLFBits(lst=[0, 1, 2, 3, 3, 2, 1, 0])
+r = raw(a)
+assert r == b"\x1b\xe4"
+assert TestFLFBits(r).lst == [0, 1, 2, 3, 3, 2, 1, 0]
+
+= Assembly of a list of bit fields closed by a following bit field
+~ field
+# The list leaves 6 bits open; the bit field after it closes the byte. The
+# open-byte state has to survive FieldListField.addfield for this to work.
+class TestFLFBitsTail(Packet):
+    fields_desc = [ FieldListField("lst", [0] * 3, BitField("elt", 0, 2),
+                                   count_from=lambda pkt: 3),
+                    BitField("tail", 0, 2) ]
+    def extract_padding(self, s):
+        return b"", s
+
+a = TestFLFBitsTail(lst=[1, 2, 3], tail=1)
+r = raw(a)
+assert r == b"\x6d"
+p = TestFLFBitsTail(r)
+assert p.lst == [1, 2, 3] and p.tail == 1
+
+= A list of bit fields left open at the end of a layer is refused by name
+~ field
+# Nothing closes the byte, so the layer cannot be serialised. The error has to
+# name the field and the layer, rather than escaping into post_build as a
+# TypeError about concatenating a tuple.
+class TestFLFBitsOpen(Packet):
+    fields_desc = [ FieldListField("lst", [0] * 3, BitField("elt", 0, 2),
+                                   count_from=lambda pkt: 3) ]
+
+try:
+    raw(TestFLFBitsOpen())
+except Scapy_Exception as e:
+    assert "'lst'" in str(e)
+    assert "TestFLFBitsOpen" in str(e)
+else:
+    assert False
+
+= A bare bit field left open at the end of a layer is refused by name
+~ field
+# The same invariant without any list involved.
+class TestOpenBits(Packet):
+    fields_desc = [ BitField("a", 0, 2) ]
+
+try:
+    raw(TestOpenBits())
+except Scapy_Exception as e:
+    assert "'a'" in str(e)
+    assert "TestOpenBits" in str(e)
+else:
+    assert False
+
 
 ############
 ############

@@ -1140,6 +1140,20 @@ assert pkt[Dot11EltVHTOperation].VHT_Operation_Info.channel_center1 == 50
 pkt = Dot11EltVHTOperation(b'\xc0\x05\x01*2\x00\x00')
 assert pkt[Dot11Elt::{"ID": 192}].len == 5
 
+= Dot11EltVHTOperation builds from its defaults
+
+# The Basic VHT-MCS Set is a FieldListField of eight 2-bit fields, two bytes
+# in all. Its default has to carry all eight: with fewer, the element ends
+# with an unfinished byte and cannot be serialised at all.
+pkt = Dot11EltVHTOperation()
+assert len(pkt.mcs_set) == 8
+assert raw(pkt) == b'\xc0\x05\x00\x24\x00\x00\x00'
+assert Dot11Elt(raw(pkt))[Dot11EltVHTOperation].mcs_set == [0] * 8
+
+pkt = Dot11EltVHTOperation(mcs_set=[0, 1, 2, 3, 3, 2, 1, 0])
+assert raw(pkt) == b'\xc0\x05\x00\x24\x00\x1b\xe4'
+assert Dot11Elt(raw(pkt))[Dot11EltVHTOperation].mcs_set == [0, 1, 2, 3, 3, 2, 1, 0]
+
 = Dot11EltHTOperation in isolation
 
 data = b'\x3d\x16\x24\x0d\x17\x00\x3f\x00' + b'\xff' + b'\x00' * 15
@@ -1195,6 +1209,16 @@ assert pkt[Dot11EltHEOperation].six_g_op_info_present == 0
 assert pkt[Dot11EltHEOperation].vht_operation_info_present == 0
 assert pkt[Dot11EltHEOperation].basic_he_mcs_and_nss_set == [0] * 8
 assert raw(pkt) == data
+
+= Dot11EltHEOperation builds from its defaults
+
+# Same for the Basic HE-MCS and NSS Set. Extension elements do not compute
+# their own len (Dot11EltExtension overrides Dot11Elt's FieldLenField with a
+# plain ByteField), so it is given here to get a well-formed element.
+pkt = Dot11EltHEOperation(len=7)
+assert len(pkt.basic_he_mcs_and_nss_set) == 8
+assert raw(pkt) == b'\xff\x07$\x00\x00\x00\x00\x00\x00'
+assert Dot11Elt(raw(pkt))[Dot11EltHEOperation].basic_he_mcs_and_nss_set == [0] * 8
 
 = Dot11EltHEOperation with 6 GHz Operation Information in isolation
 
