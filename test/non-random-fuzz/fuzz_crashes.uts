@@ -1,0 +1,199 @@
+% Regression tests for the sequential (non-random) fuzzing state machine
+% fuzz() must not raise on a field it cannot fuzz
+
+# Measured over every Packet subclass reachable from scapy.layers and
+# scapy.contrib that constructs with no arguments: 4,493 construct and 209 of
+# them raised out of fuzz(). Three separable causes account for 86, and the
+# first two are two lines of fuzz() that are on every field of every layer, so
+# they reach far past the families they were found in.
+#
+# What they have in common is that a field fuzz() cannot handle took the whole
+# packet down rather than being skipped. A field that does not get fuzzed is
+# one axis fewer; an exception is no axes at all.
+
+############
+############
++ A field whose randval() is not a settable object
+
+= A plain scalar randval is used as-is instead of aborting the packet
+~ fuzzing packet fields
+
+# 'rnd.default = f.default' assumed randval() returned something with a
+# __dict__. Field.randval() is not required to return a VolatileValue, and an
+# int has none - 76 classes could not be fuzzed at all, all of
+# scapy.contrib.rtps.pid_types and scapy.contrib.dicom among them.
+
+from scapy.volatile import VolatileValue
+
+class _ScalarRand(Field):
+    def randval(self):
+        return 7
+
+class _HasScalarRand(Packet):
+    name = "HasScalarRand"
+    fields_desc = [_ScalarRand("plain", 3, "B"), ByteField("ordinary", 1)]
+
+field = [f for f in _HasScalarRand.fields_desc if f.name == "plain"][0]
+assert not isinstance(field.randval(), VolatileValue)
+
+packet = fuzz(_HasScalarRand())
+
+# The value is kept - recording a default on it is what is impossible, not
+# using it - and the field beside it is fuzzed as usual.
+assert packet.default_fields["plain"] == 7
+assert isinstance(packet.default_fields["ordinary"], VolatileValue)
+
+# A scalar carries no default, so it is not something forward() can drive,
+# which is what every release before this did.
+assert not hasattr(packet.default_fields["plain"], "default")
+assert "HasScalarRand:plain" not in packet.return_relevant_fields(packet)
+assert "HasScalarRand:ordinary" in packet.return_relevant_fields(packet)
+
+
+= The real class it was found on
+~ fuzzing packet
+
+from scapy.contrib.rtps.pid_types import PID_GROUP_DATA
+
+# EField.randval() hands back a plain int here.
+assert isinstance(fuzz(PID_GROUP_DATA()), PID_GROUP_DATA)
+
+
+= randval() returning None is checked before it is dereferenced, not after
+~ fuzzing packet fields
+
+# 'if rnd is not None' was one line BELOW the attribute assignment that needs
+# it, so the case the code explicitly anticipates raised AttributeError.
+
+class _NoRand(Field):
+    def randval(self):
+        return None
+
+class _HasNoRand(Packet):
+    name = "HasNoRand"
+    fields_desc = [_NoRand("nothing", 3, "B"), ByteField("ordinary", 1)]
+
+packet = fuzz(_HasNoRand())
+assert "nothing" not in packet.default_fields or \
+    packet.default_fields["nothing"] == 3
+assert isinstance(packet.default_fields["ordinary"], VolatileValue)
+
+
+############
+############
++ A ConditionalField whose condition cannot be answered yet
+
+= A condition that raises means "cannot say", not "abandon the packet"
+~ fuzzing packet fields
+
+# A condition is written to be asked of a packet that has been built or
+# dissected, and fuzz() asks it of one that has been neither. A condition
+# reading a length the packet computes at build time therefore reads None.
+
+class _CondOnComputed(Packet):
+    name = "CondOnComputed"
+    fields_desc = [
+        FieldLenField("len", None, fmt="B", length_of="data"),
+        StrLenField("data", b"", length_from=lambda pkt: pkt.len),
+        ConditionalField(ByteField("extra", 1), lambda pkt: pkt.len >= 5),
+    ]
+
+fresh = _CondOnComputed()
+try:
+    fresh.getfieldval("len") >= 5
+    raise AssertionError("expected the condition to be unanswerable")
+except TypeError:
+    pass
+
+packet = fuzz(_CondOnComputed())
+
+# The guarded field is fuzzed rather than skipped: a field wrongly included is
+# a case, an exception is no cases at all.
+assert isinstance(packet.default_fields["extra"], VolatileValue)
+
+
+= A condition that answers is still obeyed
+~ fuzzing packet fields
+
+# The fallback must not swallow a condition that works - an unmet one still
+# leaves its field alone.
+
+class _CondPlain(Packet):
+    name = "CondPlain"
+    fields_desc = [
+        ByteField("flag", 0),
+        ConditionalField(ByteField("on", 1), lambda pkt: pkt.flag == 1),
+        ConditionalField(ByteField("off", 1), lambda pkt: pkt.flag == 2),
+    ]
+
+packet = fuzz(_CondPlain(flag=1))
+assert isinstance(packet.default_fields["on"], VolatileValue)
+assert not isinstance(packet.default_fields["off"], VolatileValue)
+
+
+= The real class it was found on
+~ fuzzing packet
+
+from scapy.contrib.isis import ISIS_P2PAdjacencyStateTlv
+
+# 'lambda pkt: pkt.len >= 5' over a len that is None until post_build.
+assert isinstance(fuzz(ISIS_P2PAdjacencyStateTlv()), ISIS_P2PAdjacencyStateTlv)
+
+
+############
+############
++ _ISIS_RandAreaId read an attribute it had not set
+
+= The template is built from the resolved bytecount, not from a missing one
+~ fuzzing isis volatile
+
+# self.bytecount was read to build the template and assigned four lines later.
+# VolatileValue.__getattr__ answers an unknown attribute by calling _fix(),
+# and _ISIS_RandId._fix() opens with 'if self.bytecount == 0', so the read
+# recursed into itself.
+
+from scapy.contrib.isis import _ISIS_RandAreaId
+
+for bytecount in range(1, 14):
+    area = _ISIS_RandAreaId(bytecount)
+    assert area.bytecount == bytecount, bytecount
+    # One "%02X" per octet, which is what the template exists to produce.
+    assert area.format.count("%02X") == bytecount, bytecount
+    assert len(area._fix().replace(".", "")) == bytecount * 2, bytecount
+
+# The default draws its own, and still agrees with its template.
+drawn = _ISIS_RandAreaId()
+assert 1 <= drawn.bytecount <= 13
+assert drawn.format.count("%02X") == drawn.bytecount
+
+
+= The mandatory TLV of every IS-IS PDU fuzzes
+~ fuzzing isis packet
+
+from scapy.contrib.isis import ISIS_AreaEntry, ISIS_AreaTlv
+
+# The Area Addresses TLV is mandatory in every IS-IS Hello and LSP, so this
+# was the one TLV an IS-IS PDU cannot omit being the one that could not be
+# fuzzed.
+tlv = ISIS_AreaTlv(areas=[ISIS_AreaEntry(areaid="49.1000")])
+assert isinstance(fuzz(tlv), ISIS_AreaTlv)
+assert isinstance(fuzz(ISIS_AreaEntry()), ISIS_AreaEntry)
+
+
+############
+############
++ Controls
+
+= An ordinary layer is unaffected
+~ fuzzing packet inet
+
+from scapy.volatile import VolatileValue
+
+packet = fuzz(IP() / UDP() / b"payload")
+assert isinstance(packet.default_fields["ttl"], VolatileValue)
+assert packet.default_fields["ttl"].default == 64
+
+# ... and it still walks.
+states = packet.prepare_combinations(1)
+states, more = packet.forward(states)
+assert more

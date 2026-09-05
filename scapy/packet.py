@@ -4063,6 +4063,35 @@ def _fuzz_list_items(fld, values):
     return new_list
 
 
+def _field_is_active(f, pkt):
+    # type: (AnyField, Packet) -> bool
+    """Is this ConditionalField's condition met on this packet right now?
+
+    True for anything that is not conditional, and true when the condition
+    cannot be answered at all.
+
+    A condition is written to be asked of a packet that has been built or
+    dissected, and fuzz() asks it of one that has been neither. A condition
+    reading a length the packet computes at build time therefore reads None:
+    ISIS_P2PAdjacencyStateTlv guards a field with ``lambda pkt: pkt.len >= 5``
+    over a ``len`` that is None until post_build, and comparing that to an int
+    raises TypeError - which aborted the fuzzing of the whole packet, not just
+    of the field that could not be judged.
+
+    Treat it as "cannot say" and fuzz the field. A field wrongly included is a
+    case; an exception is no cases at all. Only one class in the corpus is
+    reachable this way today, but a ConditionalField keyed on a computed
+    length is how most TLVs with optional trailing fields are written, so it
+    is a latent crash for any layer written that way rather than a one-off.
+    """
+    if not isinstance(f, ConditionalField):
+        return True
+    try:
+        return bool(f._evalcond(pkt))
+    except Exception:
+        return True
+
+
 def fuzz(p,  # type: _P
          _inplace=0,  # type: int
          _lengths=True,  # type: bool
@@ -4098,7 +4127,7 @@ def fuzz(p,  # type: _P
             # ConditionalField.i2h()'s contract), not the field's actual
             # list default - so these branches must not run at all then,
             # same as the generic scalar branch below already guards for.
-            field_is_active = not isinstance(f, ConditionalField) or f._evalcond(q)
+            field_is_active = _field_is_active(f, q)
 
             if field_is_active and hasattr(real_f, 'fuzz_current_value'):
                 # Optional hook: lets a field type produce something that
@@ -4151,9 +4180,27 @@ def fuzz(p,  # type: _P
                     if field_is_active:
                         rnd = f.randval()
 
-                        # Store the default value of the field
-                        rnd.default = f.default
+                        # Both guards below used to sit AFTER the assignment
+                        # that needs them, so a field whose randval() is not a
+                        # settable object took the whole packet down:
+                        #
+                        # - randval() is not required to return a
+                        #   VolatileValue. Several return a plain int, and an
+                        #   int has no __dict__, so recording the default on
+                        #   one raises AttributeError - 76 classes, all of
+                        #   scapy.contrib.rtps.pid_types and scapy.contrib
+                        #   .dicom among them, could not be fuzzed at all.
+                        #   A scalar simply does not carry a default, which is
+                        #   what every release before this did.
+                        # - randval() returning None is anticipated by the
+                        #   'is not None' test, which was one line too late to
+                        #   stop the attribute assignment above it.
                         if rnd is not None:
+                            if isinstance(rnd, VolatileValue):
+                                # Store the default value of the field
+                                # ('default' is carried dynamically, which is
+                                # why the narrowing above needs the ignore.)
+                                rnd.default = f.default  # type: ignore[attr-defined]  # noqa: E501
                             # print(f"Adding: {f.name} with {f.default=}")
                             new_default_fields[f.name] = rnd
                             # if f.name in p.fields:

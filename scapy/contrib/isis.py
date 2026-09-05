@@ -146,16 +146,22 @@ class _ISIS_RandId(RandString):
 
 class _ISIS_RandAreaId(_ISIS_RandId):
     def __init__(self, bytecount=None):
+        # Resolved before the template is built, not four lines after it.
+        # Reading self.bytecount here used to recurse until the stack ran
+        # out: it is not set yet, VolatileValue.__getattr__ answers an
+        # unknown attribute by calling self._fix(), and _ISIS_RandId._fix()
+        # opens with 'if self.bytecount == 0'. The Area Addresses TLV is
+        # mandatory in every IS-IS Hello and LSP, so this was the one TLV an
+        # IS-IS PDU cannot omit being the one TLV that could not be fuzzed.
+        if bytecount is None:
+            bytecount = random.randint(1, 13)
         template = "*" + (
-            ".**" * ((self.bytecount - 1) // 2)
+            ".**" * ((bytecount - 1) // 2)
         ) + (
-            "" if ((self.bytecount - 1) % 2) == 0 else ".*"
+            "" if ((bytecount - 1) % 2) == 0 else ".*"
         )
         super(_ISIS_RandAreaId, self).__init__(template)
-        if bytecount is None:
-            self.bytecount = random.randint(1, 13)
-        else:
-            self.bytecount = bytecount
+        self.bytecount = bytecount
 
 
 class ISIS_AreaIdField(Field):
