@@ -944,8 +944,7 @@ class _Dot11EltUtils(Packet):
                     crypto.add(wpa_version)
             elif p.ID == 221:
                 if isinstance(p, Dot11EltMicrosoftWPA):
-
-                  if p.akm_suites:
+                    if p.akm_suites:
                         auth = p.akm_suites[0].sprintf("%suite%")
                         crypto.add("WPA/%s" % auth)
                     else:
@@ -1555,7 +1554,7 @@ class Dot11EltVHTOperation(Dot11Elt):
         ),
         FieldListField(
             "mcs_set",
-            [0x00],
+            [0x00] * 8,
             BitField('SS', 0x00, size=2),
             count_from=lambda x: 8
         )
@@ -1661,7 +1660,7 @@ class Dot11EltHEOperation(Dot11EltExtension):
         # Basic HE-MCS and NSS Set: 2B
         FieldListField(
             "basic_he_mcs_and_nss_set",
-            [0x00],
+            [0x00] * 8,
             BitField('SS', 0x00, size=2),
             count_from=lambda x: 8
         ),
