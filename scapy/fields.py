@@ -402,6 +402,40 @@ class Field(Generic[I, M], metaclass=Field_metaclass):
             return True
         return self.declares_length()
 
+    def is_integrity_value(self):
+        # type: () -> bool
+        """Is this field a checksum, CRC or other integrity value?
+
+        Such a field is never worth fuzzing, and the reason is not that it is
+        computed - some are not. It is that a wrong one is rejected at the
+        receiver's first check, so the iteration that carried it exercises
+        nothing past that check, and every other field fuzzed in the same
+        packet is wasted with it. Fuzzing here asks "is the checksum
+        verified?", which is not the question a fuzzing run is asking.
+
+        Not every one of these is computed, which is why this cannot be folded
+        into ``computes_own_value()``. ``ISIS_L1_LSP.checksum`` sits on a class
+        overriding no ``post_build``: the Fletcher-16 is written by the OUTER
+        layer, ``ISIS_CommonHdr.post_build``, straight over those two bytes.
+        Nothing readable from the field or from its own class says so.
+
+        Names only, like ``_LENGTH_FIELD_NAMES``, because a checksum is an
+        ordinary integer field and no class distinguishes one. The set is
+        matched whole rather than as a substring, and the near misses are the
+        reason: ``NEGOEX_CHECKSUM.ChecksumType`` names an algorithm,
+        ``SCTPChunkAuthentication.HMAC_function`` selects one, and
+        ``SCTPChunkInit.init_tag`` is a value the sender is *supposed* to pick
+        arbitrarily. A substring rule takes all three and is wrong on each.
+
+        ``hmac``, ``digest``, ``signature`` and ``authenticator`` are
+        deliberately absent: in this corpus they are ``_StrField`` and
+        ``PacketField`` subclasses, which ``fuzz()`` declines already, and
+        ``signature`` names something other than an integrity value often
+        enough (26 fields, 4 of them defaulting ``None``) to fail the same
+        test the length names are held to.
+        """
+        return self.name.lower() in _INTEGRITY_FIELD_NAMES
+
     def honest_length(self, pkt):
         # type: (Packet) -> Optional[int]
         """The length this class computes for ``pkt``, read back off the wire
@@ -492,6 +526,32 @@ class Field(Generic[I, M], metaclass=Field_metaclass):
                 )
             )
 
+
+# Names an integrity value carries. Counted over the full corpus - every
+# scapy.contrib module loaded, not the subset scapy.all reaches:
+#
+#     name        fields   default None   what else carries the name
+#     chksum          55             53   -
+#     cksum           50             49   -
+#     checksum        16              7   -
+#     crc              8              3   -
+#     crc_32           1              1   -
+#     fcs              3              2   -
+#     icv              4              2   -
+#     mic              7              2   -
+#
+# Matched whole, never as a substring. 'checksumtype' (an algorithm enum),
+# 'hmac_function' (an algorithm selector) and 'init_tag' (a value SCTP wants
+# the sender to pick arbitrarily) all contain a name above and all three are
+# fuzzed correctly today - a substring rule silently stops fuzzing them.
+#
+# 'crc32' carries nothing in this corpus and stays for the same reason 'dlen'
+# stays in the length names: it is the obvious sibling spelling, and a name
+# matching nothing costs nothing.
+_INTEGRITY_FIELD_NAMES = frozenset((
+    "chksum", "cksum", "checksum", "crc", "crc32", "crc_32", "fcs", "icv",
+    "mic",
+))
 
 # Names a plain integer field carries when it declares a length, where nothing
 # about its class says so. Every one is justified over the FULL corpus - 5,652

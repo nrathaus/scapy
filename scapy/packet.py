@@ -40,6 +40,7 @@ from scapy.fields import (
     PacketListField,
     RawVal,
     StrField,
+    _INTEGRITY_FIELD_NAMES,
     _PacketField,
     _StrField,
 )
@@ -4094,6 +4095,27 @@ def _field_is_active(f, pkt):
         return True
 
 
+def _is_integrity_value(field):
+    # type: (Any) -> bool
+    """Is this a checksum, CRC or other integrity value, whatever it defaults to?
+
+    Declined by ``fuzz()`` wherever it sits and whatever its default, because a
+    wrong one is rejected at the receiver's first check: the iteration carrying
+    it exercises nothing past that check and wastes every other field fuzzed in
+    the same packet with it. Nineteen of these carry a real default and so were
+    fuzzed long before ``None`` defaults were reachable at all - ``OSPF_LSA_Hdr
+    .chksum``, the four PROFIsafe ``crc`` fields, MACsec and IPsec ``icv``,
+    ZigBee and NTLM ``mic`` among them.
+
+    ``scapy.asn1fields`` is a parallel hierarchy with no ``Field`` methods to
+    call, so the name set is consulted directly for one - ``kerberos.Checksum
+    .checksum`` is a ``_Checksum_Field`` and a real Kerberos checksum.
+    """
+    if hasattr(field, "is_integrity_value"):
+        return bool(field.is_integrity_value())
+    return getattr(field, "name", "").lower() in _INTEGRITY_FIELD_NAMES
+
+
 def _none_default_is_inert(field, pkt):
     # type: (Field[Any, Any], Packet) -> bool
     """Is this field's ``None`` default a resting value, not "I compute this"?
@@ -4128,6 +4150,11 @@ def _none_default_is_inert(field, pkt):
        be shown inert from here. Declining the class costs the fields that were
        merely resting on it, and that is the right way round: the failure it
        avoids is fuzzing a value the class needs to be real.
+
+    An integrity value never reaches this function at all - ``fuzz()`` declines
+    one before asking about its default, since the argument against fuzzing a
+    checksum does not depend on what it defaults to. See
+    ``_is_integrity_value()``.
 
     Note the order of 1 and 3. Test 3 alone is NOT the safe tier it looks
     like: ``Ether`` overrides no ``post_build``, and ``Ether.dst`` and
@@ -4229,6 +4256,12 @@ def fuzz(p,  # type: _P
 
                 if walk is not None:
                     length_walks[f.name] = walk
+                elif _is_integrity_value(real_f):
+                    # Never fuzzed, whatever it defaults to: a wrong checksum
+                    # is rejected at the receiver's first check, so the
+                    # iteration carrying it exercises nothing past that check
+                    # and wastes every other field fuzzed alongside it.
+                    pass
                 elif f.default is not None or \
                         _none_default_is_inert(real_f, q):
                     # A None default used to end the matter here. It still

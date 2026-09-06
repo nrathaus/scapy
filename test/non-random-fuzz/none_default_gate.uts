@@ -176,6 +176,75 @@ for f in IP.fields_desc:
     assert not _none_default_is_inert(f, IP()), f.name
 
 
+= An integrity value is declined even where nothing local computes it
+~ fuzzing packet
+
+from scapy.contrib.isis import ISIS_L1_LSP
+from scapy.contrib.stun import STUNFingerprint
+from scapy.packet import Packet
+
+def armed(pkt):
+    return {name for name, value in pkt.default_fields.items()
+            if isinstance(value, VolatileValue)}
+
+# A wrong checksum is rejected at the receiver's first check, so the iteration
+# carrying it exercises nothing past that check and wastes every other field
+# fuzzed alongside it.
+#
+# The post_build test does not already cover this. ISIS_L1_LSP overrides no
+# post_build - the Fletcher-16 is written by the OUTER layer,
+# ISIS_CommonHdr.post_build, straight over those two bytes - so nothing
+# readable from the field or from its own class says the value is computed.
+assert ISIS_L1_LSP.post_build is Packet.post_build
+assert "checksum" not in armed(fuzz(ISIS_L1_LSP()))
+assert "crc_32" not in armed(fuzz(STUNFingerprint()))
+
+
+= An integrity value carrying a real default is declined too
+~ fuzzing packet
+
+from scapy.contrib.ospf import OSPF_LSA_Hdr
+from scapy.contrib.pnio import PROFIsafeControl
+from scapy.layers.inet import UDP
+
+def armed(pkt):
+    return {name for name, value in pkt.default_fields.items()
+            if isinstance(value, VolatileValue)}
+
+# The argument against fuzzing a checksum does not depend on what it defaults
+# to, so fuzz() declines one before it ever asks about the default. These
+# carry a real default of 0 and were fuzzed for as long as fuzz() has existed.
+assert [f.default for f in OSPF_LSA_Hdr.fields_desc if f.name == "chksum"] == [0]
+assert "chksum" not in armed(fuzz(OSPF_LSA_Hdr()))
+assert "crc" not in armed(fuzz(PROFIsafeControl()))
+
+# ... and the ordinary fields beside them are untouched
+assert "age" in armed(fuzz(OSPF_LSA_Hdr()))
+assert "control" in armed(fuzz(PROFIsafeControl()))
+
+# UDP was never affected either way: it overrides post_build, so its chksum
+# was already left to the class before any of this
+assert armed(fuzz(UDP())) == {"sport", "dport"}
+
+
+= A name that merely contains one is still fuzzed
+~ fuzzing packet
+
+from scapy.layers.sctp import SCTPChunkInit, SCTPChunkAuthentication
+from scapy.layers.spnego import NEGOEX_CHECKSUM
+
+def armed(pkt):
+    return {name for name, value in pkt.default_fields.items()
+            if isinstance(value, VolatileValue)}
+
+# The set is matched whole, never as a substring, and these are why:
+# init_tag is a value SCTP wants the sender to pick arbitrarily, and the other
+# two name an algorithm rather than carrying an integrity value.
+assert "init_tag" in armed(fuzz(SCTPChunkInit()))
+assert "HMAC_function" in armed(fuzz(SCTPChunkAuthentication()))
+assert "ChecksumType" in armed(fuzz(NEGOEX_CHECKSUM()))
+
+
 ############
 ############
 + computes_own_value() answers for the field alone
