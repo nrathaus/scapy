@@ -61,7 +61,11 @@ from scapy.fields import (
     XIntField,
     XShortField,
 )
-from scapy.interfaces import _GlobInterfaceType, network_name
+from scapy.interfaces import (
+    _GlobInterfaceType,
+    network_name,
+    sending_iface,
+)
 from scapy.layers.inet import (
     _ICMPExtensionField,
     _ICMPExtensionPadField,
@@ -195,9 +199,14 @@ def getmacbyip6(ip6, chainCC=0, iface=None):
 
     if iface is not None:
         iface = network_name(iface)
-    elif isinstance(ip6, _ScopedIP):
-        # Already a network name: ScopedIP() resolved it on the way in.
-        iface = ip6.scope
+    else:
+        # A destination carries a scope only when one was asked for - every
+        # IPv6 address arrives here as a _ScopedIP, most of them with none.
+        # ScopedIP() resolved it to a network name on the way in.
+        scope = ip6.scope if isinstance(ip6, _ScopedIP) else None
+        # Nothing said about the link at all, then: a send in progress still
+        # knows the one the frame leaves by, which is the link to resolve on.
+        iface = scope if scope is not None else sending_iface()
 
     iff, a, nh = conf.route6.route(ip6, dev=iface)
 

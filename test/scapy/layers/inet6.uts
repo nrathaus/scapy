@@ -2157,6 +2157,92 @@ def test_getmacbyip6_multicast(mock_neighsol):
 
 test_getmacbyip6_multicast()
 
+= IPv6 - getmacbyip6 falls back to the interface the frame leaves by
+
+from scapy.interfaces import sending_on, sending_iface
+
+@mock.patch("scapy.layers.inet6.neighsol")
+@mock.patch("scapy.layers.inet6.conf.route6.route")
+def test_getmacbyip6_sending_iface(mock_route6, mock_neighsol):
+    # route6 would pick a link of its own choosing
+    mock_route6.return_value = ("scapy_wrong", "fe80::2", "::")
+    mock_neighsol.return_value = test_neighsol()
+    here = network_name(conf.iface)
+    conf.netcache.in6_neighbor.flush()
+    try:
+        # no send in progress: unchanged, the lookup chooses
+        getmacbyip6("fe80::1")
+        assert mock_neighsol.call_args[0][2] == "scapy_wrong"
+        assert sending_iface() is None
+        # inside a send, the link the frame leaves by is the link to ask on
+        conf.netcache.in6_neighbor.flush()
+        with sending_on(conf.iface):
+            assert sending_iface() == here
+            getmacbyip6("fe80::1")
+        assert mock_neighsol.call_args[0][2] == here
+        # and the declaration does not outlive the send
+        assert sending_iface() is None
+    finally:
+        conf.netcache.in6_neighbor.flush()
+
+test_getmacbyip6_sending_iface()
+
+= IPv6 - an iface= or a scoped address outranks the interface being sent on
+
+@mock.patch("scapy.layers.inet6.network_name", side_effect=lambda x: x)
+@mock.patch("scapy.layers.inet6.neighsol")
+@mock.patch("scapy.layers.inet6.conf.route6.route")
+def test_getmacbyip6_precedence(mock_route6, mock_neighsol, mock_network_name):
+    def route(ip6, dev=None):
+        return dev or "scapy_wrong", "fe80::2", "::"
+    mock_route6.side_effect = route
+    mock_neighsol.return_value = test_neighsol()
+    scoped = _ScopedIP("fe80::1")
+    scoped.scope = "ifB"
+    conf.netcache.in6_neighbor.flush()
+    try:
+        with sending_on(conf.iface):
+            getmacbyip6("fe80::1", iface="ifA")
+            assert mock_neighsol.call_args[0][2] == "ifA"
+            getmacbyip6(scoped)
+            assert mock_neighsol.call_args[0][2] == "ifB"
+    finally:
+        conf.netcache.in6_neighbor.flush()
+
+test_getmacbyip6_precedence()
+
+= IPv6 - SuperSocket.send declares the interface the build is for
+
+class QuietSocket(SuperSocket):
+    """Builds the frame the way any socket does, and writes it nowhere"""
+    def __init__(self, iface=None, **kwargs):
+        self.iface = iface or conf.iface
+        self.outs = None
+    def close(self):
+        pass
+
+@mock.patch("scapy.layers.inet6.neighsol")
+@mock.patch("scapy.layers.inet6.conf.route6.route")
+def test_send_declares_iface(mock_route6, mock_neighsol):
+    # Loopback is what the lookup would choose, and is a real interface, so
+    #  the source MAC still builds. It also discriminates: left to itself the
+    #  lookup short-circuits to broadcast and solicits nothing at all.
+    mock_route6.return_value = (conf.loopback_name, "fe80::2", "::")
+    mock_neighsol.return_value = test_neighsol()
+    here = network_name(conf.iface)
+    if here == conf.loopback_name:
+        return  # nothing to tell apart on a loopback-only host
+    conf.netcache.in6_neighbor.flush()
+    try:
+        QuietSocket().send(Ether() / IPv6(dst="fe80::1") / ICMPv6EchoRequest())
+    finally:
+        conf.netcache.in6_neighbor.flush()
+    assert mock_neighsol.call_count == 1
+    assert mock_neighsol.call_args[0][2] == here
+    assert sending_iface() is None
+
+test_send_declares_iface()
+
 = IPv6 - IPerror6 & UDPerror & _ICMPv6Error & TCPerror
 
 query = IPv6(dst="2001:db8::1", src="2001:db8::2", hlim=1)/UDP()/DNS()

@@ -37,6 +37,7 @@ from scapy.interfaces import (
     _GlobInterfaceType,
     network_name,
     resolve_iface,
+    sending_on,
 )
 from scapy.libs.structures import sock_fprog
 from scapy.packet import Packet, Padding
@@ -365,10 +366,11 @@ class L3PacketSocket(L2Socket):
                 warning("Incompatible L3 types detected using %s instead of %s !",
                         type_x, sock.LL)
                 sock.LL = type_x
-        if sock.lvl == 2:
-            sx = bytes(sock.LL() / x)
-        else:
-            sx = bytes(x)
+        with sending_on(iff):
+            if sock.lvl == 2:
+                sx = bytes(sock.LL() / x)
+            else:
+                sx = bytes(x)
         # Now send.
         try:
             x.sent_time = time.time()

@@ -34,6 +34,7 @@ from scapy.interfaces import (
     NetworkInterface,
     _GlobInterfaceType,
     network_name,
+    sending_on,
 )
 from scapy.packet import Packet
 from scapy.pton_ntop import inet_ntop
@@ -621,7 +622,8 @@ if conf.use_pcap:
 
         def send(self, x):
             # type: (Packet) -> int
-            sx = raw(x)
+            with sending_on(self.iface):
+                sx = raw(x)
             try:
                 x.sent_time = time.time()
             except AttributeError:
@@ -666,10 +668,11 @@ if conf.use_pcap:
                     warning("Incompatible L3 types detected using %s instead of %s !",
                             type_x, sock.LL)
                     sock.LL = type_x
-            if sock.lvl == 2:
-                sx = bytes(sock.LL() / x)
-            else:
-                sx = bytes(x)
+            with sending_on(iff):
+                if sock.lvl == 2:
+                    sx = bytes(sock.LL() / x)
+                else:
+                    sx = bytes(x)
             # Now send.
             try:
                 x.sent_time = time.time()

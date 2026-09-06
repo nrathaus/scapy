@@ -38,7 +38,7 @@ from scapy.config import conf
 from scapy.consts import DARWIN, FREEBSD, NETBSD
 from scapy.data import ETH_P_ALL, DLT_IEEE802_11_RADIO
 from scapy.error import Scapy_Exception, warning
-from scapy.interfaces import network_name, _GlobInterfaceType
+from scapy.interfaces import network_name, sending_on, _GlobInterfaceType
 from scapy.supersocket import SuperSocket
 from scapy.compat import raw
 
@@ -448,7 +448,9 @@ class L2bpfSocket(L2bpfListenSocket):
     def send(self, x):
         # type: (Packet) -> int
         """Send a frame"""
-        return os.write(self.bpf_fd, raw(x))
+        with sending_on(self.iface):
+            sx = raw(x)
+        return os.write(self.bpf_fd, sx)
 
     def nonblock_recv(self):
         # type: () -> Optional[Packet]

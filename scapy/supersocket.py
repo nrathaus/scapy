@@ -25,7 +25,7 @@ from scapy.data import (
 )
 from scapy.compat import raw
 from scapy.error import warning, log_runtime
-from scapy.interfaces import network_name
+from scapy.interfaces import network_name, sending_on
 from scapy.packet import Packet, NoPayload
 from scapy.plist import (
     PacketList,
@@ -117,7 +117,10 @@ class SuperSocket(metaclass=_SuperSocket_metaclass):
         :param x: `Packet` to be send
         :return: Number of bytes that have been sent
         """
-        sx = raw(x)
+        with sending_on(self.iface):
+            # The L2 destination is resolved during this build, and this
+            # socket is the only thing that knows which link it will use.
+            sx = raw(x)
         try:
             x.sent_time = time.time()
         except AttributeError:

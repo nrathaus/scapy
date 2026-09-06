@@ -7,6 +7,8 @@
 Interfaces management
 """
 
+import contextlib
+import contextvars
 import itertools
 import uuid
 from collections import defaultdict
@@ -24,6 +26,7 @@ from typing import (
     Any,
     DefaultDict,
     Dict,
+    Iterator,
     List,
     NoReturn,
     Optional,
@@ -449,3 +452,47 @@ def show_interfaces(resolve_mac=True):
     # type: (bool) -> None
     """Print list of available network interfaces"""
     return conf.ifaces.show(resolve_mac)  # type: ignore
+
+
+# The interface a frame is being built to leave by.
+#
+# Resolving an L2 destination happens while the frame is being built, inside
+# the socket's send() - by which point the socket knows the interface and the
+# field being built does not. A ContextVar rather than a global because the
+# build runs in whatever thread does the sending, which is not always the
+# thread that opened the socket.
+_sending_iface = contextvars.ContextVar(
+    "sending_iface", default=cast(Optional[str], None)
+)
+
+
+@contextlib.contextmanager
+def sending_on(iface):
+    # type: (Optional[_GlobInterfaceType]) -> Iterator[None]
+    """
+    Declares, for the duration of a build, the interface the frame leaves by.
+
+    A neighbour lookup with no interface of its own asks the routing table
+    which link to resolve on, and can be answered a different one from the
+    link the frame is actually going out on. Wrapping the build says which.
+    """
+    try:
+        name = None if iface is None else network_name(iface)
+    except ValueError:
+        # An interface that cannot be resolved says nothing about the link, so
+        # declare nothing and leave the lookup to choose one, as it did before.
+        # Resolving on the send path must not be a new way for a send to fail.
+        name = None
+    token = _sending_iface.set(name)
+    try:
+        yield
+    finally:
+        _sending_iface.reset(token)
+
+
+def sending_iface():
+    # type: () -> Optional[str]
+    """
+    The interface the frame currently being built leaves by, if one is known.
+    """
+    return _sending_iface.get()
