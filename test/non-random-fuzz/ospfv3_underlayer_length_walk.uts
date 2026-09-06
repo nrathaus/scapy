@@ -1,0 +1,144 @@
+% Regression tests for the sequential (non-random) fuzzing state machine
+% An OSPFv3 sub-layer must not need an underlayer for its honest length
+
+# OSPFv3_LSUpd.lsalist declared
+#
+#   length_from=lambda pkt: pkt.underlayer.len - 16
+#
+# where OSPF_LSUpd beside it - the v2 twin, fixed upstream in #4871 - guards
+# with 'pkt.underlayer and ...'. The four other v3 sub-layers were bare the
+# same way. A sub-layer has no underlayer while it is being built, which is
+# also the state fuzz() is applied in, so the whole class was unreachable
+# standalone: OSPFv3_LSUpd(bytes(OSPFv3_LSUpd())) raised
+#
+#   AttributeError: 'NoneType' object has no attribute 'len'
+#
+# The fuzzing consequence is quieter than a crash, because honest_length()
+# builds and re-dissects inside a try/except and declines what it cannot
+# establish: the AttributeError came back as None, length_randval() returned
+# None with it, and lsacount - the one drivable field the layer has, the
+# other being an empty PacketListField - fell through to the
+# 'f.default is not None' test that skips every length declared None. fuzz()
+# on the layer produced a packet identical to one that was never fuzzed.
+#
+# Fixed by guarding all five v3 lambdas the way the v2 ones are. Dissection
+# under an OSPFv3_Hdr is unchanged - the guard only decides what happens when
+# there is no header to read a length off.
+
+############
+############
++ OSPFv3 sub-layers dissect without an OSPFv3_Hdr above them
+
+= Every v3 sub-layer round-trips standalone
+~ fuzzing ospf
+
+load_contrib("ospf")
+
+standalone = [
+    OSPFv3_Hello(neighbors=["1.2.3.4", "5.6.7.8"]),
+    OSPFv3_DBDesc(lsaheaders=[OSPFv3_LSA_Hdr()]),
+    OSPFv3_LSReq(requests=[OSPFv3_LSReq_Item()]),
+    OSPFv3_LSUpd(lsalist=[OSPFv3_Router_LSA()]),
+    OSPFv3_LSAck(lsaheaders=[OSPFv3_LSA_Hdr()]),
+]
+for pkt in standalone:
+    assert pkt.underlayer is None
+    assert bytes(pkt.__class__(bytes(pkt))) == bytes(pkt), pkt.name
+
+
+= fuzz() on a bare v3 sub-layer does not raise
+~ fuzzing ospf
+
+load_contrib("ospf")
+
+for cls in (OSPFv3_Hello, OSPFv3_DBDesc, OSPFv3_LSReq, OSPFv3_LSUpd,
+            OSPFv3_LSAck):
+    assert isinstance(bytes(fuzz(cls())), bytes), cls.__name__
+
+
+############
+############
++ OSPFv3_LSUpd.lsacount gets its length walk back
+
+= The honest count can be established, so the walk is armed
+~ fuzzing ospf
+
+load_contrib("ospf")
+
+packet = OSPFv3_LSUpd()
+field = packet.get_field("lsacount")
+
+# It always declared a length - count_of names the field it measures. What it
+# could not do was answer what the honest value is.
+assert field.declares_length()
+assert field.honest_length(packet) == 0
+
+walk = field.length_randval(packet)
+assert walk is not None
+
+# honest 0 has nothing below it, so the under-declaring half of the ladder
+# falls away and what is left is 1, a word, and the field's own ceiling.
+assert walk.describes_nothing
+assert walk.values[:3] == [1, 8, 0xffffffff], walk.values[:3]
+
+
+= Every rung reaches the wire, and lsacount goes back to honest afterwards
+~ fuzzing ospf
+
+load_contrib("ospf")
+import struct
+
+packet = fuzz(OSPFv3_LSUpd())
+states = packet.prepare_combinations(1)
+
+walked = []
+continue_to_fuzz = True
+while continue_to_fuzz:
+    states, continue_to_fuzz = packet.forward(states)
+    if not continue_to_fuzz:
+        break
+    state = packet.return_active_state(states)
+    if state is not None and \
+            state["fields"][0]["name"] == "OSPFv3 Link State Update:lsacount":
+        walked.append(struct.unpack("!I", bytes(packet)[:4])[0])
+
+assert walked[:3] == [1, 8, 0xffffffff], walked[:3]
+assert len(walked) == 128, len(walked)
+assert len(set(walked)) == 128, len(set(walked))
+
+# A length is honest by being absent, so an idle one is byte-identical to a
+# packet that was never fuzzed.
+assert "lsacount" not in packet.fields
+assert bytes(packet) == bytes(OSPFv3_LSUpd())
+
+
+############
+############
++ Attached under an OSPFv3_Hdr, nothing changed
+
+= The header still supplies the length and every sub-layer still dissects
+~ fuzzing ospf
+
+load_contrib("ospf")
+
+subs = [
+    OSPFv3_Hello(neighbors=["1.2.3.4", "5.6.7.8"]),
+    OSPFv3_DBDesc(lsaheaders=[OSPFv3_LSA_Hdr(), OSPFv3_LSA_Hdr(id="2.2.2.2")]),
+    OSPFv3_LSReq(requests=[OSPFv3_LSReq_Item(), OSPFv3_LSReq_Item(id="9.9.9.9")]),
+    OSPFv3_LSUpd(lsalist=[OSPFv3_Router_LSA()]),
+    OSPFv3_LSAck(lsaheaders=[OSPFv3_LSA_Hdr()]),
+]
+for type_, sub in enumerate(subs, start=1):
+    pkt = IPv6(src="fe80::1", dst="ff02::5") / OSPFv3_Hdr(type=type_) / sub
+    raw = bytes(pkt)
+    dissected = IPv6(raw)
+    assert isinstance(dissected[OSPFv3_Hdr].payload, sub.__class__)
+    assert bytes(dissected[OSPFv3_Hdr].payload) == bytes(sub), sub.name
+    assert dissected[OSPFv3_Hdr].len == len(raw) - 40
+
+# The count is read from the header's length, not from lsacount, and both
+# still agree.
+lsupd = IPv6(bytes(IPv6() / OSPFv3_Hdr(type=4) /
+                   OSPFv3_LSUpd(lsalist=[OSPFv3_Router_LSA()])))[OSPFv3_LSUpd]
+assert lsupd.lsacount == 1
+assert len(lsupd.lsalist) == 1

@@ -88,3 +88,38 @@ OSPF_LSReq().show2()
 OSPF_LSUpd().show2()
 OSPF_LSAck().show2()
 
+
+= OSPFv3 - build/dissect without header
+
+# The v3 half of the module kept the bare pkt.underlayer.len that the v2 half
+# was fixed for: every one of these raised AttributeError on a layer that has
+# no OSPFv3_Hdr above it yet, which is the state a sub-layer is in while it is
+# being built - and the state fuzz() sees.
+
+OSPFv3_Hello().show2()
+OSPFv3_DBDesc().show2()
+OSPFv3_LSReq().show2()
+OSPFv3_LSUpd().show2()
+OSPFv3_LSAck().show2()
+
+# Carrying content, since an empty layer never reaches the length_from at all.
+
+standalone = [
+    OSPFv3_Hello(neighbors=["1.2.3.4", "5.6.7.8"]),
+    OSPFv3_DBDesc(lsaheaders=[OSPFv3_LSA_Hdr(), OSPFv3_LSA_Hdr(id="2.2.2.2")]),
+    OSPFv3_LSReq(requests=[OSPFv3_LSReq_Item(), OSPFv3_LSReq_Item(id="9.9.9.9")]),
+    OSPFv3_LSUpd(lsalist=[OSPFv3_Router_LSA()]),
+    OSPFv3_LSAck(lsaheaders=[OSPFv3_LSA_Hdr()]),
+]
+for pkt in standalone:
+    assert bytes(pkt.__class__(bytes(pkt))) == bytes(pkt), pkt.name
+
+# Under a header, the length still comes from the header and nothing moved.
+
+for type_, sub in enumerate(standalone, start=1):
+    pkt = IPv6(src="fe80::1", dst="ff02::5") / OSPFv3_Hdr(type=type_) / sub
+    raw = bytes(pkt)
+    dissected = IPv6(raw)
+    assert isinstance(dissected[OSPFv3_Hdr].payload, sub.__class__)
+    assert bytes(dissected[OSPFv3_Hdr].payload) == bytes(sub), sub.name
+    assert dissected[OSPFv3_Hdr].len == len(raw) - 40
