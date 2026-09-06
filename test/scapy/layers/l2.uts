@@ -277,3 +277,157 @@ assert clv2.lladdrtype == 1 # ether
 assert clv2.pkttype == 0 # unicast
 assert clv2.lladdrlen == 6
 assert clv2.src == b'\xaa\x1f\x9c\xc0\x5a\x7e\x00\000'
+
+
+############
+############
++ getmacbyip interface scoping
+
+= getmacbyip resolves on the interface it is given
+~ mock
+
+from unittest import mock
+from scapy.base_classes import _ScopedIP
+from scapy.interfaces import sending_on, sending_iface
+
+# Resolved before network_name is mocked anywhere below, so it stays a name
+HERE = network_name(conf.iface)
+
+def _answer(mac):
+    return Ether() / ARP(op="is-at", hwsrc=mac)
+
+@mock.patch("scapy.layers.l2.network_name", side_effect=lambda x: x)
+@mock.patch("scapy.layers.l2.get_if_addr", side_effect=lambda i: "192.0.2.9")
+@mock.patch("scapy.layers.l2.srp1")
+@mock.patch("scapy.layers.l2.conf.route.route")
+def test_getmacbyip_iface(mock_route, mock_srp1, mock_addr, mock_network_name):
+    # the lookup, left to itself, would pick another link and a gateway on it
+    mock_route.return_value = ("scapy_wrong", "192.0.2.2", "192.0.2.254")
+    mock_srp1.return_value = _answer("05:04:03:02:01:00")
+    conf.netcache.arp_cache.flush()
+    try:
+        mac = getmacbyip("192.0.2.1", iface="scapy0")
+    finally:
+        conf.netcache.arp_cache.flush()
+    assert mac == "05:04:03:02:01:00"
+    # asked on the interface named, not the one the lookup chose
+    assert mock_srp1.call_args[1]["iface"] == "scapy0"
+    # ... and the interface constrained the lookup rather than coming out of it
+    assert mock_route.call_args[1]["dev"] == "scapy0"
+
+test_getmacbyip_iface()
+
+= getmacbyip asks rather than answering broadcast for a named interface
+~ mock
+
+@mock.patch("scapy.layers.l2.network_name", side_effect=lambda x: x)
+@mock.patch("scapy.layers.l2.get_if_addr", side_effect=lambda i: "0.0.0.0")
+@mock.patch("scapy.layers.l2.srp1")
+@mock.patch("scapy.layers.l2.conf.route.route")
+def test_getmacbyip_no_broadcast(mock_route, mock_srp1, mock_addr, mock_nn):
+    # what the lookup hands back for an address it has no route for
+    mock_route.return_value = (conf.loopback_name, "0.0.0.0", "0.0.0.0")
+    mock_srp1.return_value = None
+    conf.netcache.arp_cache.flush()
+    try:
+        unnamed = getmacbyip("192.0.2.1")
+        named = getmacbyip("192.0.2.1", iface="scapy0")
+    finally:
+        conf.netcache.arp_cache.flush()
+    # unchanged for a caller that named no interface
+    assert unnamed == "ff:ff:ff:ff:ff:ff"
+    # with one, nobody answered - which is not a broadcast
+    assert named is None
+    assert mock_srp1.call_count == 1
+    assert mock_srp1.call_args[1]["iface"] == "scapy0"
+    # an interface with no address of its own asks from 0.0.0.0
+    assert mock_srp1.call_args[0][0][ARP].psrc == "0.0.0.0"
+
+test_getmacbyip_no_broadcast()
+
+= getmacbyip keeps the genuine broadcasts, and multicast, as they were
+~ mock
+
+@mock.patch("scapy.layers.l2.srp1")
+def test_getmacbyip_broadcasts(mock_srp1):
+    conf.netcache.arp_cache.flush()
+    try:
+        assert getmacbyip("255.255.255.255") == "ff:ff:ff:ff:ff:ff"
+        assert getmacbyip("255.255.255.255", iface=HERE) == "ff:ff:ff:ff:ff:ff"
+        assert getmacbyip("224.0.0.1") == "01:00:5e:00:00:01"
+        assert getmacbyip("224.0.0.1", iface=HERE) == "01:00:5e:00:00:01"
+        # a directed broadcast of this interface, skipping any that is really
+        #  a multicast address and so answered arithmetically instead
+        for bcast in conf.route.get_if_bcast(HERE):
+            if in4_ismaddr(bcast):
+                continue
+            assert getmacbyip(bcast, iface=HERE) == "ff:ff:ff:ff:ff:ff"
+    finally:
+        conf.netcache.arp_cache.flush()
+    assert not mock_srp1.called
+
+test_getmacbyip_broadcasts()
+
+= getmacbyip keeps the ARP cache interface-scoped
+~ mock
+
+@mock.patch("scapy.layers.l2.network_name", side_effect=lambda x: x)
+@mock.patch("scapy.layers.l2.get_if_addr", side_effect=lambda i: "192.0.2.9")
+@mock.patch("scapy.layers.l2.srp1")
+@mock.patch("scapy.layers.l2.conf.route.route")
+def test_getmacbyip_cache(mock_route, mock_srp1, mock_addr, mock_network_name):
+    def route(ip, dev=None):
+        return dev or "scapy0", "192.0.2.2", "0.0.0.0"
+    def ask(pkt, **kwargs):
+        iface = kwargs["iface"]
+        return _answer("02:00:00:00:00:0a" if iface == "ifA"
+                       else "02:00:00:00:00:0b")
+    mock_route.side_effect = route
+    mock_srp1.side_effect = ask
+    conf.netcache.arp_cache.flush()
+    try:
+        assert getmacbyip("192.0.2.1", iface="ifA") == "02:00:00:00:00:0a"
+        assert getmacbyip("192.0.2.1", iface="ifB") == "02:00:00:00:00:0b"
+        assert getmacbyip("192.0.2.1", iface="ifA") == "02:00:00:00:00:0a"
+        assert mock_srp1.call_count == 2
+        # an answer learned with no interface at all is not served either
+        conf.netcache.arp_cache["192.0.2.3"] = "aa:bb:cc:dd:ee:ff"
+        assert getmacbyip("192.0.2.3", iface="ifA") == "02:00:00:00:00:0a"
+    finally:
+        conf.netcache.arp_cache.flush()
+
+test_getmacbyip_cache()
+
+= getmacbyip falls back to the interface the frame leaves by
+~ mock
+
+@mock.patch("scapy.layers.l2.network_name", side_effect=lambda x: x)
+@mock.patch("scapy.layers.l2.get_if_addr", side_effect=lambda i: "192.0.2.9")
+@mock.patch("scapy.layers.l2.srp1")
+@mock.patch("scapy.layers.l2.conf.route.route")
+def test_getmacbyip_sending(mock_route, mock_srp1, mock_addr, mock_nn):
+    def route(ip, dev=None):
+        return dev or "scapy_wrong", "192.0.2.2", "0.0.0.0"
+    mock_route.side_effect = route
+    mock_srp1.return_value = _answer("05:04:03:02:01:00")
+    scoped = _ScopedIP("192.0.2.1")
+    scoped.scope = "ifB"
+    conf.netcache.arp_cache.flush()
+    try:
+        # no send in progress: unchanged, the lookup chooses
+        getmacbyip("192.0.2.1")
+        assert mock_srp1.call_args[1]["iface"] == "scapy_wrong"
+        with sending_on(conf.iface):
+            conf.netcache.arp_cache.flush()
+            getmacbyip("192.0.2.1")
+            assert mock_srp1.call_args[1]["iface"] == HERE
+            # an iface= and a scoped address both outrank it
+            getmacbyip("192.0.2.1", iface="ifA")
+            assert mock_srp1.call_args[1]["iface"] == "ifA"
+            getmacbyip(scoped)
+            assert mock_srp1.call_args[1]["iface"] == "ifB"
+    finally:
+        conf.netcache.arp_cache.flush()
+    assert sending_iface() is None
+
+test_getmacbyip_sending()

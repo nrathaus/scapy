@@ -54,7 +54,12 @@ from scapy.fields import (
     XShortEnumField,
     XShortField,
 )
-from scapy.interfaces import _GlobInterfaceType, resolve_iface
+from scapy.interfaces import (
+    _GlobInterfaceType,
+    network_name,
+    resolve_iface,
+    sending_iface,
+)
 from scapy.packet import bind_layers, Packet
 from scapy.plist import (
     PacketList,
@@ -135,17 +140,29 @@ _arp_cache = conf.netcache.new_cache("arp_cache", 120)
 
 
 @conf.commands.register
-def getmacbyip(ip, chainCC=0):
-    # type: (str, int) -> Optional[str]
+def getmacbyip(ip, chainCC=0, iface=None):
+    # type: (str, int, Optional[_GlobInterfaceType]) -> Optional[str]
     """
     Returns the destination MAC address used to reach a given IP address.
 
     This will follow the routing table and will issue an ARP request if
     necessary. Special cases (multicast, etc.) are also handled.
 
+    :param iface: resolve on this interface, rather than on the one
+        ``conf.route.route()`` would pick. A caller that already knows which
+        link it is sending on says so here; the gateway is then looked up for
+        that interface instead of the lookup choosing one. Takes precedence
+        over the scope of a ``ScopedIP("192.0.2.1%eth0")`` destination, which
+        in turn outranks the interface a send in progress is using.
+        With an interface named, an address unreachable from it is asked
+        about rather than answered with the broadcast address. A genuine
+        broadcast - the limited one, or the interface's own directed one -
+        still answers as it did.
+
     .. seealso:: :func:`~scapy.layers.inet6.getmacbyip6` for IPv6.
     """
-    # Sanitize the IP
+    # Sanitize the IP, keeping any scope it arrived with
+    scope = ip.scope if isinstance(ip, (Net, _ScopedIP)) else None
     if isinstance(ip, Net):
         ip = next(iter(ip))
     ip = inet_ntoa(inet_aton(ip or "0.0.0.0"))
@@ -155,8 +172,21 @@ def getmacbyip(ip, chainCC=0):
         mac = in4_getnsmac(inet_aton(ip))
         return mac
 
+    if iface is not None:
+        iface = network_name(iface)
+    else:
+        # Nothing said about the link at all, then: a send in progress still
+        # knows the one the frame leaves by, which is the link to resolve on.
+        iface = scope if scope is not None else sending_iface()
+
     # Check the routing table
-    iff, _, gw = conf.route.route(ip)
+    iff, src, gw = conf.route.route(ip, dev=iface)
+
+    if iface is not None:
+        # The caller named the link, so the lookup answered a scoped question
+        # and the interface is not its to choose: one it found no route from
+        # is still the one to ask on.
+        iff = iface
 
     # Limited broadcast
     if ip == "255.255.255.255":
@@ -171,12 +201,21 @@ def getmacbyip(ip, chainCC=0):
         ip = gw
 
     # Check the cache
-    mac = _arp_cache.get(ip)
+    cache_key = "%s%%%s" % (ip, iff) if iface is not None else ip
+    mac = _arp_cache.get(cache_key)
     if mac:
         return mac
 
+    arp = ARP(op="who-has", pdst=ip)
+    if iface is not None:
+        # The request has to come from an address of the link it goes out on,
+        # which the lookup supplies as a side effect of choosing one and
+        # cannot when it was given the link instead. An interface with no
+        # address of its own asks from 0.0.0.0, which is a legitimate probe.
+        arp.psrc = src if src != "0.0.0.0" else get_if_addr(iff)
+
     try:
-        res = srp1(Ether(dst=ETHER_BROADCAST) / ARP(op="who-has", pdst=ip),
+        res = srp1(Ether(dst=ETHER_BROADCAST) / arp,
                    type=ETH_P_ARP,
                    iface=iff,
                    timeout=2,
@@ -188,7 +227,7 @@ def getmacbyip(ip, chainCC=0):
         return None
     if res is not None:
         mac = res.payload.hwsrc
-        _arp_cache[ip] = mac
+        _arp_cache[cache_key] = mac
         return mac
     return None
 
