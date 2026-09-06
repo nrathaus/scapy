@@ -200,6 +200,8 @@ class SSHVersionExchange(Packet):
     ]
 
     def mysummary(self):
+        if not self.lines:
+            return "SSH - Version Exchange", [TCP]
         return "SSH - Version Exchange %s" % plain_str(self.lines[-1]), [TCP]
 
 

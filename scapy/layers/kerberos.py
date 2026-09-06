@@ -2781,6 +2781,10 @@ class Kerberos(ASN1_Packet):
     )
 
     def mysummary(self):
+        if self.root is None:
+            # Built rather than dissected: the choice has not been made yet.
+            # An empty summary lets _do_summary fall back to the class name.
+            return ""
         return self.root.summary()
 
 

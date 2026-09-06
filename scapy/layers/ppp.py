@@ -811,7 +811,12 @@ class PPP_PAP_Response(PPP_PAP):
 
     def mysummary(self):
         res = "PAP-Ack" if self.code == 2 else "PAP-Nak"
-        if self.msg_len > 0:
+        # msg_len is computed at build time, so it is None until then; the
+        # length it would take is the length of the message it counts.
+        msg_len = self.msg_len
+        if msg_len is None:
+            msg_len = len(self.message)
+        if msg_len > 0:
             res += self.sprintf(" msg=%PPP_PAP_Response.message%")
         return res
 

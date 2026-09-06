@@ -218,9 +218,14 @@ class LLTDQueryResp(Packet):
         return pkt + pay
 
     def mysummary(self):
+        # descs_count is only filled in by post_build or by a dissection; on a
+        # constructed packet the count is the length of the list itself.
+        count = self.descs_count
+        if count is None:
+            count = len(self.descs_list)
         return self.sprintf("%d response%s" % (
-            self.descs_count,
-            "s" if self.descs_count > 1 else "")), [LLTD]
+            count,
+            "s" if count > 1 else "")), [LLTD]
 
 
 class LLTDQueryLargeTlv(Packet):

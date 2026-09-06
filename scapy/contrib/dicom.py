@@ -873,14 +873,18 @@ class DICOMImplementationClassUID(Packet):
 class DICOMImplementationVersionName(Packet):
     """DICOM Implementation Version Name sub-item."""
 
-    name = "DICOM Implementation Version Name"
+    # Declared as _name rather than name because this class carries a field of
+    # that name: Packet_metaclass turns a class-body "name" into the default of
+    # the like-named field, which would both leave the class without a display
+    # name and give a StrLenField a str default instead of a bytes one.
+    _name = "DICOM Implementation Version Name"
     fields_desc = [
         StrLenField(
             "name", b"",
             length_from=lambda pkt: (
                 pkt.underlayer.length
                 if pkt.underlayer and pkt.underlayer.length
-                else len(pkt.name)
+                else len(pkt.getfieldval("name"))
             )
         ),
     ]
@@ -889,7 +893,9 @@ class DICOMImplementationVersionName(Packet):
         return b"", s
 
     def mysummary(self) -> str:
-        return "ImplVersion %s" % self.name.decode("ascii").rstrip("\x00")
+        # Packet.name is the display name, so the field has to be read by name.
+        version = self.getfieldval("name")
+        return "ImplVersion %s" % version.decode("ascii", "replace").rstrip("\x00")
 
 
 class DICOMAsyncOperationsWindow(Packet):
