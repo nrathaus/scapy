@@ -18,7 +18,7 @@ import socket
 import struct
 from time import gmtime, strftime
 
-from scapy.arch import get_if_hwaddr
+from scapy.arch import get_if_hwaddr, in6_getifaddr
 from scapy.as_resolvers import AS_resolver_riswhois
 from scapy.base_classes import Gen, _ScopedIP
 from scapy.compat import chb, raw, plain_str, bytes_encode
@@ -61,6 +61,7 @@ from scapy.fields import (
     XIntField,
     XShortField,
 )
+from scapy.interfaces import _GlobInterfaceType, network_name
 from scapy.layers.inet import (
     _ICMPExtensionField,
     _ICMPExtensionPadField,
@@ -88,7 +89,7 @@ from scapy.utils import checksum, strxor
 from scapy.pton_ntop import inet_pton, inet_ntop
 from scapy.utils6 import in6_getnsma, in6_getnsmac, in6_isaddr6to4, \
     in6_isaddrllallnodes, in6_isaddrllallservers, in6_isaddrTeredo, \
-    in6_isllsnmaddr, in6_ismaddr, Net6, teredoAddrExtractInfo
+    in6_islladdr, in6_isllsnmaddr, in6_ismaddr, Net6, teredoAddrExtractInfo
 from scapy.volatile import RandInt, RandShort
 
 # Typing
@@ -145,9 +146,23 @@ def neighsol(addr, src, iface, timeout=1, chainCC=0):
     return res
 
 
+def _in6_getiflladdr(iface):
+    # type: (str) -> Optional[str]
+    """
+    Returns the link-local address of 'iface', or None if it has none.
+
+    A solicitation has to come from an address of the link it goes out on, and
+    an interface without a global address still has this one.
+    """
+    return next(
+        (x[0] for x in in6_getifaddr() if x[2] == iface and in6_islladdr(x[0])),
+        None,
+    )
+
+
 @conf.commands.register
-def getmacbyip6(ip6, chainCC=0):
-    # type: (str, int) -> Optional[str]
+def getmacbyip6(ip6, chainCC=0, iface=None):
+    # type: (str, int, Optional[_GlobInterfaceType]) -> Optional[str]
     """
     Returns the MAC address of the next hop used to reach a given IPv6 address.
 
@@ -156,6 +171,16 @@ def getmacbyip6(ip6, chainCC=0):
 
     (chainCC parameter value ends up being passed to sending function
      used to perform the resolution, if needed)
+
+    :param iface: resolve on this interface, rather than on the one
+        ``conf.route6.route()`` would pick. A caller that already knows which
+        link it is sending on says so here; the next hop is then looked up for
+        that interface instead of the lookup choosing one. Takes precedence
+        over the scope of a ``ScopedIP("fe80::1%eth0")`` destination.
+        With an interface named, an address unreachable from it answers None
+        rather than the broadcast address - a broadcast is not a resolution.
+        Naming the loopback interface still answers the broadcast address,
+        as an unscoped loopback destination does.
 
     .. seealso:: :func:`~scapy.layers.l2.getmacbyip` for IPv4.
     """
@@ -168,16 +193,39 @@ def getmacbyip6(ip6, chainCC=0):
         mac = in6_getnsmac(inet_pton(socket.AF_INET6, ip6))
         return mac
 
-    scope = ip6.scope if isinstance(ip6, _ScopedIP) else None
-    iff, a, nh = conf.route6.route(ip6, dev=scope)
+    if iface is not None:
+        iface = network_name(iface)
+    elif isinstance(ip6, _ScopedIP):
+        # Already a network name: ScopedIP() resolved it on the way in.
+        iface = ip6.scope
+
+    iff, a, nh = conf.route6.route(ip6, dev=iface)
+
+    if iface is not None:
+        # The caller named the link, so the lookup answered a scoped question
+        # and the interface is not its to choose: one it found no route from is
+        # still the one to solicit on.
+        iff = iface
 
     if iff == conf.loopback_name:
+        # Loopback has nothing to solicit. That is what a lookup falling back
+        # to it means for a caller who named nothing, and what naming it means
+        # for a caller who did.
         return "ff:ff:ff:ff:ff:ff"
+
+    if iface is not None and a in (None, "::"):
+        # The lookup found no route from this interface, so no source address
+        # either - and a solicitation still has to come from somewhere. The
+        # interface's own link-local is where.
+        lladdr = _in6_getiflladdr(iff)
+        if lladdr is None:
+            return None
+        a = lladdr
 
     if nh != '::':
         ip6 = nh  # Found next hop
 
-    cache_key = "%s%%%s" % (ip6, iff) if scope is not None else ip6
+    cache_key = "%s%%%s" % (ip6, iff) if iface is not None else ip6
 
     mac = conf.netcache.in6_neighbor.get(cache_key)
     if mac:

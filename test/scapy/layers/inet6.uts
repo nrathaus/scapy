@@ -2046,6 +2046,117 @@ def test_getmacbyip6_scope(mock_route6, mock_neighsol):
 
 test_getmacbyip6_scope()
 
+= IPv6 - getmacbyip6 resolves on the interface it is given
+
+@mock.patch("scapy.layers.inet6.network_name", side_effect=lambda x: x)
+@mock.patch("scapy.layers.inet6.neighsol")
+@mock.patch("scapy.layers.inet6.conf.route6.route")
+def test_getmacbyip6_iface(mock_route6, mock_neighsol, mock_network_name):
+    # route6, left to itself, would pick another link entirely
+    mock_route6.return_value = ("scapy_wrong", "fe80::baca:3aff:fe72:b08b", "::")
+    mock_neighsol.return_value = test_neighsol()
+    conf.netcache.in6_neighbor.flush()
+    try:
+        mac = getmacbyip6("fe80::704:3ff:fe2:100", iface="scapy0")
+    finally:
+        conf.netcache.in6_neighbor.flush()
+    assert mac == "05:04:03:02:01:00"
+    # the interface asked for is the interface solicited on
+    assert mock_neighsol.call_args[0][2] == "scapy0"
+    # ... and it constrained the lookup rather than being an output of it
+    assert mock_route6.call_args[1]["dev"] == "scapy0"
+
+test_getmacbyip6_iface()
+
+= IPv6 - getmacbyip6 solicits rather than answering broadcast for a named interface
+
+@mock.patch("scapy.layers.inet6.network_name", side_effect=lambda x: x)
+@mock.patch("scapy.layers.inet6.in6_getifaddr")
+@mock.patch("scapy.layers.inet6.neighsol")
+@mock.patch("scapy.layers.inet6.conf.route6.route")
+def test_getmacbyip6_no_broadcast(mock_route6, mock_neighsol, mock_getifaddr,
+                                  mock_network_name):
+    # what route6 hands back for an address it has no route for: loopback, and
+    #  no source address to solicit from
+    mock_route6.return_value = (conf.loopback_name, "::", "::")
+    mock_neighsol.return_value = None
+    mock_getifaddr.return_value = [
+        ("2001:db8::1", IPV6_ADDR_GLOBAL, "scapy_other"),
+        ("fe80::1122:33ff:fe44:5566", IPV6_ADDR_LINKLOCAL, "scapy0"),
+    ]
+    conf.netcache.in6_neighbor.flush()
+    try:
+        unnamed = getmacbyip6("2001:db8::1")
+        named = getmacbyip6("2001:db8::1", iface="scapy0")
+    finally:
+        conf.netcache.in6_neighbor.flush()
+    # unchanged for a caller that named no interface
+    assert unnamed == "ff:ff:ff:ff:ff:ff"
+    # with an interface named: asked, nobody answered - which is not a broadcast
+    assert named is None
+    assert mock_neighsol.call_count == 1
+    assert mock_neighsol.call_args[0][2] == "scapy0"
+    # the interface's own link-local stood in as the source
+    assert mock_neighsol.call_args[0][1] == "fe80::1122:33ff:fe44:5566"
+
+test_getmacbyip6_no_broadcast()
+
+= IPv6 - getmacbyip6 leaves a named loopback interface alone
+
+@mock.patch("scapy.layers.inet6.network_name", side_effect=lambda x: x)
+@mock.patch("scapy.layers.inet6.neighsol")
+@mock.patch("scapy.layers.inet6.conf.route6.route")
+def test_getmacbyip6_loopback(mock_route6, mock_neighsol, mock_network_name):
+    mock_route6.return_value = (conf.loopback_name, "::1", "::")
+    conf.netcache.in6_neighbor.flush()
+    try:
+        mac = getmacbyip6("::1", iface=conf.loopback_name)
+    finally:
+        conf.netcache.in6_neighbor.flush()
+    # loopback has no neighbours to ask, named or not
+    assert mac == "ff:ff:ff:ff:ff:ff"
+    assert not mock_neighsol.called
+
+test_getmacbyip6_loopback()
+
+= IPv6 - getmacbyip6 keeps the neighbor cache interface-scoped
+
+@mock.patch("scapy.layers.inet6.network_name", side_effect=lambda x: x)
+@mock.patch("scapy.layers.inet6.neighsol")
+@mock.patch("scapy.layers.inet6.conf.route6.route")
+def test_getmacbyip6_cache(mock_route6, mock_neighsol, mock_network_name):
+    def route(ip6, dev=None):
+        return dev or "scapy0", "fe80::2", "::"
+    def resolve(ip6, src, iface, chainCC=0):
+        mac = "02:00:00:00:00:0a" if iface == "ifA" else "02:00:00:00:00:0b"
+        return Ether(src=mac) / ICMPv6NDOptDstLLAddr(lladdr=mac)
+    mock_route6.side_effect = route
+    mock_neighsol.side_effect = resolve
+    conf.netcache.in6_neighbor.flush()
+    try:
+        # an answer learned on one link is not served to a caller on another
+        assert getmacbyip6("fe80::1", iface="ifA") == "02:00:00:00:00:0a"
+        assert getmacbyip6("fe80::1", iface="ifB") == "02:00:00:00:00:0b"
+        assert getmacbyip6("fe80::1", iface="ifA") == "02:00:00:00:00:0a"
+        assert mock_neighsol.call_count == 2
+        # nor is one learned with no interface at all
+        conf.netcache.in6_neighbor["fe80::3"] = "aa:bb:cc:dd:ee:ff"
+        assert getmacbyip6("fe80::3", iface="ifA") == "02:00:00:00:00:0a"
+    finally:
+        conf.netcache.in6_neighbor.flush()
+
+test_getmacbyip6_cache()
+
+= IPv6 - getmacbyip6 keeps multicast arithmetic and unsolicited
+
+@mock.patch("scapy.layers.inet6.neighsol")
+def test_getmacbyip6_multicast(mock_neighsol):
+    assert getmacbyip6("ff02::1") == "33:33:00:00:00:01"
+    assert getmacbyip6("ff02::1", iface="scapy0") == "33:33:00:00:00:01"
+    assert not mock_neighsol.called
+
+test_getmacbyip6_multicast()
+
 = IPv6 - IPerror6 & UDPerror & _ICMPv6Error & TCPerror
 
 query = IPv6(dst="2001:db8::1", src="2001:db8::2", hlim=1)/UDP()/DNS()
