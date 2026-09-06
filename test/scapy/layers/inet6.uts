@@ -2028,7 +2028,7 @@ def test_getmacbyip6_scope(mock_route6, mock_neighsol):
         return value
     def route(ip6, dev=None):
         return dev, "fe80::2", "::"
-    def resolve(ip6, src, iface, chainCC=0):
+    def resolve(ip6, src, iface, timeout=1, chainCC=0):
         mac = "02:00:00:00:00:0a" if iface == "ifA" else "02:00:00:00:00:0b"
         return Ether(src=mac) / ICMPv6NDOptDstLLAddr(lladdr=mac)
     mock_route6.side_effect = route
@@ -2127,7 +2127,7 @@ test_getmacbyip6_loopback()
 def test_getmacbyip6_cache(mock_route6, mock_neighsol, mock_network_name):
     def route(ip6, dev=None):
         return dev or "scapy0", "fe80::2", "::"
-    def resolve(ip6, src, iface, chainCC=0):
+    def resolve(ip6, src, iface, timeout=1, chainCC=0):
         mac = "02:00:00:00:00:0a" if iface == "ifA" else "02:00:00:00:00:0b"
         return Ether(src=mac) / ICMPv6NDOptDstLLAddr(lladdr=mac)
     mock_route6.side_effect = route
@@ -2210,6 +2210,28 @@ def test_getmacbyip6_precedence(mock_route6, mock_neighsol, mock_network_name):
         conf.netcache.in6_neighbor.flush()
 
 test_getmacbyip6_precedence()
+
+= IPv6 - getmacbyip6 passes a caller's timeout down to the solicitation
+
+@mock.patch("scapy.layers.inet6.network_name", side_effect=lambda x: x)
+@mock.patch("scapy.layers.inet6.neighsol")
+@mock.patch("scapy.layers.inet6.conf.route6.route")
+def test_getmacbyip6_timeout(mock_route6, mock_neighsol, mock_network_name):
+    mock_route6.return_value = ("scapy0", "fe80::baca:3aff:fe72:b08b", "::")
+    mock_neighsol.return_value = test_neighsol()
+    conf.netcache.in6_neighbor.flush()
+    try:
+        # a peer slower than neighsol's own default is waited for
+        getmacbyip6("fe80::704:3ff:fe2:100", iface="scapy0", timeout=7)
+        assert mock_neighsol.call_args[1]["timeout"] == 7
+        conf.netcache.in6_neighbor.flush()
+        # and asking for nothing in particular still waits the 1 second it did
+        getmacbyip6("fe80::704:3ff:fe2:100", iface="scapy0")
+        assert mock_neighsol.call_args[1]["timeout"] == 1
+    finally:
+        conf.netcache.in6_neighbor.flush()
+
+test_getmacbyip6_timeout()
 
 = IPv6 - SuperSocket.send declares the interface the build is for
 

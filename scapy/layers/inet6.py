@@ -165,8 +165,8 @@ def _in6_getiflladdr(iface):
 
 
 @conf.commands.register
-def getmacbyip6(ip6, chainCC=0, iface=None):
-    # type: (str, int, Optional[_GlobInterfaceType]) -> Optional[str]
+def getmacbyip6(ip6, chainCC=0, iface=None, timeout=1):
+    # type: (str, int, Optional[_GlobInterfaceType], Optional[int]) -> Optional[str]  # noqa: E501
     """
     Returns the MAC address of the next hop used to reach a given IPv6 address.
 
@@ -185,6 +185,10 @@ def getmacbyip6(ip6, chainCC=0, iface=None):
         rather than the broadcast address - a broadcast is not a resolution.
         Naming the loopback interface still answers the broadcast address,
         as an unscoped loopback destination does.
+    :param timeout: how long to wait for the solicitation to be answered,
+        in seconds; ``None`` waits indefinitely. A peer slower than the
+        default leaves an unanswered solicitation behind, which a caller
+        judging liveness reads as the target being gone.
 
     .. seealso:: :func:`~scapy.layers.l2.getmacbyip` for IPv4.
     """
@@ -240,7 +244,7 @@ def getmacbyip6(ip6, chainCC=0, iface=None):
     if mac:
         return mac
 
-    res = neighsol(ip6, a, iff, chainCC=chainCC)
+    res = neighsol(ip6, a, iff, timeout=timeout, chainCC=chainCC)
 
     if res is not None:
         if ICMPv6NDOptDstLLAddr in res:

@@ -140,8 +140,8 @@ _arp_cache = conf.netcache.new_cache("arp_cache", 120)
 
 
 @conf.commands.register
-def getmacbyip(ip, chainCC=0, iface=None):
-    # type: (str, int, Optional[_GlobInterfaceType]) -> Optional[str]
+def getmacbyip(ip, chainCC=0, iface=None, timeout=2):
+    # type: (str, int, Optional[_GlobInterfaceType], Optional[int]) -> Optional[str]  # noqa: E501
     """
     Returns the destination MAC address used to reach a given IP address.
 
@@ -158,6 +158,10 @@ def getmacbyip(ip, chainCC=0, iface=None):
         about rather than answered with the broadcast address. A genuine
         broadcast - the limited one, or the interface's own directed one -
         still answers as it did.
+    :param timeout: how long to wait for the ARP request to be answered,
+        in seconds; ``None`` waits indefinitely. A peer slower than the
+        default leaves an unanswered request behind, which a caller judging
+        liveness reads as the target being gone.
 
     .. seealso:: :func:`~scapy.layers.inet6.getmacbyip6` for IPv6.
     """
@@ -218,7 +222,7 @@ def getmacbyip(ip, chainCC=0, iface=None):
         res = srp1(Ether(dst=ETHER_BROADCAST) / arp,
                    type=ETH_P_ARP,
                    iface=iff,
-                   timeout=2,
+                   timeout=timeout,
                    verbose=0,
                    chainCC=chainCC,
                    nofilter=1)
