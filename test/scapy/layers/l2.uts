@@ -455,3 +455,98 @@ def test_getmacbyip_timeout(mock_route, mock_srp1, mock_addr, mock_network_name)
         conf.netcache.arp_cache.flush()
 
 test_getmacbyip_timeout()
+
+= Neighbor.resolve carries the link the caller names down to the resolver
+~ mock
+
+@mock.patch("scapy.layers.l2.network_name", side_effect=lambda x: x)
+@mock.patch("scapy.layers.l2.get_if_addr", side_effect=lambda i: "192.0.2.9")
+@mock.patch("scapy.layers.l2.srp1")
+@mock.patch("scapy.layers.l2.conf.route.route")
+def test_neighbor_resolve_iface(mock_route, mock_srp1, mock_addr, mock_nn):
+    def route(ip, dev=None):
+        return dev or "scapy_wrong", "192.0.2.2", "0.0.0.0"
+    mock_route.side_effect = route
+    mock_srp1.return_value = _answer("05:04:03:02:01:00")
+    conf.netcache.arp_cache.flush()
+    try:
+        # the registered resolver, and the same question routed through a
+        #  Dot1Q that delegates it - both reach the link that was named
+        for payload in (IP(dst="192.0.2.1"), Dot1Q() / IP(dst="192.0.2.1")):
+            conf.netcache.arp_cache.flush()
+            conf.neighbor.resolve(Ether(), payload, iface="ifA")
+            assert mock_srp1.call_args[1]["iface"] == "ifA"
+        # naming a link does not make an ARP who-has ask anything
+        mock_srp1.reset_mock()
+        assert conf.neighbor.resolve(
+            Ether(), ARP(op=1, pdst="192.0.2.1"), iface="ifA"
+        ) == "ff:ff:ff:ff:ff:ff"
+        assert not mock_srp1.called
+        # nothing named: the lookup chooses, as it did before
+        conf.netcache.arp_cache.flush()
+        conf.neighbor.resolve(Ether(), IP(dst="192.0.2.1"))
+        assert mock_srp1.call_args[1]["iface"] == "scapy_wrong"
+    finally:
+        conf.netcache.arp_cache.flush()
+
+test_neighbor_resolve_iface()
+
+= Neighbor.resolve still calls a resolver written before there was an interface
+~ mock
+
+def test_neighbor_resolve_legacy():
+    def old_style(l2, l3):
+        return "de:ad:be:ef:00:01"
+    def new_style(l2, l3, iface=None):
+        return "de:ad:be:ef:00:02" if iface is None else "de:ad:be:ef:00:03"
+    def by_keywords(l2, l3, **kwargs):
+        return "de:ad:be:ef:00:%02d" % (4 if kwargs.get("iface") else 5)
+    try:
+        conf.neighbor.register_l3(Ether, Raw, old_style)
+        assert conf.neighbor.resolve(Ether(), Raw()) == "de:ad:be:ef:00:01"
+        # a link it cannot be told about is dropped, not raised over
+        assert conf.neighbor.resolve(
+            Ether(), Raw(), iface="ifA"
+        ) == "de:ad:be:ef:00:01"
+        # one that can be told takes it, and still answers without
+        conf.neighbor.register_l3(Ether, Raw, new_style)
+        assert conf.neighbor.resolve(Ether(), Raw()) == "de:ad:be:ef:00:02"
+        assert conf.neighbor.resolve(
+            Ether(), Raw(), iface="ifA"
+        ) == "de:ad:be:ef:00:03"
+        # and one that takes it only through **kwargs
+        conf.neighbor.register_l3(Ether, Raw, by_keywords)
+        assert conf.neighbor.resolve(
+            Ether(), Raw(), iface="ifA"
+        ) == "de:ad:be:ef:00:04"
+    finally:
+        del conf.neighbor.resolvers[Ether, Raw]
+        del conf.neighbor.scoped[Ether, Raw]
+
+test_neighbor_resolve_legacy()
+
+= sendpfast declares the interface it hands to tcpreplay
+~ mock
+
+def test_sendpfast_declares_iface():
+    # A real interface, because sendpfast names it to tcpreplay too and an
+    #  unresolvable one never reaches the build. Loopback is the one every
+    #  host has that is not the one an unnamed send would fall back to.
+    named = conf.loopback_name
+    if network_name(conf.iface) == named:
+        return  # nothing to tell apart on a loopback-only host
+    declared = []
+    def record(fname, pkt, *args, **kwargs):
+        # Building the pcap is where an unset L2 destination is resolved
+        declared.append(sending_iface())
+    with mock.patch("scapy.sendrecv.wrpcap", side_effect=record), \
+            mock.patch("scapy.sendrecv.subprocess.Popen") as popen:
+        popen.return_value.communicate.return_value = (b"", b"")
+        sendpfast(Ether() / IP(dst="192.0.2.1"), iface=named)
+        sendpfast(Ether() / IP(dst="192.0.2.1"))
+    # the interface tcpreplay is told to use is the one the frames were
+    #  built for, and an unnamed one still falls back to conf.iface
+    assert declared == [named, network_name(conf.iface)]
+    assert sending_iface() is None
+
+test_sendpfast_declares_iface()

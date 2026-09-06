@@ -22,6 +22,7 @@ from scapy.error import warning
 from scapy.interfaces import (
     network_name,
     resolve_iface,
+    sending_on,
     NetworkInterface,
 )
 from scapy.packet import Packet
@@ -578,7 +579,11 @@ def sendpfast(x: _PacketIterable,
 
     f = get_temp_file()
     argv.append(f)
-    wrpcap(f, x)
+    with sending_on(iface):
+        # An unset L2 destination is resolved here, while the pcap tcpreplay
+        # will send is written - the last point at which the interface the
+        # frames leave by is still known.
+        wrpcap(f, x)
     results = None
     with ContextManagerSubprocess(conf.prog.tcpreplay):
         try:

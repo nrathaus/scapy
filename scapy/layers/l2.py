@@ -7,6 +7,7 @@
 Classes and functions for layer 2 protocols.
 """
 
+import inspect
 import itertools
 import socket
 import struct
@@ -105,26 +106,67 @@ if conf.route is None:
 
 
 # type definitions
-_ResolverCallable = Callable[[Packet, Packet], Optional[str]]
+# The interface is optional and passed by keyword: a resolver written before
+# one could be named takes (l2, l3) alone, and register_l3() still accepts it.
+_ResolverCallable = Callable[..., Optional[str]]
 
 #################
 #  Tools        #
 #################
 
 
+def _resolver_takes_iface(resolve_method):
+    # type: (_ResolverCallable) -> bool
+    """
+    Whether a registered resolver can be told which link to resolve on.
+
+    Resolvers took ``(l2, l3)`` alone until an interface could be named, and
+    out-of-tree code still registers that shape. Asked once, when the resolver
+    is registered, rather than on every frame built.
+    """
+    try:
+        parameters = inspect.signature(resolve_method).parameters
+    except (TypeError, ValueError):
+        # A builtin or C callable has no signature to read. It cannot have been
+        # written against a parameter that did not exist yet, so read it as the
+        # older shape: guessing the other way costs a TypeError per frame.
+        return False
+    if "iface" in parameters:
+        return True
+    return any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+
+
 class Neighbor:
     def __init__(self):
         # type: () -> None
         self.resolvers = {}  # type: Dict[Tuple[Type[Packet], Type[Packet]], _ResolverCallable] # noqa: E501
+        self.scoped = {}  # type: Dict[Tuple[Type[Packet], Type[Packet]], bool]
 
     def register_l3(self, l2, l3, resolve_method):
         # type: (Type[Packet], Type[Packet], _ResolverCallable) -> None
         self.resolvers[l2, l3] = resolve_method
+        self.scoped[l2, l3] = _resolver_takes_iface(resolve_method)
 
-    def resolve(self, l2inst, l3inst):
-        # type: (Packet, Packet) -> Optional[str]
+    def resolve(self, l2inst, l3inst, iface=None):
+        # type: (Packet, Packet, Optional[_GlobInterfaceType]) -> Optional[str]
+        """
+        Resolves the L2 destination address a packet should be sent to.
+
+        :param iface: resolve on this link, rather than on the one the routing
+            table would pick. A caller that already knows which interface it is
+            sending on says so here, and it outranks the scope of a scoped
+            destination. Left unset, an interface declared for the build by
+            :func:`~scapy.interfaces.sending_on` is still used.
+            A resolver registered before this parameter existed cannot be
+            scoped, and is called as it was.
+        """
         k = l2inst.__class__, l3inst.__class__
         if k in self.resolvers:
+            if self.scoped.get(k):
+                return self.resolvers[k](l2inst, l3inst, iface=iface)
             return self.resolvers[k](l2inst, l3inst)
         return None
 
@@ -389,12 +431,18 @@ class LLC(Packet):
                    ByteField("ctrl", 0)]
 
 
-def l2_register_l3(l2: Packet, l3: Packet) -> Optional[str]:
+def l2_register_l3(
+    l2: Packet,
+    l3: Packet,
+    iface: Optional[_GlobInterfaceType] = None,
+) -> Optional[str]:
     """
     Delegates resolving the default L2 destination address to the payload of L3.
+
+    :param iface: the link to resolve on, passed down with the question.
     """
     neighbor = conf.neighbor  # type: Neighbor
-    return neighbor.resolve(l2, l3.payload)
+    return neighbor.resolve(l2, l3.payload, iface=iface)
 
 
 conf.neighbor.register_l3(Ether, LLC, l2_register_l3)
@@ -637,9 +685,18 @@ class ARP(Packet):
         return self.sprintf("ARP %op% %psrc% > %pdst%")
 
 
-def l2_register_l3_arp(l2: Packet, l3: Packet) -> Optional[str]:
+def l2_register_l3_arp(
+    l2: Packet,
+    l3: Packet,
+    iface: Optional[_GlobInterfaceType] = None,
+) -> Optional[str]:
     """
     Resolves the default L2 destination address when ARP is used.
+
+    :param iface: resolve on this link rather than the one the routing table
+        would pick. Left unset, the address's own scope and then the interface
+        of a send in progress still answer, as they do for a direct
+        :func:`getmacbyip` call.
     """
     if l3.op == 1:  # who-has
         return "ff:ff:ff:ff:ff:ff"
@@ -651,10 +708,10 @@ def l2_register_l3_arp(l2: Packet, l3: Packet) -> Optional[str]:
     # Need ARP request to send ARP request...
     plen = l3.get_field("pdst").i2len(l3, l3.pdst)
     if plen == 4:
-        return getmacbyip(l3.pdst)
+        return getmacbyip(l3.pdst, iface=iface)
     elif plen == 32:
         from scapy.layers.inet6 import getmacbyip6
-        return getmacbyip6(l3.pdst)
+        return getmacbyip6(l3.pdst, iface=iface)
     # Can't even do that
     log_runtime.warning(
         "You should be providing the Ethernet destination mac when sending this "

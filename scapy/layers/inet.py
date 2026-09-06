@@ -43,6 +43,7 @@ from scapy.layers.l2 import (
 )
 from scapy.compat import raw, chb, bytes_encode, Optional
 from scapy.config import conf
+from scapy.interfaces import _GlobInterfaceType
 from scapy.fields import (
     BitEnumField,
     BitField,
@@ -1416,11 +1417,17 @@ conf.l3types.register(ETH_P_IP, IP)
 conf.l3types.register_num2layer(ETH_P_ALL, IP)
 
 
-def inet_register_l3(l2, l3):
+def inet_register_l3(l2, l3, iface=None):
+    # type: (Packet, Packet, Optional[_GlobInterfaceType]) -> Optional[str]
     """
     Resolves the default L2 destination address when IP is used.
+
+    :param iface: resolve on this link, rather than on the one
+        ``conf.route.route()`` would pick. Left unset, the scope of a scoped
+        destination and then the interface of a send in progress still answer,
+        as they do for a direct :func:`~scapy.layers.l2.getmacbyip` call.
     """
-    return getmacbyip(l3.dst)
+    return getmacbyip(l3.dst, iface=iface)
 
 
 conf.neighbor.register_l3(Ether, IP, inet_register_l3)

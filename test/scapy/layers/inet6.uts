@@ -2265,6 +2265,57 @@ def test_send_declares_iface(mock_route6, mock_neighsol):
 
 test_send_declares_iface()
 
+= IPv6 - inet6_register_l3 resolves on the link the question names
+
+@mock.patch("scapy.layers.inet6.network_name", side_effect=lambda x: x)
+@mock.patch("scapy.layers.inet6.neighsol")
+@mock.patch("scapy.layers.inet6.conf.route6.route")
+def test_inet6_register_l3_iface(mock_route6, mock_neighsol, mock_network_name):
+    from scapy.layers.inet6 import inet6_register_l3
+    def route(ip6, dev=None):
+        return dev or "scapy_wrong", "fe80::2", "::"
+    mock_route6.side_effect = route
+    mock_neighsol.return_value = test_neighsol()
+    conf.netcache.in6_neighbor.flush()
+    try:
+        # the resolver itself: the interface the implicit path had nowhere
+        #  to put now arrives with the question
+        inet6_register_l3(Ether(), IPv6(dst="fe80::1"), iface="ifA")
+        assert mock_neighsol.call_args[0][2] == "ifA"
+        # and through the registry, which is the path DestMACField.i2m takes
+        conf.netcache.in6_neighbor.flush()
+        conf.neighbor.resolve(Ether(), IPv6(dst="fe80::1"), iface="ifB")
+        assert mock_neighsol.call_args[0][2] == "ifB"
+        # Named nothing: the destination's own scope answers first, then the
+        #  interface of a send in progress - unchanged by the above. Both need
+        #  real interface names, since a scope is resolved on the way in.
+        here = network_name(conf.iface)
+        if here == conf.loopback_name:
+            return  # nothing to tell apart on a loopback-only host
+        # a scope outranks the link the frame leaves by, which on its own
+        #  would short-circuit to a broadcast having asked nobody
+        conf.netcache.in6_neighbor.flush()
+        mock_neighsol.reset_mock()
+        with sending_on(conf.loopback_name):
+            conf.neighbor.resolve(Ether(), IPv6(dst="fe80::1%" + here))
+        assert mock_neighsol.call_count == 1
+        assert mock_neighsol.call_args[0][2] == here
+        # and with no scope either, the link the frame leaves by
+        conf.netcache.in6_neighbor.flush()
+        mock_neighsol.reset_mock()
+        with sending_on(conf.iface):
+            conf.neighbor.resolve(Ether(), IPv6(dst="fe80::1"))
+            assert mock_neighsol.call_args[0][2] == here
+            # which a named link still outranks
+            conf.netcache.in6_neighbor.flush()
+            conf.neighbor.resolve(Ether(), IPv6(dst="fe80::1"), iface="ifA")
+        assert mock_neighsol.call_count == 2
+        assert mock_neighsol.call_args[0][2] == "ifA"
+    finally:
+        conf.netcache.in6_neighbor.flush()
+
+test_inet6_register_l3_iface()
+
 = IPv6 - IPerror6 & UDPerror & _ICMPv6Error & TCPerror
 
 query = IPv6(dst="2001:db8::1", src="2001:db8::2", hlim=1)/UDP()/DNS()

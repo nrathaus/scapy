@@ -632,7 +632,8 @@ assert isinstance(pkt, DNS) and isinstance(pkt.payload, NoPayload)
 
 from unittest import mock
 
-def _err(*_):
+def _err(*_, **__):
+    # keywords too: the resolver hands the link down with the question
     raise ValueError
 
 with mock.patch("scapy.layers.l2.getmacbyip", side_effect=_err):

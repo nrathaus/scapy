@@ -589,11 +589,21 @@ class IPv46(IP, IPv6):
         return IP
 
 
-def inet6_register_l3(l2, l3):
+def inet6_register_l3(l2, l3, iface=None):
+    # type: (Packet, Packet, Optional[_GlobInterfaceType]) -> Optional[str]
     """
     Resolves the default L2 destination address when IPv6 is used.
+
+    :param iface: resolve on this link, rather than on the one
+        ``conf.route6.route()`` would pick. This is the interface the implicit
+        path had nowhere to put: an unset ``Ether.dst`` is resolved during the
+        build, and until the question could carry a link the answer could name
+        a different one from the one the frame leaves by.
+        Left unset, the scope of a scoped destination and then the interface
+        of a send in progress still answer, as they do for a direct
+        :func:`getmacbyip6` call.
     """
-    return getmacbyip6(l3.dst)
+    return getmacbyip6(l3.dst, iface=iface)
 
 
 conf.neighbor.register_l3(Ether, IPv6, inet6_register_l3)
