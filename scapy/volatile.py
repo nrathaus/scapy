@@ -586,7 +586,114 @@ def _spread_unused(used, low, high, room, enumerable_span=1024):
     return filled
 
 
-class RandEnumWalk(RandNum):
+class RandValueWalk(RandNum):
+    """State-driven walk over a list of values, whatever those values are
+
+    The plain list walk that ``RandEnumWalk``'s first block already is, with
+    the enum arithmetic lifted off it. A caller that has worked out which
+    values are worth sending - byte strings, ``None``, anything - hands them
+    over and gets a volatile the fuzzing machinery can drive:
+
+    * ``state_pos`` is an *index* into ``values`` rather than the value
+      itself, so ``min``/``max`` bound the list rather than a numeric range,
+      exactly as they do for ``RandEnumWalk`` and ``RandLengthWalk``;
+    * ``exhaustive`` is set, so ``Packet._advance_state_pos()`` steps the list
+      one entry at a time instead of striding ``max_samples_per_field`` over
+      it - a list assembled by hand is already the interesting set, and
+      sampling it down would drop the entries it was assembled for;
+    * an unset ``state_pos`` renders ``values[0]``, the same contract the rest
+      of the module keeps for a field that is not the one being fuzzed right
+      now.
+
+    ``RandChoice`` cannot serve this purpose, though it also takes an
+    arbitrary list: it is a ``RandField`` rather than a ``RandNum``, so it
+    carries no ``state_pos``, no ``min``/``max`` and no ``exhaustive``, and
+    ``_fix()`` draws with ``random.choice()``. ``forward()`` cannot step it,
+    and no value in it is guaranteed to be sent at all.
+
+    There is no budget here, because there is nothing to size: the list is
+    what the caller gave and it is sent whole. ``plan_budget()`` is
+    ``RandEnumWalk``'s, where a budget bounds the undefined values it invents
+    on top of the declared ones.
+
+    Inherited from ``RandNum`` and meaningless when the values are not
+    numbers: ``__int__``, ``__add__`` and the rest of the arithmetic. They are
+    the price of the walk contract, which is defined on ``RandNum``.
+    """
+
+    # See the class docstring: the list is the interesting set already.
+    exhaustive = True
+
+    def __init__(self, values):
+        # type: (List[Any]) -> None
+        if not values:
+            raise TypeError("RandValueWalk needs at least one value")
+        self._field_default = values[0]  # type: Any
+        self._default_index = 0
+        self._index_values(list(values))
+
+    def _index_values(self, values):
+        # type: (List[Any]) -> None
+        """Point ``state_pos`` at ``values`` and re-resolve the default on it
+
+        Separate from ``__init__()`` because ``RandEnumWalk`` rebuilds its list
+        whenever the sampling budget changes, and every index into it has to
+        follow: ``min``/``max``, and the default's position.
+        """
+        self.values = values
+        # Indexes the value list directly: 0 .. len(values) - 1. This used to
+        # start at -1, because Packet.forward() advanced a field before
+        # reading it and so emitted min + 1 .. max, never min - which would
+        # have made values[0] unreachable. Packet._advance_state_pos() now
+        # emits a cycle's own starting position first, for plain integer
+        # fields as much as for this one, so the extra index below the list is
+        # no longer needed. _fix() still clamps, so a read before the first
+        # advance renders values[0] rather than raising.
+        RandNum.__init__(self, 0, len(self.values) - 1)
+        # Re-resolve the field default against the new list.
+        self.default = self._field_default
+
+    # Everywhere else in this module 'default' is the field's own default
+    # value, and fuzz() assigns it that way ('rnd.default = f.default'). But
+    # Packet.forward() also assigns 'default' straight into 'state_pos' when it
+    # resets an exhausted field, and here state_pos is an index into 'values',
+    # not a value. Keep both meanings: the setter records the real default, the
+    # getter hands the walk machinery the matching index.
+    @property
+    def default(self):
+        # type: () -> int
+        return self._default_index
+
+    @default.setter
+    def default(self, value):
+        # type: (Any) -> None
+        self._field_default = value
+        try:
+            self._default_index = self.values.index(value)
+        except (ValueError, TypeError):
+            # A default the list doesn't carry (for an enum, one it doesn't
+            # declare, or that got filtered out for not fitting the field's
+            # width) - start the walk at the top of the list instead.
+            self._default_index = 0
+
+    def _command_args(self):
+        # type: () -> str
+        return "values=%r" % (self.values,)
+
+    def _fix(self):
+        # type: () -> Any
+        if self.state_pos is None:
+            # Not the field being fuzzed right now - same contract as
+            # RandNum._fix(): build with the value the packet would have had.
+            return self._field_default
+
+        # 'max' is len(values) - 1 and Packet.forward() stops a field as soon
+        # as state_pos passes max, so an out-of-range index is a bug rather
+        # than something to wrap around into an unrelated entry.
+        return self.values[min(max(self.state_pos, 0), len(self.values) - 1)]
+
+
+class RandEnumWalk(RandValueWalk):
     """State-driven walk over an enum field's own declared values, then the rest
 
     ``Field.randval()`` dispatches on the struct format character alone, so an
@@ -615,16 +722,14 @@ class RandEnumWalk(RandNum):
     walk that sent *only* the declared values would trade one blind spot for
     another - a byte enum field went from 114 undefined values per field to 6.
 
-    Unlike the rest of the ``Rand*`` family, ``state_pos`` here is an *index*
-    into ``values`` rather than the value itself, so ``min``/``max`` bound the
-    list and not the field's integer width.
+    Block 1 is a plain list walk and nothing more, so it is
+    ``RandValueWalk``: this is that class's numeric specialisation, adding
+    blocks 2 and 3 on top of it. Everything the walk contract is made of -
+    ``state_pos`` as an *index* into ``values`` rather than the value itself,
+    ``min``/``max`` bounding the list rather than the field's integer width,
+    ``exhaustive``, the two meanings of ``default`` - lives there and is
+    unchanged by the two blocks added here.
     """
-
-    # Packet._advance_state_pos() reads this: the value list is already sized to
-    # the sampling budget, so it must be stepped one at a time. Striding it -
-    # which is what max_samples_per_field means for an integer field - would
-    # sample away the declared values this exists to send.
-    exhaustive = True
 
     # Above this span, listing the not-yet-used values costs more than it buys:
     # 'used' is sparse in a 16-bit-or-wider range, so proportional striding
@@ -634,15 +739,18 @@ class RandEnumWalk(RandNum):
     def __init__(self, declared, guaranteed, low, high, budget=128):
         # type: (List[int], List[int], int, int, int) -> None
         if not declared:
+            # Same refusal as RandValueWalk's, named for the argument the
+            # caller actually passed: an enum walk over nothing declared is a
+            # field that should have been left to the integer walk.
             raise TypeError("RandEnumWalk needs at least one declared value")
         self.declared = list(declared)
         self.guaranteed = list(guaranteed)
         self.low = low
         self.high = high
-        self.values = []  # type: List[Any]
-        self._field_default = self.declared[0]  # type: Any
-        self._default_index = 0
         self._budget = None  # type: Optional[int]
+        # Block 1 on its own, which is the whole of RandValueWalk - and which
+        # settles the field default, since declared[0] is values[0] either way.
+        RandValueWalk.__init__(self, self.declared)
         self.plan_budget(budget)
 
     def plan_budget(self, budget):
@@ -666,18 +774,9 @@ class RandEnumWalk(RandNum):
 
         self.values = self.declared + self.guaranteed
         self.values.extend(self._undefined_fill(budget))
-        # Indexes the value list directly: 0 .. len(values) - 1. This used to
-        # start at -1, because Packet.forward() advanced a field before
-        # reading it and so emitted min + 1 .. max, never min - which would
-        # have made values[0], the first declared value, unreachable.
-        # Packet._advance_state_pos() now emits a cycle's own starting
-        # position first, for plain integer fields as much as for this one,
-        # so the extra index below the list is no longer needed. _fix()
-        # still clamps, so a read before the first advance renders
-        # values[0] rather than raising.
-        RandNum.__init__(self, 0, len(self.values) - 1)
-        # Re-resolve the field default against the new list.
-        self.default = self._field_default
+        # min/max and the default's position both index the list, so they are
+        # re-resolved every time the list is rebuilt.
+        self._index_values(self.values)
 
     def _undefined_fill(self, budget):
         # type: (int) -> List[int]
@@ -694,46 +793,11 @@ class RandEnumWalk(RandNum):
             budget - len(self.values), self._ENUMERABLE_SPAN,
         )
 
-    # Everywhere else in this module 'default' is the field's own default
-    # value, and fuzz() assigns it that way ('rnd.default = f.default'). But
-    # Packet.forward() also assigns 'default' straight into 'state_pos' when it
-    # resets an exhausted field, and here state_pos is an index into 'values',
-    # not a value. Keep both meanings: the setter records the real default, the
-    # getter hands the walk machinery the matching index.
-    @property
-    def default(self):
-        # type: () -> int
-        return self._default_index
-
-    @default.setter
-    def default(self, value):
-        # type: (Any) -> None
-        self._field_default = value
-        try:
-            self._default_index = self.values.index(value)
-        except (ValueError, TypeError):
-            # A default the enum doesn't declare (or that got filtered out for
-            # not fitting the field's width) - start the walk at the top of the
-            # list instead, which is the first declared value.
-            self._default_index = 0
-
     def _command_args(self):
         # type: () -> str
         return "declared=%r, guaranteed=%r, low=%r, high=%r" % (
             self.declared, self.guaranteed, self.low, self.high,
         )
-
-    def _fix(self):
-        # type: () -> Any
-        if self.state_pos is None:
-            # Not the field being fuzzed right now - same contract as
-            # RandNum._fix(): build with the value the packet would have had.
-            return self._field_default
-
-        # 'max' is len(values) - 1 and Packet.forward() stops a field as soon
-        # as state_pos passes max, so an out-of-range index is a bug rather
-        # than something to wrap around into an unrelated enum entry.
-        return self.values[min(max(self.state_pos, 0), len(self.values) - 1)]
 
 
 class RandLengthWalk(RandNum):

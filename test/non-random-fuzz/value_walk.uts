@@ -1,0 +1,211 @@
+% Regression tests for the sequential (non-random) fuzzing state machine
+% A state-driven walk over a list of values that are not integers
+
+# RandEnumWalk was the only state-driven list walk in scapy.volatile, and it is
+# typed for integers throughout: constructed as (declared, guaranteed, low,
+# high, budget), it invents the guaranteed edges and the budget fill on top of
+# the list it is handed. A caller holding a list of byte strings, or one
+# carrying None, had to switch two of its three blocks off to borrow it:
+#
+#     RandEnumWalk(values)              TypeError: missing 3 arguments
+#     RandEnumWalk(values, [], 0, -1)   works: an empty range leaves the
+#                                       undefined fill nothing to draw
+#     RandEnumWalk(values, [], 0,  0)   appends the integer 0
+#     RandEnumWalk(values, [], 0,  5)   appends 0, 1, 2, 3, 4, 5
+#
+# The working call was one argument away from putting an integer into a list of
+# byte strings, and nothing at the call site said so. RandChoice is not the
+# answer either: it is a RandField rather than a RandNum, so it carries no
+# state_pos, no min/max and no exhaustive, and _fix() is random.choice() - so
+# forward() cannot step it and no value in it is guaranteed to be sent at all.
+#
+# RandValueWalk is the plain list walk that RandEnumWalk's first block already
+# was, with the enum arithmetic lifted off it. RandEnumWalk is now its numeric
+# specialisation, which is why the last test below is a control: blocks 2 and 3
+# have to go on behaving exactly as they did.
+
+############
+############
++ RandValueWalk walks a list of values that are not integers
+
+= It carries exactly the values it was given, at any sampling budget
+~ fuzzing volatile
+
+from scapy.volatile import RandValueWalk
+
+VALUES = [b"GET", b"", None, b"GET GET"]
+
+# There is no budget to size: the list is what the caller gave and it is sent
+# whole. Nothing may be appended to it, which is what borrowing the enum walk
+# could not promise - RandEnumWalk(VALUES, [], 0, 5) carries nine values.
+walk = RandValueWalk(list(VALUES))
+assert walk.values == VALUES, walk.values
+
+# Only RandEnumWalk sizes a list to a budget, because only it invents values to
+# fill one. Packet.initialize_volatile_field() probes for plan_budget() on the
+# type, so a walk without one is simply left alone.
+assert not hasattr(RandValueWalk, "plan_budget")
+
+= It meets the walk contract: exhaustive, indexed by state_pos, values[0] idle
+~ fuzzing volatile
+
+from scapy.volatile import RandNum, RandValueWalk
+
+VALUES = [b"GET", b"", None, b"GET GET"]
+walk = RandValueWalk(list(VALUES))
+
+# A RandNum, so forward() can step it - the contract RandChoice cannot meet.
+assert isinstance(walk, RandNum)
+
+# The list is the interesting set already, so _advance_state_pos() steps it one
+# entry at a time instead of striding max_samples_per_field over it.
+assert walk.exhaustive is True
+
+# state_pos is an index into 'values', not a value, so min/max bound the list.
+assert (walk.min, walk.max) == (0, len(VALUES) - 1), (walk.min, walk.max)
+
+# Every index renders its own entry...
+for index, value in enumerate(VALUES):
+    walk.state_pos = index
+    assert walk._fix() == value, index
+
+# ...and out of range clamps rather than wrapping into an unrelated entry:
+# forward() stops a field as soon as state_pos passes max, so an index past the
+# end is a bug rather than something to fold back over the list.
+walk.state_pos = len(VALUES) + 10
+assert walk._fix() == VALUES[-1]
+
+# An unset state_pos means "not the field being fuzzed right now", and renders
+# the value the packet would otherwise have had - values[0] until told else.
+walk.state_pos = None
+assert walk._fix() == VALUES[0]
+
+= 'default' keeps the two meanings RandEnumWalk gives it
+~ fuzzing volatile
+
+from scapy.volatile import RandValueWalk
+
+VALUES = [b"GET", b"", None, b"GET GET"]
+walk = RandValueWalk(list(VALUES))
+
+# fuzz() assigns the field's own default value in ('rnd.default = f.default'),
+# but Packet.forward() reads 'default' straight back out into state_pos when it
+# resets an exhausted field - and state_pos is an index. So the setter records
+# the value and the getter hands back its position.
+assert walk.default == 0
+walk.default = None
+assert walk.default == 2, walk.default
+walk.state_pos = None
+assert walk._fix() is None
+
+# None is a value of the list like any other here, which is the point of it
+# being on the list: "whatever this field would otherwise compute" is one entry
+# of the walk rather than a case of its own.
+walk.state_pos = 2
+assert walk._fix() is None
+
+# A default the list does not carry starts the walk at the top of the list,
+# rather than raising - the same fallback the enum walk uses for a default that
+# got filtered out for not fitting the field's width.
+walk.default = b"not in the list"
+assert walk.default == 0
+walk.state_pos = None
+assert walk._fix() == b"not in the list"
+
+= An empty list is refused, as the enum walk refuses one
+~ fuzzing volatile
+
+from scapy.volatile import RandEnumWalk, RandValueWalk
+
+try:
+    RandValueWalk([])
+    raise AssertionError("an empty RandValueWalk was accepted")
+except TypeError:
+    pass
+
+# Unchanged, and named for the argument the caller actually passed.
+try:
+    RandEnumWalk([], [], 0, 255)
+    raise AssertionError("an empty RandEnumWalk was accepted")
+except TypeError:
+    pass
+
+= forward() walks every entry of the list, driving a real field
+~ fuzzing packet volatile
+
+from scapy.volatile import RandValueWalk
+
+VALUES = [b"GET", b"", None, b"GET GET"]
+
+packet = fuzz(Raw())
+walk = RandValueWalk(list(VALUES))
+packet.default_fields["load"] = walk
+
+states = packet.prepare_combinations(1, max_samples_per_field=128)
+positions = []
+rendered = []
+continue_to_fuzz = True
+iterations = 0
+while continue_to_fuzz and iterations < 500:
+    states, continue_to_fuzz = packet.forward(states)
+    iterations += 1
+    positions.append(walk.state_pos)
+    rendered.append(walk._fix())
+
+# One entry at a time, from the first, and every one of them reached. A walk
+# that was not exhaustive would stride max_samples_per_field over the list and
+# drop the entries it was assembled for.
+assert positions[:len(VALUES)] == list(range(len(VALUES))), positions
+assert rendered[:len(VALUES)] == VALUES, rendered
+
+# ...and the packet builds on each of them. Raw renders both b"" and None as an
+# empty payload, so the wire form carries three distinct strings for four
+# entries - that is the field's doing, not the walk's.
+packet.default_fields["load"] = RandValueWalk(list(VALUES))
+states = packet.prepare_combinations(1, max_samples_per_field=128)
+built = set()
+continue_to_fuzz = True
+iterations = 0
+while continue_to_fuzz and iterations < 500:
+    states, continue_to_fuzz = packet.forward(states)
+    iterations += 1
+    built.add(bytes(packet))
+
+assert built == {b"GET", b"", b"GET GET"}, built
+
+= Control: RandEnumWalk is the numeric specialisation, and unchanged
+~ fuzzing packet volatile inet
+
+from scapy.volatile import RandEnumWalk, RandValueWalk
+
+# The whole of the walk contract lives on the base class now.
+assert issubclass(RandEnumWalk, RandValueWalk)
+
+icmp_type = [f for f in ICMP.fields_desc if f.name == "type"][0]
+walk = icmp_type.randval()
+assert isinstance(walk, RandEnumWalk)
+declared = sorted(icmp_type.i2s)
+assert len(declared) == 26
+
+# Block 1 first and whole, block 2 and 3 behind it, block 3 alone bounded by
+# the budget. A refactor that separated block 1 out could trade that away
+# without any test of RandValueWalk noticing.
+walk.plan_budget(128)
+assert walk.values[:len(declared)] == declared
+assert len(walk.values) == 128
+assert len([v for v in walk.values if v not in set(declared)]) == 102
+walk.plan_budget(512)
+assert sorted(walk.values) == list(range(256))
+
+# Re-planning re-indexes the list: min/max and the default's position both
+# index 'values', so both have to follow it.
+walk.plan_budget(128)
+assert (walk.min, walk.max) == (0, 127), (walk.min, walk.max)
+walk.default = declared[3]
+assert walk.default == 3
+walk.plan_budget(512)
+assert (walk.min, walk.max) == (0, 255), (walk.min, walk.max)
+assert walk.default == 3
+walk.state_pos = None
+assert walk._fix() == declared[3]
+
