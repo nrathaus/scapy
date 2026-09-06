@@ -2186,7 +2186,10 @@ class BGPPathAttr(Packet):
         if flags_value is None:
             packet = p[:2]
         else:
-            packet = struct.pack("!B", flags_value) + p[1]
+            # p[1:2], not p[1]: indexing a bytes gives an int, and
+            # concatenating one raises TypeError. Reached whenever a caller
+            # supplies type_flags=None explicitly.
+            packet = struct.pack("!B", flags_value) + p[1:2]
 
         # Add the length
         if self.attr_len is None:
@@ -2202,7 +2205,11 @@ class BGPPathAttr(Packet):
             if extended_length:
                 packet = packet + p[2:4]
             else:
-                packet = packet + p[2]
+                # p[2:3] for the same reason as p[1:2] above. 'length' is only
+                # assigned while attr_len is None, so supplying an attr_len -
+                # which is what fuzzing the field does - reaches this line and
+                # took bytes(BGPPathAttr(attr_len=5)) down with a TypeError.
+                packet = packet + p[2:3]
         else:
             if extended_length:
                 packet = packet + struct.pack("!H", length)

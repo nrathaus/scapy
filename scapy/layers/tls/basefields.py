@@ -51,6 +51,9 @@ class _TLSClientVersionField(ShortEnumField):
     and the legacy 0x0303 for TLS 1.3 packets.
     """
 
+    # Resolved from the TLS session when the value handed over is None.
+    _resolves_own_value = True
+
     def i2h(self, pkt, x):
         if x is None:
             v = pkt.tls_session.advertised_tls_version
@@ -73,6 +76,9 @@ class _TLSVersionField(ShortEnumField):
     We use the tls_version if it has been defined, else the advertised version.
     Also, the legacy 0x0301 is used for TLS 1.3 packets.
     """
+
+    # Resolved from the TLS session when the value handed over is None.
+    _resolves_own_value = True
 
     def i2h(self, pkt, x):
         if x is None:

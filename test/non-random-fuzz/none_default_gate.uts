@@ -1,0 +1,250 @@
+% Regression tests for the sequential (non-random) fuzzing state machine
+% A None class default means "unset" as often as it means "I compute this"
+
+# fuzz() decided whether to arm a field with one line in scapy/packet.py:
+#
+#     elif f.default is not None:
+#         ...arm a volatile...
+#
+# and None carries two unrelated meanings there.
+#
+# It is how a class says "I compute this" - a FieldLenField, a checksum, an
+# address read off the route table - and skipping those is the whole reason
+# the test exists.
+#
+# It is also just the resting value of a field nothing fills in, and there the
+# same test quietly removed the field from the fuzz space. MQTTPubrec has one
+# field, a plain ShortField defaulting None; nothing computes it, and no run
+# ever varied it. Passing a value did not help either, because fuzz() reads
+# the FIELD's default rather than the value the packet carries.
+#
+# Field.computes_own_value() separates the two, and _none_default_is_inert()
+# adds the two tests a field cannot answer for itself: a _StrField/_PacketField
+# is a container whose None means empty, and a class overriding post_build can
+# fill in any field it likes without anything on the field saying so.
+#
+# The ordering of those tests matters, and the Ether case below is why. The
+# obvious reading - "the class overrides no post_build, so nothing can be
+# computing the value behind the field's back" - is wrong: Ether overrides no
+# post_build, and Ether.dst/Ether.src default None precisely because they are
+# resolved from the route table. The field-level predicate is what keeps them
+# computed, on the class fuzzing touches most.
+
+############
+############
++ A field nothing fills in is in the fuzz space
+
+= The smallest witness: one plain ShortField defaulting None
+~ fuzzing packet
+
+from scapy.contrib.mqtt import MQTTPubrec
+
+def armed(pkt):
+    return {name for name, value in pkt.default_fields.items()
+            if isinstance(value, VolatileValue)}
+
+assert [(f.name, f.default) for f in MQTTPubrec.fields_desc] == [("msgid", None)]
+assert "msgid" in armed(fuzz(MQTTPubrec()))
+
+# fuzz() reads the field's default, not the packet's value, so this arms the
+# field for the same reason rather than for a different one
+assert "msgid" in armed(fuzz(MQTTPubrec(msgid=0)))
+
+
+= Classes fuzz() used to arm nothing at all on now arm their fields
+~ fuzzing packet
+
+from scapy.contrib.knx import ServiceFamily
+from scapy.contrib.rtcp import ReceptionReport
+
+def armed(pkt):
+    return {name for name, value in pkt.default_fields.items()
+            if isinstance(value, VolatileValue)}
+
+# One witness per module, so this does not rest on a single protocol
+for cls, field in [(ServiceFamily, "id"), (ReceptionReport, "sourcesync")]:
+    assert field in armed(fuzz(cls())), cls.__name__
+
+# and every one of them still builds once armed
+for cls in [MQTTPubrec, ServiceFamily, ReceptionReport]:
+    pkt = fuzz(cls())
+    for _ in range(20):
+        assert isinstance(bytes(pkt), bytes)
+
+
+= The deterministic walk reaches a class that had nothing to walk
+~ fuzzing packet
+
+from scapy.contrib.mqtt import MQTTPubrec
+
+# The payoff, end to end. With msgid out of the fuzz space MQTTPubrec had no
+# field to permute at all, so prepare_combinations() did not merely produce a
+# short walk - it raised "States should include at least one permutation", and
+# every packet the class could produce was the same two zero bytes.
+packet = fuzz(MQTTPubrec())
+
+# the volatile carries the field's declared default of None, and the walk
+# starts anyway - see volatile_none_default.uts for the half that makes a
+# None default safe to carry
+assert packet.default_fields["msgid"].default is None
+
+states = packet.prepare_combinations(2)
+
+seen = set()
+for _ in range(40):
+    states, keep_going = packet.forward(states)
+    seen.add(bytes(packet))
+    if not keep_going:
+        break
+
+assert len(seen) == 40, len(seen)
+
+
+############
+############
++ A field the class does fill in stays computed
+
+= An address resolved from the route table is not armed
+~ fuzzing packet
+
+# The control that a post_build test cannot supply: Ether overrides no
+# post_build, so a gate keyed on the class alone would arm both addresses.
+from scapy.packet import Packet
+
+def armed(pkt):
+    return {name for name, value in pkt.default_fields.items()
+            if isinstance(value, VolatileValue)}
+
+assert Ether.post_build is Packet.post_build
+assert [f.default for f in Ether.fields_desc if f.name in ("dst", "src")] == [None, None]
+
+armed_ether = armed(fuzz(Ether()))
+assert "dst" not in armed_ether
+assert "src" not in armed_ether
+assert "type" in armed_ether        # the ordinary field is untouched
+
+# Dot3 is the same pair plus a LenField, so it arms nothing at all
+assert armed(fuzz(Dot3())) == set()
+
+
+= A value resolved from the clock is not armed
+~ fuzzing packet
+
+from scapy.layers.ntp import NTPHeader
+
+def armed(pkt):
+    return {name for name, value in pkt.default_fields.items()
+            if isinstance(value, VolatileValue)}
+
+armed_ntp = armed(fuzz(NTPHeader()))
+
+# orig and sent default None and TimeStampField.i2m fills them from time.time()
+assert "orig" not in armed_ntp
+assert "sent" not in armed_ntp
+
+# ref and recv are the same field class carrying a real default of 0, so they
+# were already armed before any of this and still are
+assert "ref" in armed_ntp
+assert "recv" in armed_ntp
+
+
+= A declared length and a checksum stay computed
+~ fuzzing packet
+
+def armed(pkt):
+    return {name for name, value in pkt.default_fields.items()
+            if isinstance(value, VolatileValue)}
+
+armed_ip = armed(fuzz(IP()))
+assert "len" not in armed_ip
+assert "chksum" not in armed_ip
+assert "ttl" in armed_ip
+
+# and the checksum still computes to a real value on build
+assert IP(bytes(IP())).chksum
+
+
+= A class overriding post_build is declined whole
+~ fuzzing packet
+
+from scapy.packet import Packet, _none_default_is_inert
+
+# IP fills len and chksum in from post_build without anything on either field
+# saying so, so no field of it can be shown inert from the field alone
+assert IP.post_build is not Packet.post_build
+for f in IP.fields_desc:
+    assert not _none_default_is_inert(f, IP()), f.name
+
+
+############
+############
++ computes_own_value() answers for the field alone
+
+= A length declaration and a resolved value both answer True
+~ fuzzing fields
+
+from scapy.layers.l2 import DestMACField, SourceMACField
+
+assert DestMACField("dst").computes_own_value()
+assert SourceMACField("src").computes_own_value()
+assert SourceIPField("src").computes_own_value()
+assert UTCTimeField("when", None).computes_own_value()
+
+# a length declaration is computed too - length_randval() declines whenever
+# the honest value cannot be established, and what it declines must not fall
+# through to an ordinary randval
+assert FieldLenField("len", None, length_of="x").computes_own_value()
+assert LenField("len", None).computes_own_value()
+
+
+= An ordinary field answers False
+~ fuzzing fields
+
+assert not ShortField("msgid", None).computes_own_value()
+assert not ByteField("id", None).computes_own_value()
+assert not IntField("sourcesync", None).computes_own_value()
+
+# and a plain IPField is not a SourceIPField: only the resolving subclass says
+# it fills its own value in
+assert not IPField("addr", None).computes_own_value()
+
+
+= A container's None means empty, so fuzz() declines it
+~ fuzzing packet
+
+from scapy.packet import _none_default_is_inert
+from scapy.contrib.mqtt import MQTTPubrec
+
+# StrField/PacketField carry the payload whose length is declared elsewhere;
+# filling one with random bytes changes the packet's shape, not one of its
+# values. The class-level test cannot be what declines these - MQTTPubrec
+# overrides no post_build.
+assert not _none_default_is_inert(StrField("load", None), MQTTPubrec())
+assert not _none_default_is_inert(PacketField("p", None, MQTTPubrec), MQTTPubrec())
+
+
+############
+############
++ BGPPathAttr.post_build survives a supplied length
+
+= Supplying attr_len no longer takes the build down
+~ fuzzing packet bgp
+
+from scapy.contrib.bgp import BGPPathAttr
+
+# post_build assigns 'length' only inside "if self.attr_len is None", so
+# supplying one reached "packet = packet + p[2]" - and indexing a bytes gives
+# an int, which cannot be concatenated. Anything that fuzzes attr_len supplies
+# one.
+assert bytes(BGPPathAttr()) == b"\x80\x00\x00"
+assert bytes(BGPPathAttr(attr_len=5)) == b"\x80\x00\x05"
+
+
+= The same defect one branch up, reached through type_flags
+~ fuzzing packet bgp
+
+from scapy.contrib.bgp import BGPPathAttr
+
+# "struct.pack('!B', flags_value) + p[1]" had it too, reachable whenever a
+# caller supplies type_flags=None explicitly rather than leaving the default
+assert bytes(BGPPathAttr(type_flags=None)) == b"\x80\x00\x00"

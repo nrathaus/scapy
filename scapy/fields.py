@@ -353,6 +353,55 @@ class Field(Generic[I, M], metaclass=Field_metaclass):
             return True
         return self.name.lower() in self._LENGTH_FIELD_NAMES
 
+    # Set by a field class that fills its own value in from something outside
+    # the packet - the route table, the clock, a session - whenever the value
+    # it is handed is None. See computes_own_value().
+    _resolves_own_value = False
+
+    def computes_own_value(self):
+        # type: () -> bool
+        """Does a ``None`` here mean "the class fills this in", or "unset"?
+
+        ``fuzz()`` skips every field whose class default is ``None``, and
+        ``None`` is scapy's way of saying two unrelated things.
+
+        It is how a class says *I compute this* - a ``FieldLenField``, a
+        checksum, an address read off the route table - and skipping those is
+        the whole reason that test is there.
+
+        It is also just the resting value of a field nothing fills in, and
+        there the same test quietly removes the field from the fuzz space.
+        ``MQTTPubrec`` has one ``ShortField`` defaulting ``None``, nothing
+        computes it, and no run has ever varied it.
+
+        This separates the two, so the gate can go on skipping the first
+        without also skipping the second.
+
+        1. A length declaration is computed. ``fuzz()`` reaches for a length
+           walk before this test and usually gets one, but
+           ``length_randval()`` declines whenever the honest value cannot be
+           established, and what it declines has to stay computed rather than
+           fall through to an ordinary ``randval()``. See
+           ``declares_length()``.
+
+        2. ``_resolves_own_value`` is the explicit half: a field class that
+           reads its value from outside the packet when handed ``None``.
+           ``SourceIPField`` and ``DestMACField`` take it from the route
+           table, ``UTCTimeField`` and ``TimeStampField`` from the clock,
+           ``_TLSVersionField`` from the session. Arming one replaces a value
+           the caller needs to be real, and none of them can be told from an
+           ordinary field by anything a rule could read off ``Field`` alone -
+           which is why this is a marker rather than a heuristic.
+
+        Note what this deliberately does not answer: whether the *class*
+        fills the field in from ``post_build``. That is invisible from a
+        field, and ``fuzz()`` tests it separately - see
+        ``_none_default_is_inert()``.
+        """
+        if self._resolves_own_value:
+            return True
+        return self.declares_length()
+
     def honest_length(self, pkt):
         # type: (Packet) -> Optional[int]
         """The length this class computes for ``pkt``, read back off the wire
@@ -1058,6 +1107,9 @@ class FCSField(TrailerField):
 
 
 class DestField(Field[str, bytes]):
+    # Resolved from the route table when the value handed over is None.
+    _resolves_own_value = True
+
     __slots__ = ["defaultdst"]
     # Each subclass must have its own bindings attribute
     bindings = {}  # type: Dict[Type[Packet], Tuple[str, Any]]
@@ -1205,6 +1257,9 @@ class IPField(Field[Union[str, Net], bytes]):
 
 
 class SourceIPField(IPField):
+    # Resolved from the route table when the value handed over is None.
+    _resolves_own_value = True
+
     def __init__(self, name):
         # type: (str) -> None
         IPField.__init__(self, name, None)
@@ -1294,6 +1349,9 @@ class IP6Field(Field[Optional[Union[str, Net6]], bytes]):
 
 
 class SourceIP6Field(IP6Field):
+    # Resolved from the route table when the value handed over is None.
+    _resolves_own_value = True
+
     def __init__(self, name):
         # type: (str) -> None
         IP6Field.__init__(self, name, None)
@@ -4027,6 +4085,9 @@ class IP6PrefixField(_IPPrefixFieldBase):
 
 
 class UTCTimeField(Field[float, int]):
+    # Resolved from the clock when the value handed over is None.
+    _resolves_own_value = True
+
     __slots__ = ["epoch", "delta", "strf",
                  "use_msec", "use_micro", "use_nano", "custom_scaling"]
 

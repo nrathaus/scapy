@@ -281,6 +281,9 @@ def getmacbyip(ip, chainCC=0, iface=None, timeout=2):
 # Fields
 
 class DestMACField(MACField):
+    # Resolved from the route table when the value handed over is None.
+    _resolves_own_value = True
+
     def __init__(self, name):
         # type: (str) -> None
         MACField.__init__(self, name, None)
@@ -310,6 +313,9 @@ class DestMACField(MACField):
 
 
 class SourceMACField(MACField):
+    # Resolved from the route table when the value handed over is None.
+    _resolves_own_value = True
+
     __slots__ = ["getif"]
 
     def __init__(self, name, getif=None):

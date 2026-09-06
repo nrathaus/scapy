@@ -89,6 +89,9 @@ class TimeStampField(FixedPointField):
     This field handles the timestamp fields in the NTP header.
     """
 
+    # Resolved from the clock when the value handed over is None.
+    _resolves_own_value = True
+
     def __init__(self, name, default):
         FixedPointField.__init__(self, name, default, 64, 32)
 

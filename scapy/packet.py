@@ -40,6 +40,8 @@ from scapy.fields import (
     PacketListField,
     RawVal,
     StrField,
+    _PacketField,
+    _StrField,
 )
 from scapy.config import conf, _version_checker
 from scapy.compat import raw, bytes_encode
@@ -4092,6 +4094,57 @@ def _field_is_active(f, pkt):
         return True
 
 
+def _none_default_is_inert(field, pkt):
+    # type: (Field[Any, Any], Packet) -> bool
+    """Is this field's ``None`` default a resting value, not "I compute this"?
+
+    ``fuzz()`` has always skipped every field whose class default is ``None``,
+    and ``None`` carries two unrelated meanings. The four tests below are what
+    it takes to tell them apart, and each rejects something the others let
+    through.
+
+    0. Anything that is not a ``Field`` is declined, the same way the length
+       walk above tests for ``declares_length`` rather than assuming it.
+       ``scapy.asn1fields`` is a parallel hierarchy rooted at ``ASN1F_element``
+       rather than ``Field`` - it has no ``randval()`` and no predicate to ask
+       - and its ``None`` means the element is absent from the encoding. 133
+       classes across ``x509``, ``kerberos``, ``snmp``, ``spnego``, ``ldap``
+       and ``gssapi`` are built from nothing else.
+
+    1. ``computes_own_value()`` is the field's own answer: a length
+       declaration, or a class that reads its value off the route table, the
+       clock or a session. That is the half a rule can see from the field.
+
+    2. A ``_StrField``/``_PacketField`` is declined for the same reason
+       ``declares_length()`` declines one - it is a container whose ``None``
+       means *empty*, and filling it with random bytes changes the packet's
+       shape rather than one of its values. ``fuzz()`` already drives the
+       list-valued containers through their own branches above.
+
+    3. **A class that overrides** ``post_build`` **is declined whole.** This is
+       the coarse test and it is the one carrying the risk. A ``post_build``
+       can fill in any field it likes without anything on the field saying so -
+       ``IP.chksum`` is the familiar shape - so a field on such a class cannot
+       be shown inert from here. Declining the class costs the fields that were
+       merely resting on it, and that is the right way round: the failure it
+       avoids is fuzzing a value the class needs to be real.
+
+    Note the order of 1 and 3. Test 3 alone is NOT the safe tier it looks
+    like: ``Ether`` overrides no ``post_build``, and ``Ether.dst`` and
+    ``Ether.src`` default ``None`` because they are resolved from the route.
+    Test 1 is what keeps those computed, on the class fuzzing touches most.
+    """
+    if not hasattr(field, "computes_own_value"):
+        return False
+    if field.computes_own_value():
+        return False
+    if isinstance(field, (_StrField, _PacketField)):
+        return False
+    if type(pkt).post_build is not Packet.post_build:
+        return False
+    return True
+
+
 def fuzz(p,  # type: _P
          _inplace=0,  # type: int
          _lengths=True,  # type: bool
@@ -4176,7 +4229,13 @@ def fuzz(p,  # type: _P
 
                 if walk is not None:
                     length_walks[f.name] = walk
-                elif f.default is not None:
+                elif f.default is not None or \
+                        _none_default_is_inert(real_f, q):
+                    # A None default used to end the matter here. It still
+                    # does for every field the class fills in itself; what
+                    # changes is the field nothing fills in, which was being
+                    # dropped from the fuzz space with nothing saying so.
+                    # See _none_default_is_inert().
                     if field_is_active:
                         rnd = f.randval()
 
