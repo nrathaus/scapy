@@ -2303,7 +2303,16 @@ class Packet(
         return s
 
     def do_dissect(self, s):
-        # type: (bytes) -> bytes
+        # type: (Any) -> Any
+        """
+        Dissect this layer's own fields out of *s*, and return what is left.
+
+        *s* is normally bytes. A bit field can leave the current byte open
+        though, so a layer that starts inside one is handed a (bytes, bits
+        consumed) pair instead, and hands one back for whoever opened the
+        group; a layer that opens a group itself keeps the byte it only
+        partly consumed and returns whole bytes.
+        """
         _raw = s
         self.raw_packet_cache_fields = {}
         for f in self.fields_desc:
@@ -2322,7 +2331,28 @@ class Packet(
                           (fval is not None and f.isconditional and
                            f.fld.ismayend)):  # type: ignore
                 break
-        self.raw_packet_cache = _raw[:-len(s)] if s else _raw
+        # A bit field can leave the current byte open, in which case what it
+        # hands back is a (bytes, bits) pair rather than bytes. len() of that
+        # pair is 2 whatever it holds, so a remainder cannot be measured with
+        # it, and bits that are not a whole number of bytes cannot be kept as
+        # bytes either. Work out both here rather than let the pair travel on
+        # as though it were a remainder.
+        if isinstance(_raw, tuple):
+            # A layer above had already partly consumed the first byte, so
+            # this layer's own bits are not a whole number of bytes and it
+            # cannot keep a byte cache at all: leave it unset, so that
+            # self_build reassembles the layer from its fields. Whatever is
+            # left goes back untouched to whoever opened the group.
+            self.raw_packet_cache = None
+        elif isinstance(s, tuple):
+            # This layer opened the group, so it owns the byte it has only
+            # partly consumed: keep that byte among this layer's bytes, and
+            # start the payload at the next whole one.
+            rem = s[0]
+            self.raw_packet_cache = _raw[:len(_raw) - len(rem) + 1]
+            s = rem[1:]
+        else:
+            self.raw_packet_cache = _raw[:-len(s)] if s else _raw
         self.explicit = 1
         return s
 
@@ -3384,6 +3414,21 @@ class Raw(Packet):
             else:
                 _pkt = bytes_encode(_pkt)
         super(Raw, self).__init__(_pkt, *args, **kwargs)
+
+    def self_build(self):
+        # type: () -> bytes
+        # This layer's own load, if it has one: a subclass may replace
+        # fields_desc entirely, and getfieldval would fall through to the
+        # payload and raise for one that has no load field.
+        load = self.fields.get("load", None)
+        if isinstance(load, tuple):
+            # A bit-offset load: dissection hands a byte it only partly
+            # consumed on as a (bytes, bits) pair, so that the next packet in
+            # a list can start mid-byte. A fraction of a byte cannot be
+            # emitted, so hold the whole bytes the pair carries rather than
+            # let it reach `p + pay` as a TypeError that names nothing.
+            return cast(bytes, load[0])
+        return super(Raw, self).self_build()
 
     def answers(self, other):
         # type: (Packet) -> int

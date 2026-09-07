@@ -2389,6 +2389,14 @@ offsetdata = bytes.fromhex("0" + p.load.hex() + "0")
 p = Raw((offsetdata, 4))
 p
 
+= Assembly of a bit-offset load
+~ field
+# Dissection hands a byte it only partly consumed on as a (bytes, bits) pair,
+# so that the next packet in a list can start mid-byte. A fraction of a byte
+# cannot be emitted, so building one holds the whole bytes it carries rather
+# than letting the pair reach `p + pay` as a TypeError that names nothing.
+assert raw(Raw((b"\x0a\xb0", 4))) == b"\x0a\xb0"
+
 ############
 ############
 + PacketListField() tests
@@ -2467,4 +2475,37 @@ except Scapy_Exception as e:
     assert "TestPLFBitsOpen" in str(e)
 else:
     assert False
+
+= A byte a layer only partly consumed stays with that layer
+~ field
+# 4 + 8 + 4*8 = 44 bits, so dissection stops halfway through the sixth byte.
+# The layer that opened the bit group owns that byte: it belongs to this
+# layer's own bytes, and the payload starts at the next one. Measuring the
+# (bytes, bits) remainder with len() instead put 2 there whatever it held,
+# cutting raw_packet_cache short and leaving the packet unbuildable.
+class TestPLFUnaligned(Packet):
+    name = "TestPLFUnaligned"
+    fields_desc = [ BitField("indent", 0, 4),
+                    BitFieldLenField("pcount", None, 8, count_of="plist"),
+                    PacketListField("plist", None, TestPLFInner,
+                                    count_from=lambda pkt: pkt.pcount) ]
+
+p = TestPLFUnaligned(b"\xf0\x44\x14\x24\x34\x40")
+assert p.raw_packet_cache == b"\xf0\x44\x14\x24\x34\x40"
+assert raw(p) == b"\xf0\x44\x14\x24\x34\x40"
+
+= A byte a layer only partly consumed is not handed to the payload
+~ field
+p = TestPLFUnaligned(b"\xf0\x44\x14\x24\x34\x40\xaa\xbb")
+assert p.raw_packet_cache == b"\xf0\x44\x14\x24\x34\x40"
+assert bytes(p.payload) == b"\xaa\xbb"
+assert raw(p) == b"\xf0\x44\x14\x24\x34\x40\xaa\xbb"
+
+= A packet dissected mid-byte reassembles from its fields
+~ field
+# The packets in the list start on bit boundaries, so none of them is a whole
+# number of bytes on its own and none of them can keep a byte cache. They have
+# to fall back to their fields, which are byte aligned once rebuilt.
+p = TestPLFUnaligned(b"\xf0\x44\x14\x24\x34\x40")
+assert [raw(i) for i in p.plist] == [b"\x41", b"\x42", b"\x43", b"\x44"]
 
