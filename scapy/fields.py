@@ -2334,9 +2334,27 @@ class PacketListField(_PacketField[List[BasePacket]]):
         # type: (...) -> bytes
         return bytes_encode(i)
 
-    def addfield(self, pkt, s, val):
-        # type: (Packet, bytes, Any) -> bytes
-        return s + b"".join(self.i2m(pkt, v) for v in val)
+    def addfield(self,  # type: ignore
+                 pkt,  # type: Packet
+                 s,  # type: Union[Tuple[bytes, int, int], bytes]
+                 val,  # type: Any
+                 ):
+        # type: (...) -> Union[Tuple[bytes, int, int], bytes]
+        body = b"".join(self.i2m(pkt, v) for v in val)
+        if not isinstance(s, tuple):
+            return s + body
+        # A bit field before this one left the current byte open, the way
+        # getfield already expects to be handed it. The packets in the list
+        # are whole bytes, so feed them through the open byte as a bit field
+        # of size 8 would, and hand the byte on still open so that a bit
+        # field after this one can close the group. Without this, `s + body`
+        # raises a TypeError that names neither the field nor the layer.
+        s, bitsdone, v = s
+        for byte in body:
+            v = (v << 8) | byte
+            s += struct.pack("!B", v >> bitsdone)
+            v &= (1 << bitsdone) - 1
+        return s, bitsdone, v
 
 
 class StrFixedLenField(StrField):
