@@ -10,6 +10,7 @@
 RFC 7252 - Constrained Application Protocol (CoAP) layer for Scapy
 """
 
+import random
 import struct
 
 from scapy.fields import BitEnumField, BitField, BitFieldLenField, \
@@ -17,7 +18,8 @@ from scapy.fields import BitEnumField, BitField, BitFieldLenField, \
 from scapy.layers.inet import UDP
 from scapy.packet import Packet, bind_layers
 from scapy.error import warning
-from scapy.compat import raw
+from scapy.compat import bytes_encode, raw
+from scapy.volatile import RandBin, RandField
 
 """
 CoAP message request codes (RFC 7252 @ section-5.8.1)
@@ -186,8 +188,65 @@ class _CoAPOpt(Packet):
             return Packet.guess_payload_class(self, payload)
 
 
+class RandCoAPOpt(RandField):
+    """One ``(option number, option value)`` pair - the shape
+    ``_CoAPOptsField.i2m()`` reads.
+
+    ``_CoAPOptsField.islist`` is 1, so ``Packet.forward()`` writes what
+    ``_fix()`` returns into the field as a one-element list, and that list of
+    one pair is what ``i2m()`` wants. Returning a list of pairs here would
+    make it a list of lists; the ``RandBin`` inherited from ``StrField``
+    returned a byte string, so ``i2m()`` read ``o[0]`` and ``o[1]`` off
+    ``bytes`` and handed ``_CoAPOpt`` an ``int`` as the option value.
+
+    ``state_pos`` walks the option *number*, the axis that decides which
+    option a receiver parses. ``max`` is the last number CoAP can encode:
+    ``_CoAPOpt._populate_extended()`` packs anything from 269 up as ``'!H'``
+    after subtracting 269, so 269 + 0xffff builds and one more raises
+    ``struct.error``.
+    """
+
+    min = 0
+    max = 269 + 0xffff
+    state_pos = None
+
+    def __init__(self, opt_val=None):
+        self.opt_val = opt_val
+
+    def _command_args(self):
+        if self.opt_val is None:
+            return ""
+        return "opt_val=%r" % (self.opt_val,)
+
+    def _fix(self):
+        if self.state_pos is None:
+            # Nothing is driving a walk, so draw. Rendering ``.default``
+            # instead - the way RandBin does when it is not the field being
+            # fuzzed - is not open to us: fuzz() sets it to this field's own
+            # default, ``[]``, and a list is not a pair i2m() can read.
+            number = random.randrange(self.min, self.max + 1)
+        else:
+            number = min(max(int(self.state_pos), self.min), self.max)
+
+        if self.opt_val is not None:
+            return number, bytes_encode(self.opt_val)
+
+        # The value tracks the number rather than resting at a constant.
+        # A nested volatile cannot do it: forward() sets ``state_pos`` only
+        # on the field it is driving, so a RandBin held here would render
+        # with ``state_pos`` still None and every option would carry an
+        # empty value. Sliced from RandBin's own charset, the same way
+        # RandBin slices it, so the two stay in step.
+        return number, RandBin._DEFAULT_CHARS[:number % 256]
+
+
 class _CoAPOptsField(StrField):
     islist = 1
+
+    def randval(self):
+        # StrField.randval() returns a RandBin, which this field's own i2m()
+        # cannot read - see RandCoAPOpt.
+        return RandCoAPOpt()
 
     def i2h(self, pkt, x):
         return [(coap_options[0][o[0]], o[1]) if o[0] in coap_options[0] else o for o in

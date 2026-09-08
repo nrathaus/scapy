@@ -1,0 +1,300 @@
+% Regression tests for the sequential (non-random) fuzzing state machine
+% A field that overrides i2m() must override randval() to match
+
+# _CoAPOptsField overrode i2h, getfield, m2i and i2m - every conversion method
+# except the one that generates fuzz values. So it inherited
+# StrField.randval(), which returns a RandBin, a byte string, while its own
+# i2m() reads a list of (number, value) pairs:
+#
+#     field.i2m(CoAP(), [field.randval()._fix()])
+#     # IndexError: index out of range
+#     # or TypeError: object of type 'int' has no len()
+#
+# Handed b'\x00\x01\x02' the element is bytes, so o[0] is the int 0 and o[1]
+# the int 1: opt_val became an int and _CoAPOpt called len() on it. Handed b''
+# there was no o[0] at all.
+#
+# The mismatch showed up as two faults depending on whether the value was ever
+# applied. Where it was not, the field was silently never fuzzed: fuzz()
+# installs the volatile in default_fields['options'], but 'options' is also in
+# 'fields' - scapy copies a mutable list default there at construction - and
+# 'fields' shadows default_fields. Where it was applied, by forward() writing
+# into 'fields' directly, EVERY case failed: 256 of 256 at complexity 1 and
+# 16,512 of 16,512 at complexity 2. CoAP.options was 100% unfuzzable.
+#
+# Fixed with RandCoAPOpt, a volatile whose fixed value is the pair i2m()
+# reads. Measured over the same walks afterwards: 665 cases / 0 raises at
+# complexity 1, and 171,217 cases / 0 raises at complexity 2 - the same case
+# counts as before, which matters as much as the zero. A randval() that
+# returns a plain list of pairs with no min/max/state_pos also takes the
+# raises to zero and shrinks complexity 2 to 104,796 cases, trading the
+# defect for 39% of the coverage rather than fixing it.
+#
+# 21 field classes in scapy override i2m() without overriding randval(). Most
+# are harmless because the inherited type happens to fit; gtp's TBCDByteField
+# is not, and is covered at the end of this file.
+
+############
+############
++ _CoAPOptsField.randval() and i2m() agree on a type
+
+= randval() returns a pair, not the inherited RandBin
+~ fuzzing coap
+
+from scapy.contrib.coap import CoAP, RandCoAPOpt
+from scapy.volatile import RandBin
+
+field = CoAP().get_field("options")
+assert isinstance(field.randval(), RandCoAPOpt)
+assert not isinstance(field.randval(), RandBin)
+
+
+= i2m() accepts what randval() produces, for every value it can produce
+~ fuzzing coap
+
+from scapy.contrib.coap import CoAP
+
+field = CoAP().get_field("options")
+
+# islist is 1, so what reaches i2m() is the fixed value inside a
+# one-element list. Sampled rather than taken once: a randval() whose values
+# vary has to be acceptable for all of them, not for a lucky one.
+for _ in range(64):
+    pair = field.randval()._fix()
+    assert isinstance(pair, tuple) and len(pair) == 2
+    assert isinstance(pair[0], int)
+    assert isinstance(pair[1], bytes)
+    assert field.i2m(CoAP(), [pair])
+
+
+= The two shapes the inherited RandBin produced still cannot be read
+~ fuzzing coap
+
+from scapy.contrib.coap import CoAP
+
+field = CoAP().get_field("options")
+
+# Kept as an assertion rather than a comment: these are what randval() must
+# not return, and they are why returning a bytes was not merely untidy.
+try:
+    field.i2m(CoAP(), [b"\x00\x01\x02"])
+    assert False, "bytes was read as a pair"
+except TypeError:
+    pass
+
+try:
+    field.i2m(CoAP(), [b""])
+    assert False, "empty bytes was read as a pair"
+except IndexError:
+    pass
+
+
+= A hand-built list of pairs still builds - the control
+~ fuzzing coap
+
+from scapy.contrib.coap import CoAP
+
+assert raw(CoAP(options=[(1, b"x")]))
+assert raw(CoAP(options=[(1, b"x"), (11, b"path")]))
+assert raw(CoAP(options=[])) == b"\x40\x00\x00\x00"
+
+# Option names, not just numbers - i2m() maps them through coap_options.
+assert raw(CoAP(options=[("Uri-Path", b"core")]))
+
+# And dissection still round-trips.
+packet = CoAP(raw(CoAP(options=[("Uri-Path", b".well-known"), ("Uri-Path", b"core")])))
+assert packet.options == [("Uri-Path", b".well-known"), ("Uri-Path", b"core")]
+
+############
+############
++ RandCoAPOpt participates in the walk
+
+= Every case of a walked fuzz(CoAP()) builds
+~ fuzzing coap
+
+import random
+from scapy.contrib.coap import CoAP
+
+random.seed(1234)
+packet = fuzz(CoAP())
+
+states = packet.prepare_combinations(1)
+cases = 0
+carry_on = True
+while carry_on:
+    cases += 1
+    raw(packet)   # raises here if any case cannot be built
+    states, carry_on = packet.forward(states)
+
+# 665 is what this walk covered while 256 of its cases were still raising.
+# A fix that takes the raises to zero by generating fewer values shrinks it.
+assert cases == 665
+
+
+= The walk drives the option number, and every number it reaches encodes
+~ fuzzing coap
+
+import random
+from scapy.contrib.coap import CoAP, RandCoAPOpt
+
+random.seed(1234)
+packet = fuzz(CoAP())
+
+states = packet.prepare_combinations(1)
+numbers = set()
+carry_on = True
+while carry_on:
+    current = packet.fields.get("options")
+    if current:
+        numbers.add(current[0][0])
+    states, carry_on = packet.forward(states)
+
+# The option number is the axis worth walking: it selects which option the
+# receiver parses. A randval() that did not carry min/max/state_pos would
+# render one value here.
+assert len(numbers) > 1
+assert min(numbers) == 0
+assert max(numbers) == RandCoAPOpt.max
+assert all(RandCoAPOpt.min <= n <= RandCoAPOpt.max for n in numbers)
+
+
+= state_pos renders the option number, and the value tracks it
+~ fuzzing coap
+
+from scapy.contrib.coap import RandCoAPOpt
+
+volatile = RandCoAPOpt()
+volatile.state_pos = 0
+assert volatile._fix() == (0, b"")
+
+volatile = RandCoAPOpt()
+volatile.state_pos = 5
+assert volatile._fix() == (5, b"\x00\x01\x02\x03\x04")
+
+# The value tracks the number rather than resting at a constant. A nested
+# volatile could not do it: forward() sets state_pos only on the field it is
+# driving, so a RandBin held inside would render with state_pos still None
+# and every option would carry an empty value.
+volatile = RandCoAPOpt()
+volatile.state_pos = 300
+number, value = volatile._fix()
+assert number == 300
+assert len(value) == 300 % 256
+
+# An explicit value is used as given, which is what makes the class usable
+# for a targeted option.
+volatile = RandCoAPOpt(opt_val=b"path")
+volatile.state_pos = 11
+assert volatile._fix() == (11, b"path")
+
+# Un-driven, it draws - nothing renders '.default' here because fuzz() sets
+# that to the field's own default, [], and a list is not a pair i2m() reads.
+volatile = RandCoAPOpt()
+assert volatile.state_pos is None
+number, value = volatile._fix()
+assert RandCoAPOpt.min <= number <= RandCoAPOpt.max
+
+# command() round-trips, like every other volatile's.
+assert RandCoAPOpt().command() == "RandCoAPOpt()"
+assert RandCoAPOpt(opt_val=b"x").command() == "RandCoAPOpt(opt_val=b'x')"
+
+
+= RandCoAPOpt.max is the last option number CoAP can encode
+~ fuzzing coap
+
+import struct
+from scapy.contrib.coap import CoAP, RandCoAPOpt
+
+# _CoAPOpt._populate_extended() packs anything from 269 up as '!H' after
+# subtracting 269, so this is where the encodable range ends. Asserted
+# because it is the bound the walk is given, not an arbitrary ceiling.
+assert RandCoAPOpt.max == 269 + 0xffff
+assert RandCoAPOpt.min == 0
+assert raw(CoAP(options=[(RandCoAPOpt.max, b"x")]))
+
+try:
+    raw(CoAP(options=[(RandCoAPOpt.max + 1, b"x")]))
+    assert False, "an unencodable option number built"
+except struct.error:
+    pass
+
+############
+############
++ The same defect in gtp's TBCDByteField
+
+= TBCDByteField.randval() produces digits its own i2m() parses
+~ fuzzing gtp
+
+from scapy.contrib.gtp import TBCDByteField
+from scapy.volatile import RandBin, RandString
+
+field = TBCDByteField("MCC", "", 2)
+volatile = field.randval()
+
+# StrFixedLenField.randval() handed back a RandBin over all 256 byte values,
+# and TBCDByteField.i2m() parses the value as hex digits:
+#
+#     field.i2m(pkt, b"1234")      # ok
+#     field.i2m(pkt, b"\x00\x01")  # ValueError: invalid literal for
+#                                  #             int() with base 16
+assert isinstance(volatile, RandString)
+assert not isinstance(volatile, RandBin)
+
+# Decimal digits are the alphabet, and not merely a safe subset of hex: i2m()
+# reads base 16 while m2i() indexes TBCD_TO_ASCII by nibble, and the two
+# coincide only over '0'-'9' - 'a' means 10 to one and 12 to the other.
+assert volatile.chars == "0123456789"
+
+# Two digits to the byte, so a 2-byte field wants 4 of them.
+assert volatile.size == 4
+
+# Every value the walk can render has to parse, not just a sampled few:
+# RandString slices its charset by state_pos, so this is all of them.
+for position in range(volatile.max + 1):
+    driven = field.randval()
+    driven.state_pos = position
+    assert field.i2m(None, driven._fix()) is not None
+
+# The old shape, kept as an assertion for the same reason as CoAP's above.
+old = RandBin(4)
+old.state_pos = 2
+try:
+    field.i2m(None, old._fix())
+    assert False, "arbitrary bytes parsed as hex digits"
+except ValueError:
+    pass
+
+# A length_from that needs a real packet cannot be measured with None, and
+# falls back rather than raising out of randval().
+lengthy = TBCDByteField("digits", "33607080910", length_from=lambda x: x.length - 1)
+assert lengthy.randval().chars == "0123456789"
+
+
+= Every case of a walked fuzz() over TBCD-bearing layers builds
+~ fuzzing gtp
+
+import random
+from scapy.contrib.gtp import IE_IMSI, IE_Routing
+
+# 8 of 138 cases raised on IE_IMSI and 3 of 134 on IE_Routing before.
+for cls in [IE_IMSI, IE_Routing]:
+    random.seed(1234)
+    packet = fuzz(cls())
+    states = packet.prepare_combinations(1)
+    cases = 0
+    carry_on = True
+    while carry_on:
+        cases += 1
+        raw(packet)   # raises here if any case cannot be built
+        states, carry_on = packet.forward(states)
+    assert cases > 100
+
+
+= TBCD round-trips and declared defaults still build - the control
+~ fuzzing gtp
+
+from scapy.contrib.gtp import IE_IMSI, IE_Routing
+
+# The digits randval() draws from are also what these fields carry.
+assert IE_IMSI(raw(IE_IMSI(imsi="123456789012345"))).imsi == b"123456789012345"
+assert raw(IE_Routing(MCC="123", MNC="45"))

@@ -1,0 +1,157 @@
+% Regression tests for the sequential (non-random) fuzzing state machine
+% valid_ip6()/valid_net6() must answer rather than raise, like valid_ip() does
+
+# Both are annotated '-> bool'. The IPv4 one answered for any input; its IPv6
+# counterpart raised, for the same input, from the function immediately below
+# it in the same file:
+#
+#     valid_ip("\x00\x01")     # False
+#     valid_ip6("\x00\x01")    # ValueError: embedded null character
+#
+# socket.error is an alias of OSError. socket.inet_pton raises OSError for an
+# address that is merely malformed, which 'except socket.error' catches, and
+# ValueError for one containing an embedded NUL, which it does not, because
+# CPython refuses to hand such a string to a C API that expects NUL
+# termination. valid_ip() already listed ValueError; valid_ip6() did not.
+# valid_net6() inherited it by delegating to valid_ip6().
+#
+# It matters beyond the annotation because MultipleTypeField uses these
+# predicates to decide which concrete field applies, so the raise surfaced a
+# long way from the value that caused it - see the ARP tests below.
+#
+# Over a walk of fuzz(ARP()) at complexity 2: 347,009 cases and 254 raises
+# before, the same 347,009 cases and 0 raises after. Nothing about which
+# values are generated changes, only whether a predicate answers.
+
+############
+############
++ The valid_* predicates answer for input they should reject
+
+= valid_ip6() and valid_net6() return False rather than raising
+~ fuzzing utils
+
+# The embedded NUL is the input that separated the two families.
+rejected = ["nonsense", "\x00\x01", b"\x00\x01", "::1\x00", "1.2.3.4\x00", "\x00"]
+
+for addr in rejected:
+    assert valid_ip(addr) is False, addr
+    assert valid_ip6(addr) is False, addr
+    assert valid_net(addr) is False, addr
+    assert valid_net6(addr) is False, addr
+
+
+= The IPv4 and IPv6 predicates agree on whether to raise
+~ fuzzing utils
+
+# The point of the fix: not that valid_ip6() rejects these, but that it
+# decides the same way its IPv4 twin does instead of propagating.
+def _answered(predicate, addr):
+    try:
+        predicate(addr)
+        return True
+    except Exception:
+        return False
+
+for addr in ["nonsense", "\x00\x01", b"\x00\x01", "::1\x00", "1.2.3.4\x00", "\x00"]:
+    assert _answered(valid_ip, addr) == _answered(valid_ip6, addr), addr
+    assert _answered(valid_net, addr) == _answered(valid_net6, addr), addr
+
+
+= Real addresses still answer True - the control
+~ fuzzing utils
+
+for addr in ["1.2.3.4", "0.0.0.0", "255.255.255.255"]:
+    assert valid_ip(addr)
+    assert valid_net(addr)
+
+for addr in ["::1", "fe80::1", "2001:db8::1"]:
+    assert valid_ip6(addr)
+    assert valid_net6(addr)
+
+# Masks still narrow to the right family, and 129 is still too wide for v6.
+assert valid_net("1.2.3.0/24")
+assert valid_net6("2001:db8::/32")
+assert valid_net("1.2.3.0/33") is False
+assert valid_net6("2001:db8::/129") is False
+
+
+= The mechanism: inet_pton raises ValueError, which socket.error misses
+~ fuzzing utils
+
+# This is the assumption the fix rests on. If inet_pton ever starts raising
+# something that IS an OSError for an embedded NUL, the described cause is
+# wrong rather than the fix being unnecessary.
+import socket
+
+try:
+    socket.inet_pton(socket.AF_INET6, "\x00\x01")
+    assert False, "inet_pton accepted an embedded NUL"
+except ValueError as exception:
+    assert not isinstance(exception, OSError)
+
+# ...while a merely malformed address raises the OSError that was always
+# being caught.
+try:
+    socket.inet_pton(socket.AF_INET6, "nonsense")
+    assert False, "inet_pton accepted nonsense"
+except OSError:
+    pass
+
+############
+############
++ Where the raise surfaced: MultipleTypeField selectors on ARP
+
+= An ARP address field holding arbitrary bytes builds
+~ fuzzing l2
+
+# ARP.psrc is a MultipleTypeField whose IPv6 arm is guarded by
+# valid_net6(val), consulted only while plen is None - so a NUL in psrc was
+# reported as 'While building field plen: embedded null character'. plen is a
+# FieldLenField that merely measures psrc; it named neither the field holding
+# the value nor the address that failed, and the traceback ended in
+# pton_ntop.py, a long way from the selector that asked the question.
+built = raw(ARP(ptype=0x86dd, psrc="\x00\x01", pdst="::1"))
+assert built[:2] == b"\x00\x01"    # hwtype
+assert built[2:4] == b"\x86\xdd"   # ptype
+
+# The selector fell through to its StrFixedLenField default, which is what
+# should happen for bytes that are not an address: the value is carried as-is.
+assert b"\x00\x01" in built
+
+# Every address field on the layer, both families, and the v4 selector too.
+for kwargs in [
+    {"ptype": 0x86dd, "psrc": "\x00\x01"},
+    {"ptype": 0x86dd, "pdst": "\x00\x01"},
+    {"ptype": 0x86dd, "psrc": "::1\x00", "pdst": "\x00"},
+    {"ptype": 0x0800, "psrc": "\x00\x01"},
+    {"ptype": 0x0800, "pdst": "1.2.3.4\x00"},
+]:
+    assert raw(ARP(**kwargs))
+
+
+= A fuzzed ARP whose psrc walks onto a NUL-bearing value still builds
+~ fuzzing l2
+
+# The shape the walk found it in: fuzz() installs a RandBin over all 256 byte
+# values on psrc/pdst, and the selector is handed whatever it renders.
+import random
+
+random.seed(1234)
+packet = fuzz(ARP())
+
+# plen is what opens the selector at all - valid_net6(val) is consulted only
+# while plen is None - so a walk that has armed plen with a concrete length
+# never reaches the predicate. None is ARP's own default for it.
+packet.plen = None
+packet.ptype = 0x86dd
+
+for value in [b"\x00", b"\x00\x01", b"\x00" * 16, b"a\x00b", b"\xff\x00"]:
+    packet.psrc = value
+    packet.pdst = value
+    assert raw(packet)
+
+# Round-tripping still works for values that really are addresses.
+packet = ARP(raw(ARP(ptype=0x86dd)))
+assert packet.ptype == 0x86dd
+assert valid_ip6(packet.psrc)
+assert valid_ip6(packet.pdst)

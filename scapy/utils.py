@@ -793,7 +793,7 @@ def valid_ip6(addr):
         return False
     try:
         inet_pton(socket.AF_INET6, addr)
-    except socket.error:
+    except (OSError, ValueError, socket.error):
         return False
     return True
 

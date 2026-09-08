@@ -178,6 +178,27 @@ ExtensionHeadersTypes = {
 
 class TBCDByteField(StrFixedLenField):
 
+    def randval(self):
+        # i2m() below reads the value as pairs of hex digits, so the RandBin
+        # over all 256 byte values that StrFixedLenField.randval() hands
+        # back raises ValueError on all but a lucky few.
+        #
+        # Decimal digits are the alphabet to draw from, and not merely a
+        # safe subset of hex: i2m() reads base 16 while m2i() indexes
+        # TBCD_TO_ASCII by nibble, and the two coincide only over '0'-'9' -
+        # 'a' means 10 to one and 12 to the other. They are also what a TBCD
+        # field carries in the first place (an IMSI, an MEI, an MCC), which
+        # is what every default declared below is.
+        #
+        # Two digits go to the byte, so a field of sz bytes wants 2*sz of
+        # them; anything longer is truncated by StrFixedLenField.addfield()
+        # and anything shorter NUL-padded by it.
+        try:
+            size = self.length_from(None) * 2
+        except Exception:
+            size = RandNum(0, 200)
+        return RandString(size, chars="0123456789")
+
     def i2h(self, pkt, val):
         return val
 
