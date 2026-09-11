@@ -240,3 +240,181 @@ parsed = UDP(built)
 
 assert parsed.sport == 3478, parsed.sport
 assert parsed.dport == 3478, parsed.dport
+
++ STUN message types
+
+= test every RFC 8489 / RFC 8656 method is declared
+
+from scapy.contrib.stun import _stun_method
+
+# RFC 8489 s:18.2 declares Binding; RFC 8656 s:17 adds the six that are the
+# whole of TURN over UDP. A method missing here cannot be named by a caller at
+# all. IANA's registry also carries RFC 6062's Connect (0x00A), ConnectionBind
+# (0x00B) and ConnectionAttempt (0x00C), which scapy has no attributes for.
+assert set(_stun_method) == {
+    "Binding", "Allocate", "Refresh", "Send", "Data", "CreatePermission",
+    "ChannelBind"
+}, sorted(_stun_method)
+assert _stun_method["Binding"] == 0x001
+assert _stun_method["Allocate"] == 0x003
+assert _stun_method["Refresh"] == 0x004
+assert _stun_method["Send"] == 0x006
+assert _stun_method["Data"] == 0x007
+assert _stun_method["CreatePermission"] == 0x008
+assert _stun_method["ChannelBind"] == 0x009
+
+= test the eighteen defined messages encode to their RFC values
+
+from scapy.contrib.stun import _stun_message_type
+
+# The eighteen messages RFC 8489 and RFC 8656 define, with the value each one
+# puts on the wire. Written out rather than computed, so this disagrees with a
+# wrong interleave instead of sharing its arithmetic.
+expected = {
+    "Binding request": 0x0001,
+    "Binding indication": 0x0011,
+    "Binding success response": 0x0101,
+    "Binding error response": 0x0111,
+    "Allocate request": 0x0003,
+    "Allocate success response": 0x0103,
+    "Allocate error response": 0x0113,
+    "Refresh request": 0x0004,
+    "Refresh success response": 0x0104,
+    "Refresh error response": 0x0114,
+    "Send indication": 0x0016,
+    "Data indication": 0x0017,
+    "CreatePermission request": 0x0008,
+    "CreatePermission success response": 0x0108,
+    "CreatePermission error response": 0x0118,
+    "ChannelBind request": 0x0009,
+    "ChannelBind success response": 0x0109,
+    "ChannelBind error response": 0x0119,
+}
+for name, value in expected.items():
+    assert _stun_message_type[name] == value, (
+        name, hex(_stun_message_type[name]), hex(value))
+
+# and each survives a build/parse round trip under its own name
+for name, value in expected.items():
+    built = bytes(STUN(stun_message_type=name))
+    assert int.from_bytes(built[:2], "big") == value, (name, built[:2].hex())
+    back = STUN(built)
+    assert STUN.stun_message_type.i2repr(None, back.stun_message_type) == name, name
+
+= test the class/method interleave above method 0x00F
+
+from scapy.contrib.stun import _stun_type
+
+# RFC 8489 s:5 lays the 14-bit type out as M11..M7 C1 M6..M4 C0 M3..M0, so the
+# method's bits 4-6 land at 5-7 and its bits 7-11 at 9-13.
+#
+# Every method these two RFCs assign is <= 0x009, so the table exercises
+# only a method's low four bits and cannot tell a right interleave from a
+# wrong one. These hypothetical methods can: shifting by 5 and 9 instead puts
+# 0x010 at 0x0200 rather than 0x0020, and pushes 0x080 out of the 14 bits the
+# field has altogether.
+assert _stun_type(0x010, 0b00) == 0x0020, hex(_stun_type(0x010, 0b00))
+assert _stun_type(0x011, 0b00) == 0x0021, hex(_stun_type(0x011, 0b00))
+assert _stun_type(0x070, 0b00) == 0x00e0, hex(_stun_type(0x070, 0b00))
+assert _stun_type(0x080, 0b00) == 0x0200, hex(_stun_type(0x080, 0b00))
+assert _stun_type(0xfff, 0b00) == 0x3eef, hex(_stun_type(0xfff, 0b00))
+
+# the class is C0 at bit 4 and C1 at bit 8, alone and alongside a method
+assert _stun_type(0x000, 0b01) == 0x0010
+assert _stun_type(0x000, 0b10) == 0x0100
+assert _stun_type(0x000, 0b11) == 0x0110
+assert _stun_type(0xfff, 0b11) == 0x3fff
+
+# the interleave is a bijection over 12 method bits and 2 class bits, and
+# nothing it produces overflows the 14 bits the field carries
+seen = set()
+for method_code in range(0x1000):
+    for class_code in range(0b100):
+        v = _stun_type(method_code, class_code)
+        assert v <= 0x3fff, (hex(method_code), class_code, hex(v))
+        seen.add(v)
+
+assert len(seen) == 0x1000 * 0b100, len(seen)
+
+= test the message type table is the full cross product
+
+from scapy.contrib.stun import _stun_message_type
+
+assert len(_stun_message_type) == 28, len(_stun_message_type)
+assert len(set(_stun_message_type.values())) == 28
+
++ STUN defaults
+
+= test STUN() builds a valid Binding request
+
+# 0x0000 is not an assigned method, so a no-argument STUN() used to build a
+# message every receiver drops before it reads a single attribute.
+pkt = STUN()
+assert pkt.stun_message_type == 0x0001, pkt.stun_message_type
+assert STUN.stun_message_type.i2repr(None, pkt.stun_message_type) == "Binding request"
+
+built = bytes(pkt)
+assert built[:2] == b"\x00\x01", built[:2].hex()
+assert len(built) == 20, len(built)
+assert STUN(built).build() == built
+
+= test stun_message_type and transaction_id are values, not None
+
+def _field(name):
+    for f in STUN.fields_desc:
+        if f.name == name:
+            return f
+    raise AssertionError(name)
+
+# None was a resting value on both of these, not "the class computes this":
+# STUN.post_build assigns 'length' and nothing else. So None built as zero and
+# 96 zero bits, and fuzz() skipped both fields for a default nothing filled in.
+assert _field("stun_message_type").default == 0x0001
+assert _field("transaction_id").default == 0
+
+# length is the opposite case and must stay that way - post_build computes it
+assert _field("length").default is None
+assert _field("length").computes_own_value()
+
+= test length is still computed for a message with attributes
+
+pkt = STUN(attributes=[STUNFingerprint(crc_32=0x8718c3a4)])
+built = bytes(pkt)
+assert built[2:4] == b"\x00\x08", built[2:4].hex()
+assert STUN(built).length == 8
+
++ STUN fuzzing
+
+= test fuzz() walks the message type over every declared value
+
+import collections
+import contextlib
+import io
+import random
+
+from scapy.contrib.stun import _stun_message_type
+
+# Neither field was reachable by fuzz() before: fuzz() skips a None class
+# default, and the refinement that reads a resting None as fuzzable declines
+# any class overriding post_build, which STUN does. With real defaults the
+# enum walk emits every declared value before it spends budget elsewhere, so
+# the eighteen real messages are sent deterministically rather than sampled.
+pkt = fuzz(STUN())
+random.seed(3)
+types, tids, n = collections.Counter(), set(), 0
+with contextlib.redirect_stdout(io.StringIO()):
+    states = pkt.prepare_combinations(1)
+    more = True
+    while more and n < 20000:
+        raw = bytes(pkt)
+        types[int.from_bytes(raw[0:2], "big") & 0x3fff] += 1
+        tids.add(raw[8:20])
+        states, more = pkt.forward(states)
+        n += 1
+
+missing = sorted(hex(v) for v in set(_stun_message_type.values()) - set(types))
+assert not missing, missing
+assert len(types) > 1, types
+
+# transaction_id was 96 zero bits in every packet the walk emitted
+assert len(tids) > 1, len(tids)

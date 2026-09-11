@@ -53,18 +53,49 @@ _stun_class = {
     "error response": 0b11
 }
 
+# RFC 8489 s:18.2 and RFC 8656 s:17, which between them assign every method
+# here; 0x000, 0x002 and 0x005 are reserved. These are not the whole of IANA's
+# "STUN Methods" registry - RFC 6062 adds Connect (0x00A), ConnectionBind
+# (0x00B) and ConnectionAttempt (0x00C) for TCP allocations, which scapy has
+# no attributes for.
 _stun_method = {
-    "Binding": 0b000000000001
+    "Binding": 0b000000000001,
+    "Allocate": 0b000000000011,
+    "Refresh": 0b000000000100,
+    "Send": 0b000000000110,
+    "Data": 0b000000000111,
+    "CreatePermission": 0b000000001000,
+    "ChannelBind": 0b000000001001,
 }
 
+
 # fmt: off
-_stun_message_type = {
-    "{} {}".format(method, class_):
+def _stun_type(method_code, class_code):
+    # type: (int, int) -> int
+    """Interleave a method and a class into a 14-bit message type.
+
+    RFC 8489 s:5 lays the type out as M11..M7 C1 M6..M4 C0 M3..M0, so neither
+    the method nor the class is contiguous:
+
+        method bits 0-3  stay at bits 0-3     class bit 0 -> bit 4
+        method bits 4-6  move to bits 5-7     class bit 1 -> bit 8
+        method bits 7-11 move to bits 9-13
+
+    Every method RFC 8489 and RFC 8656 assign is <= 0x009, so only the first
+    of those three runs is exercised by the table below; the other two are
+    here for a method the registry has yet to hand out.
+    """
+    return (
         (method_code & 0b000000001111)      |    # noqa: E221,W504
         (class_code  & 0b01)           << 4 |    # noqa: E221,W504
-        (method_code & 0b000001110000) << 5 |    # noqa: E221,W504
+        (method_code & 0b000001110000) << 1 |    # noqa: E221,W504
         (class_code  & 0b10)           << 7 |    # noqa: E221,W504
-        (method_code & 0b111110000000) << 9
+        (method_code & 0b111110000000) << 2
+    )
+
+
+_stun_message_type = {
+    "{} {}".format(method, class_): _stun_type(method_code, class_code)
     for (method, method_code), (class_, class_code) in
         itertools.product(_stun_method.items(), _stun_class.items())    # noqa: E131
 }
@@ -290,10 +321,16 @@ class STUN(Packet):
 
     fields_desc = [
         BitField('RESERVED', 0b00, size=2),   # <- always zeroes
-        BitEnumField('stun_message_type', None, 14, _stun_message_type),
+        BitEnumField('stun_message_type', 0x0001, 14, _stun_message_type),
         LenField('length', None, fmt='!h'),
         XIntField('magic_cookie', MAGIC_COOKIE),
-        XBitField('transaction_id', None, 96),
+        # RFC 8489 s:5 wants this chosen at random per transaction; 0 is a
+        # resting default rather than a recommended value. It is a value at
+        # all because None here never meant "the class computes this":
+        # post_build below assigns 'length' and nothing else, so a None
+        # transaction_id simply built as 96 zero bits, and fuzz() skipped
+        # the field for a default the class was not in fact filling in.
+        XBitField('transaction_id', 0, 96),
         PacketListField("attributes", [], STUNGenericTlv)
     ]
 
