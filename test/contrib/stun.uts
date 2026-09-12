@@ -418,3 +418,137 @@ assert len(types) > 1, types
 
 # transaction_id was 96 zero bits in every packet the walk emitted
 assert len(tids) > 1, len(tids)
+
++ STUN attribute types
+
+= test the vocabulary names every type the module dispatches on
+
+from scapy.contrib.stun import _stun_attribute_types, _stun_tlv_class
+
+# _stun_tlv_class is the module's own statement of what it understands, so a
+# vocabulary narrower than it would leave the field unable to name an
+# attribute this very file parses.
+missing = sorted(hex(t) for t in set(_stun_tlv_class) - set(_stun_attribute_types))
+assert not missing, missing
+
+# 0xc057 is the one that catches a vocabulary copied out of the RFCs: it is a
+# Google vendor attribute, absent from every IANA registry, and dispatched on.
+assert _stun_attribute_types[0xc057] == "GOOG-NETWORK-INFO"
+
+= test the two attribute tables are one table
+
+from scapy.contrib.stun import _stun_attribute_types, _stun_tlv_attribute_types
+
+# _stun_tlv_attribute_types shipped with the original STUN support and nothing
+# read it. It is now the hand-maintained list and _stun_attribute_types is its
+# inverse, so the pair cannot drift; that only holds while the names are
+# unique, which this asserts rather than assumes.
+assert len(set(_stun_tlv_attribute_types.values())) == len(_stun_tlv_attribute_types)
+assert _stun_attribute_types == {
+    code: name for name, code in _stun_tlv_attribute_types.items()
+}
+assert len(_stun_attribute_types) == 29, len(_stun_attribute_types)
+
+= test every attribute class declares the vocabulary on 'type'
+
+from scapy.fields import EnumField
+from scapy.contrib.stun import STUNGenericTlv, _stun_attribute_types
+
+from scapy.contrib import stun as _stun_mod
+
+classes = [
+    c for c in vars(_stun_mod).values()
+    if isinstance(c, type) and issubclass(c, STUNGenericTlv)
+]
+assert len(classes) == 10, len(classes)
+
+for cls in classes:
+    f = cls.fields_desc[0]
+    assert f.name == "type", (cls.__name__, f.name)
+    assert isinstance(f, EnumField), (cls.__name__, type(f).__name__)
+    # a class that named only its own type would still pass an isinstance
+    # check, so require the whole vocabulary on each one
+    assert f.i2s == _stun_attribute_types, cls.__name__
+
+= test an attribute type reads as its name, and an unassigned one as hex
+
+from scapy.contrib.stun import STUNGenericTlv
+
+f = STUNGenericTlv.fields_desc[0]
+
+# a type with no class of its own still gets named
+assert f.i2repr(None, 0x0009) == "ERROR-CODE"
+assert f.i2repr(None, 0x0013) == "DATA"
+# and one the module dispatches on
+assert f.i2repr(None, 0x8028) == "FINGERPRINT"
+
+# XShortEnumField, not ShortEnumField: an unassigned type keeps the hex it
+# showed under XShortField. ShortEnumField would render this one as 16962.
+assert f.i2repr(None, 0x4242) == "0x4242", f.i2repr(None, 0x4242)
+assert f.i2repr(None, 0x0000) == "0x0", f.i2repr(None, 0x0000)
+
+= test naming the types changed nothing that goes on the wire
+
+# The vocabulary is declarative. Every default is what it was, so every class
+# still builds the exact bytes it built before it had an enum.
+built = {
+    STUNFingerprint: bytes.fromhex("8028000400000000"),
+    STUNGenericTlv: bytes.fromhex("00000000"),
+    STUNGoogNetworkInfo: bytes.fromhex("c0570004000003e7"),
+    STUNIceControlling: bytes.fromhex("802a00080000000000000000"),
+    STUNMappedAddress: bytes.fromhex("00010008000100007f000001"),
+    STUNMessageIntegrity: bytes.fromhex("0008001400000000000000000000000000000000"
+                                        "00000000"),
+    STUNPriority: bytes.fromhex("0024000400000000"),
+    STUNUseCandidate: bytes.fromhex("00250000"),
+    STUNUsername: bytes.fromhex("00060000"),
+    STUNXorMappedAddress: bytes.fromhex("00200008000121125e12a443"),
+}
+for cls, expected in built.items():
+    assert bytes(cls()) == expected, (cls.__name__, bytes(cls()).hex())
+
+= test dispatch still reads the type off the wire, not off the enum
+
+from scapy.contrib.stun import STUNGenericTlv, STUNFingerprint
+
+# dispatch_hook unpacks the first two bytes itself; declaring a vocabulary
+# must not have moved that decision into the field.
+raw = b"\x80\x28\x00\x04\x87\x18\xc3\xa4"
+assert type(STUNGenericTlv(raw)) is STUNFingerprint
+
+# a named type with no class of its own still lands on the generic class
+attr = STUNGenericTlv(b"\x00\x13\x00\x04\x00\x00\x00\x00")
+assert type(attr) is STUNGenericTlv, type(attr).__name__
+assert attr.type == 0x0013
+assert attr.sprintf("%type%") == "DATA", attr.sprintf("%type%")
+
+= test fuzz() walks the attribute type over every declared value
+
+import collections
+import contextlib
+import io
+import random
+
+from scapy.contrib.stun import STUNGenericTlv, _stun_attribute_types
+
+# Undeclared, this field was a 65,536-value range sampled 128 times, and the
+# step of 516 stepped straight over the whole assigned 0x0001-0x0025 block.
+# The enum walk emits every declared value before it spends budget elsewhere.
+pkt = fuzz(STUNGenericTlv())
+random.seed(3)
+seen, n = set(), 0
+with contextlib.redirect_stdout(io.StringIO()):
+    states = pkt.prepare_combinations(1)
+    more = True
+    while more and n < 20000:
+        states, more = pkt.forward(states)
+        n += 1
+        seen.add(int(pkt.type))
+
+missing = sorted(hex(v) for v in set(_stun_attribute_types) - seen)
+assert not missing, missing
+
+# and the undeclared range is still covered - declaring a vocabulary is only
+# an improvement while unknown-type handling keeps being exercised
+undeclared = seen - set(_stun_attribute_types)
+assert len(undeclared) > 1, sorted(hex(v) for v in undeclared)

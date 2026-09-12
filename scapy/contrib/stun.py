@@ -30,7 +30,7 @@ from scapy.fields import (
     PadField,
     StrLenField,
     PacketListField,
-    XShortField,
+    XShortEnumField,
     FieldLenField,
     ShortField,
     ByteEnumField,
@@ -101,12 +101,56 @@ _stun_message_type = {
 }
 # fmt: on
 
+# RFC 5389 s:18.2, RFC 8489 s:18.3 and RFC 8656 s:18 are the registries this is
+# drawn from. It names more than _stun_tlv_class dispatches on: a type with no
+# class of its own still dissects as STUNGenericTlv, and naming it costs
+# nothing while leaving the field able to say what it carries.
+_stun_tlv_attribute_types = {
+    "MAPPED-ADDRESS": 0x0001,
+    "RESPONSE-ADDRESS": 0x0002,
+    "CHANGE-REQUEST": 0x0003,
+    "SOURCE-ADDRESS": 0x0004,
+    "CHANGED-ADDRESS": 0x0005,
+    "USERNAME": 0x0006,
+    "PASSWORD": 0x0007,
+    "MESSAGE-INTEGRITY": 0x0008,
+    "ERROR-CODE": 0x0009,
+    "UNKNOWN-ATTRIBUTES": 0x000A,
+    "REFLECTED-FROM": 0x000B,
+    "CHANNEL-NUMBER": 0x000C,
+    "LIFETIME": 0x000D,
+    "XOR-PEER-ADDRESS": 0x0012,
+    "DATA": 0x0013,
+    "REALM": 0x0014,
+    "NONCE": 0x0015,
+    "XOR-RELAYED-ADDRESS": 0x0016,
+    "REQUESTED-TRANSPORT": 0x0019,
+    "DONT-FRAGMENT": 0x001A,
+    "XOR-MAPPED-ADDRESS": 0x0020,
+    "PRIORITY": 0x0024,
+    "USE-CANDIDATE": 0x0025,
+    "SOFTWARE": 0x8022,
+    "ALTERNATE-SERVER": 0x8023,
+    "FINGERPRINT": 0x8028,
+    "ICE-CONTROLLED": 0x8029,
+    "ICE-CONTROLLING": 0x802a,
+    # Not IANA registered, but _stun_tlv_class dispatches on it, so leaving it
+    # out would make the enum narrower than the module's own dispatch table.
+    "GOOG-NETWORK-INFO": 0xc057
+}
+
+# What the fields carry. _EnumField would invert the dict above on its own, but
+# an enum keyed the way it is read is one less thing to work out at the call.
+_stun_attribute_types = {
+    code: name for name, code in _stun_tlv_attribute_types.items()
+}
+
 
 class STUNGenericTlv(Packet):
     name = "STUN Generic TLV"
 
     fields_desc = [
-        XShortField("type", 0x0000),
+        XShortEnumField("type", 0x0000, _stun_attribute_types),
         FieldLenField("length", None, length_of="value"),
         PadField(StrLenField("value", "", length_from=lambda pkt:pkt.length), align=4)
     ]
@@ -126,7 +170,7 @@ class STUNUsername(STUNGenericTlv):
     name = "STUN Username"
 
     fields_desc = [
-        XShortField("type", 0x0006),
+        XShortEnumField("type", 0x0006, _stun_attribute_types),
         FieldLenField("length", None, length_of="username"),
         PadField(
             StrLenField("username", '', length_from=lambda pkt: pkt.length),
@@ -139,7 +183,7 @@ class STUNMessageIntegrity(STUNGenericTlv):
     name = "STUN Message Integrity"
 
     fields_desc = [
-        XShortField("type", 0x0008),
+        XShortEnumField("type", 0x0008, _stun_attribute_types),
         ShortField("length", 20),
         XNBytesField("hmac_sha1", 0, 20)
     ]
@@ -153,7 +197,7 @@ class STUNPriority(STUNGenericTlv):
     name = "STUN Priority"
 
     fields_desc = [
-        XShortField("type", 0x0024),
+        XShortEnumField("type", 0x0024, _stun_attribute_types),
         ShortField("length", 4),
         IntField("priority", 0)
     ]
@@ -209,7 +253,7 @@ class STUNXorMappedAddress(STUNGenericTlv):
     name = "STUN XOR Mapped Address"
 
     fields_desc = [
-        XShortField("type", 0x0020),
+        XShortEnumField("type", 0x0020, _stun_attribute_types),
         FieldLenField("length", None, length_of="xip", adjust=lambda pkt, x: x + 4),
         ByteField("RESERVED", 0),
         ByteEnumField("address_family", 1, _xor_mapped_address_family),
@@ -228,7 +272,7 @@ class STUNMappedAddress(STUNGenericTlv):
     name = "STUN Mapped Address"
 
     fields_desc = [
-        XShortField("type", 0x0001),
+        XShortEnumField("type", 0x0001, _stun_attribute_types),
         FieldLenField("length", None, length_of="ip", adjust=lambda pkt, x: x + 4),
         ByteField("RESERVED", 0),
         ByteEnumField("address_family", 1, _xor_mapped_address_family),
@@ -247,7 +291,7 @@ class STUNUseCandidate(STUNGenericTlv):
     name = "STUN Use Candidate"
 
     fields_desc = [
-        XShortField("type", 0x0025),
+        XShortEnumField("type", 0x0025, _stun_attribute_types),
         FieldLenField("length", 0, length_of="value"),
         PadField(StrLenField("value", "", length_from=lambda pkt: pkt.length), align=4)
     ]
@@ -257,7 +301,7 @@ class STUNFingerprint(STUNGenericTlv):
     name = "STUN Fingerprint"
 
     fields_desc = [
-        XShortField("type", 0x8028),
+        XShortEnumField("type", 0x8028, _stun_attribute_types),
         ShortField("length", 4),
         XIntField("crc_32", None)
     ]
@@ -267,7 +311,7 @@ class STUNIceControlling(STUNGenericTlv):
     name = "STUN ICE-controlling"
 
     fields_desc = [
-        XShortField("type", 0x802a),
+        XShortEnumField("type", 0x802a, _stun_attribute_types),
         ShortField("length", 8),
         XLongField("tie_breaker", None)
     ]
@@ -277,7 +321,7 @@ class STUNGoogNetworkInfo(STUNGenericTlv):
     name = "STUN Google Network Info"
 
     fields_desc = [
-        XShortField("type", 0xc057),
+        XShortEnumField("type", 0xc057, _stun_attribute_types),
         ShortField("length", 4),
         ShortField("network_id", 0),
         ShortField("network_cost", 999)
@@ -294,25 +338,6 @@ _stun_tlv_class = {
     0x8028: STUNFingerprint,
     0x802a: STUNIceControlling,
     0xc057: STUNGoogNetworkInfo
-}
-
-_stun_tlv_attribute_types = {
-    "MAPPED-ADDRESS": 0x0001,
-    "USERNAME": 0x0006,
-    "MESSAGE-INTEGRITY": 0x0008,
-    "ERROR-CODE": 0x0009,
-    "UNKNOWN-ATTRIBUTES": 0x000A,
-    "REALM": 0x0014,
-    "NONCE": 0x0015,
-    "XOR-MAPPED-ADDRESS": 0x0020,
-    "PRIORITY": 0x0024,
-    "USE-CANDIDATE": 0x0025,
-    "SOFTWARE": 0x8022,
-    "ALTERNATE-SERVER": 0x8023,
-    "FINGERPRINT": 0x8028,
-    "ICE-CONTROLLED": 0x8029,
-    "ICE-CONTROLLING": 0x802a,
-    "GOOG-NETWORK-INFO": 0xc057
 }
 
 
