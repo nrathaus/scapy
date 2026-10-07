@@ -2068,8 +2068,20 @@ class _PacketFieldSingle(_PacketField[K]):
 
 class PacketField(_PacketFieldSingle[BasePacket]):
     def randval(self):  # type: ignore
-        # type: () -> Packet
-        from scapy.packet import fuzz
+        # type: () -> Optional[Packet]
+        from scapy.packet import Packet, fuzz  # late: it imports this module
+        if self.cls is None:
+            # A field that picks its class from the bytes in its own m2i()
+            # (NTPControlStatusField, _ECBasisField, _TLSServerParamsField,
+            # _TLSCKExchKeysField, _pObjectDataField) has no class to build
+            # here, and calling None took the whole packet down rather than
+            # just this field. Fuzz the packet the default carries when there
+            # is one - it is one of the classes m2i() can return - and leave
+            # the field at its default otherwise: fuzz() skips a field whose
+            # randval() answers None.
+            if isinstance(self.default, Packet):
+                return fuzz(self.default)
+            return None
         return fuzz(self.cls())  # type: ignore
 
 

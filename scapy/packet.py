@@ -4294,8 +4294,15 @@ def fuzz(p,  # type: _P
                     continue
 
             if isinstance(real_f, PacketListField):
-                if field_is_active:
-                    for r in getattr(q, f.name):
+                # Not every active list-valued field holds a list: a NULL
+                # NDR pointer around one (CustomHeader.pclsid, an
+                # NDRFullEmbPointerField that _unwrap_field() unwraps to an
+                # NDRConfPacketListField) reads back as None, and iterating
+                # that took the whole packet down. Same guard the
+                # FieldListField branch below already carries.
+                current_list = getattr(q, f.name) if field_is_active else None
+                if isinstance(current_list, list):
+                    for r in current_list:
                         fuzz(r, _inplace=1, _lengths=False)
             elif isinstance(real_f, FieldListField):
                 # Fuzz each item with the inner field's own randval, keeping

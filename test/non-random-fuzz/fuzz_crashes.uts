@@ -182,6 +182,124 @@ assert isinstance(fuzz(ISIS_AreaEntry()), ISIS_AreaEntry)
 
 ############
 ############
++ A PacketField that chooses its class in m2i()
+
+= A cls of None is answered from the default rather than by calling it
+~ fuzzing packet fields
+
+# PacketField.randval() was 'fuzz(self.cls())', and five fields in the
+# library pass cls=None on purpose: the class is a function of the bytes, so
+# m2i() picks it and no constructor argument can express that. 'None()' took
+# the whole packet down.
+
+from scapy.fields import MultipleTypeField
+from scapy.layers.msrpce.msdcom import OBJREF_CUSTOM
+from scapy.layers.ntp import NTPControl, NTPSystemStatusPacket
+from scapy.layers.tls.handshake import TLSClientKeyExchange, TLSServerKeyExchange
+from scapy.layers.tls.keyexchange import ServerECDHExplicitChar2Params
+
+# Imported rather than discovered: walking every live PacketField needs every
+# module imported, and the two TLS handshakes cannot even be constructed
+# without the cryptography module, which this is not a test of.
+for (cls, name) in [(NTPControl, "status"),
+                    (OBJREF_CUSTOM, "pObjectData"),
+                    (ServerECDHExplicitChar2Params, "basis"),
+                    (TLSClientKeyExchange, "exchkeys"),
+                    (TLSServerKeyExchange, "params")]:
+    field = [f for f in cls.fields_desc if f.name == name][0]
+    if isinstance(field, MultipleTypeField):
+        # NTPControl.status resolves to the PacketField only on a reply - its
+        # one condition, 'pkt.response == 0 or pkt.op_code in [6, 7]', gives a
+        # plain ShortField - so the arm that matters is the dflt.
+        field = field.dflt
+    assert field.cls is None, (cls.__name__, name)
+    field.randval()
+
+# The default is an instance of one of the classes m2i() can return, so it is
+# what the field itself says to build.
+basis = [f for f in ServerECDHExplicitChar2Params.fields_desc
+         if f.name == "basis"][0]
+assert isinstance(basis.randval(), type(basis.default))
+
+# A field with no default either is skipped: fuzz() already tests its
+# randval() for None, so this costs one axis rather than the packet.
+params = [f for f in TLSServerKeyExchange.fields_desc if f.name == "params"][0]
+assert params.default is None
+assert params.randval() is None
+
+
+= The real packet it was found on
+~ fuzzing packet ntp
+
+# NTPControl.status is a MultipleTypeField whose condition is
+# 'pkt.response == 0 or pkt.op_code in [6, 7]', so a mode 6 reply - the
+# server's direction, which is what a client has to be tested against - was
+# the one that could not be fuzzed at all.
+packet = fuzz(NTPControl(response=1))
+
+status = packet.default_fields["status"]
+assert isinstance(status, NTPSystemStatusPacket), status
+assert all(isinstance(v, VolatileValue)
+           for v in status.default_fields.values()), status.default_fields
+
+# It still builds and comes back as the same status packet.
+assert isinstance(NTPControl(bytes(packet)).status, NTPSystemStatusPacket)
+
+# The request direction resolves to a plain ShortField and is unaffected.
+assert isinstance(fuzz(NTPControl(response=0)).default_fields["status"],
+                  VolatileValue)
+
+
+= Fuzzing the default does not touch the default
+~ fuzzing packet ntp
+
+# The default lives on the field, so it is shared by every packet of the
+# class. fuzz() copies, and this is what the copy is for.
+field = [f for f in NTPControl.fields_desc if f.name == "status"][0].dflt
+before = dict(field.default.default_fields)
+first = field.randval()
+assert first is not field.default
+assert field.randval() is not first
+assert field.default.default_fields == before
+
+
+############
+############
++ An active list-valued field that does not hold a list
+
+= A NULL pointer around a PacketListField is skipped, not iterated
+~ fuzzing packet fields
+
+from scapy.fields import PacketListField
+from scapy.layers.msrpce.msdcom import CustomHeader
+
+# CustomHeader.pclsid is an NDRFullEmbPointerField, which fuzz() unwraps to
+# the NDRConfPacketListField underneath, so it took the PacketListField
+# branch - and a NULL pointer reads back as None, which 'for r in
+# getattr(q, f.name)' cannot iterate. The FieldListField branch beside it
+# already carried the guard.
+field = [f for f in CustomHeader.fields_desc if f.name == "pclsid"][0]
+assert isinstance(field.fld, PacketListField), field.fld
+assert CustomHeader().pclsid is None
+
+assert isinstance(fuzz(CustomHeader()), CustomHeader)
+assert len(bytes(fuzz(CustomHeader()))) > 0
+
+
+= A list that is a list is still fuzzed per item
+~ fuzzing packet inet
+
+from scapy.layers.inet import IPOption_RR
+
+packet = fuzz(IP(options=[IPOption_RR()]))
+option = packet.options[0]
+assert isinstance(option.default_fields["pointer"], VolatileValue)
+assert isinstance(option.default_fields["optclass"], VolatileValue)
+assert len(bytes(packet)) > 0
+
+
+############
+############
 + Controls
 
 = An ordinary layer is unaffected
