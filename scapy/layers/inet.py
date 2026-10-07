@@ -382,12 +382,13 @@ class RandTCPOptions(VolatileValue):
     max = len(combinations_patterns) + 1 # at max we will generate 2 options (and an empty start)
 
     def __init__(self, size=None):
-        # if size is None:
-        #     size = RandNum(1, 5)
-        # self.size = size
         if size is not None:
             raise ValueError("Size provided, not expected")
-        self.size = self.min
+        # Only the state_pos is None branch of _fix() reads this: how many
+        # options to draw when nothing is walking the field. min/max above
+        # are the walk's bounds over combinations_patterns, not a count of
+        # options, so resting size on min left random mode drawing none.
+        self.size = RandNum(1, 5)
 
     def _fix(self):
         # Pseudo-Random amount of options
@@ -396,7 +397,7 @@ class RandTCPOptions(VolatileValue):
         if self.state_pos is None:
             rand_patterns = [
                 random.choice(list(
-                    (opt, fmt) for opt, fmt in six.itervalues(TCPOptions[0])
+                    (opt, fmt) for opt, fmt in TCPOptions[0].values()
                     if opt != 'EOL'
                 ))
                 for _ in range(self.size)
