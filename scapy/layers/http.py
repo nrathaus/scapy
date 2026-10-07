@@ -676,7 +676,7 @@ class HTTP(Packet):
                 return http_packet
             is_response = isinstance(http_packet.payload, cls.clsresp)
             # Packets may have a Content-Length we must honnor
-            length = http_packet.Content_Length
+            length = getattr(http_packet, "Content_Length", None)
             if length:
                 # Parse the length as an integer
                 try:
@@ -695,7 +695,8 @@ class HTTP(Packet):
                 # Subtract the length of the "HTTP*" layer
                 elif http_packet.payload.payload or length == 0:
                     http_length = len(data) - http_packet.payload._original_len
-                    detect_end = lambda dat: len(dat) - http_length >= length
+                    metadata["http_end"] = http_end = http_length + length
+                    detect_end = lambda dat: len(dat) >= http_end
                 else:
                     # The HTTP layer isn't fully received.
                     if metadata.get("tcp_end", False):
@@ -739,9 +740,15 @@ class HTTP(Packet):
                     metadata["detect_unknown"] = True
             metadata["detect_end"] = detect_end
             if detect_end(data):
+                http_end = metadata.get("http_end")
+                if http_end is not None and len(data) > http_end:
+                    return cls(data[:http_end]) / conf.padding_layer(data[http_end:])
                 return http_packet
         else:
             if detect_end(data):
+                http_end = metadata.get("http_end")
+                if http_end is not None and len(data) > http_end:
+                    return cls(data[:http_end]) / conf.padding_layer(data[http_end:])
                 http_packet = cls(data)
                 return http_packet
 
@@ -817,7 +824,7 @@ class HTTP_Client(object):
         if port is None:
             port = 443 if tls else 80
         # If the current socket matches, keep it.
-        if self._sockinfo == (host, port):
+        if self._sockinfo == (host, port, tls):
             return
         # A new socket is needed
         if self._sockinfo:
@@ -862,7 +869,7 @@ class HTTP_Client(object):
         else:
             self.sock = StreamSocket(sock, HTTP)
         # Store information regarding the current socket
-        self._sockinfo = (host, port)
+        self._sockinfo = (host, port, tls)
 
     def sr1(self, req, **kwargs):
         if self.verb:
