@@ -129,11 +129,11 @@ while continue_to_fuzz and steps < 200000:
     rendered[value] = rendered.get(value, 0) + 1
 
 # The count alone says nothing - the first cycle walks the whole range
-# either way, so 128 distinct values show up even when every later cycle
-# contributes nothing but 255. The share of the most common value is what
-# separates them: re-walked, no value takes much more than its 1/128; pinned
-# to its default, 255 takes almost the whole run.
-assert len(rendered) == 128, len(rendered)
+# either way, so all 33 of the range's boundary values show up even when
+# every later cycle contributes nothing but 255. The share of the most
+# common value is what separates them: re-walked, no value takes much more
+# than its 1/33; pinned to its default, 255 takes almost the whole run.
+assert len(rendered) == 33, len(rendered)
 top_value = max(rendered, key=rendered.get)
 top = rendered[top_value]
 assert top < steps // 3, (top_value, top, steps)

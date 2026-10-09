@@ -117,6 +117,65 @@ class FuzzStates(list):
         super(FuzzStates, self).__init__(iterable)
         self.first_live = 0
 
+    def total(self, pkt):
+        # type: (Packet) -> Optional[int]
+        """
+        How many times forward() will return True for these states.
+
+        Returns None where the count cannot be known without walking.
+
+        A caller that wants to report progress, bound a run, or notice that
+        a protocol's walk has moved otherwise has to take the walk first.
+        What each field contributes is decided by initialize_volatile_field()
+        and _advance_state_pos() before anything is sent, so this costs
+        O(fields) rather than O(steps) - but only the parts of it that are
+        properties of the fields, which is why there is a None.
+
+        Hands back None rather than a number in two cases:
+
+        - **the walk has already started.** What is left of a state then
+          depends on where each of its fields got to, which is the walk.
+        - **a state carries a MultipleTypeField.** Its concrete field - and
+          so its range - is picked by reading other fields on the packet,
+          and resync_multiple_type_fields() swaps the driven volatile
+          mid-walk with per-variant progress cached. How many values it
+          contributes is a property of the walk rather than of the field.
+          Of seven protocol stacks carrying one, four would in fact count
+          exactly, because their selectors never move between variants -
+          but nothing short of the walk establishes that, and the three
+          that diverge do so by -6.67%, +64.84% and +73.46%. ICMP.unused is
+          the shape: a zero-byte StrFixedLenField for most values of
+          ICMP.type and 2 or 4 bytes for a few, so ICMP:type paired with
+          ICMP:unused counts 16,640 and walks 257.
+
+        A caller that cannot tell "I counted this exactly" from "I counted
+        this approximately" caches a wrong number and reports it as fact.
+        One that is handed None walks those states and is right.
+        """
+        if any(state['active'] or state['done'] for state in self):
+            return None
+
+        counted = 0
+        for state in self:
+            cycles = []
+            for field_item in state['fields']:
+                field_cycles = pkt._walk_cycle_counts(field_item)
+                if field_cycles is None:
+                    return None
+                cycles.append(field_cycles)
+
+            # The first field of a state walks its own cycle, one case per
+            # value. Every field above it is advanced once per carry, and a
+            # carry is both a case of its own and the thing that restarts
+            # the field below it - exactly one, which is why a state is
+            # linear in its field count rather than a product. See
+            # forward()'s carry loop.
+            counted += cycles[0][0]
+            for position in range(1, len(cycles)):
+                counted += cycles[position][0] * (1 + cycles[position - 1][1])
+
+        return counted
+
 
 class Packet(
     BasePacket,
@@ -1183,12 +1242,38 @@ class Packet(
         """
         Prepare fuzzing by returning a 'states' of fields.
 
+        **What a state of N fields covers, and why complexity above 2 is
+        usually the wrong knob.** The fields of a state are walked as an
+        odometer whose carry revives only the digit immediately below the
+        one that advanced (see forward()), so a state of N fields covers
+        its N-1 *adjacent* pairs completely and reaches one row and one
+        column of every other pair - 2v-1 of the v**2 a pair has, which is
+        6% for a byte field and 1.3% for a 32-bit one. It is not N-way
+        coverage.
+
+        Per pair that is not wasteful: four byte fields at complexity 4
+        walk 3,300 cases for 3 complete pairs, 1,100 each, against 1,122
+        for a standalone pair at complexity 2. What costs is the number of
+        states. Complexity 2 already emits every C(n, 2) pair and walks
+        each one whole, so no complexity above it reaches a pair it has not
+        reached - but the states grow as C(n, N) while the complete pairs
+        per state grow only as N-1. Measured against real stacks, the same
+        pairwise coverage costs 14x at complexity 4 for ICMP, 33x for TCP
+        and 67x for BOOTP. A caller that wants more coverage should raise
+        max_samples_per_field, where the space is linear, rather than
+        complexity.
+
         :param complexity: how many fields are fuzzed together per state
-            (as before).
-        :param max_samples_per_field: caps how many distinct values a
-            single field is sampled at before forward() moves on (replaces
-            the previously hardcoded 128). Defaults to 128, matching prior
-            behavior exactly for callers that don't pass this.
+            (as before), which is not the depth of the combinations they
+            are walked at - see above.
+        :param max_samples_per_field: how wide a range forward() will still
+            send whole, one value at a time, before it falls back to
+            sampling the range at its boundaries instead (replaces the
+            previously hardcoded 128). It is a threshold rather than a cap:
+            a range wider than this sends its boundary values, of which
+            there are 33 for a byte and 313 for a 64-bit field however this
+            is set - see Packet._boundary_walk_values(). Raising it past a
+            field's range is what makes that field exhaustive.
         :param boundary_values: when True, guarantees each field's exact
             min/max/off-by-one/type-width 'magic' values (0x7F, 0x80, 0xFF,
             ...) are visited at least once, in addition to the normal
@@ -1400,6 +1485,140 @@ class Packet(
 
         return sorted(candidates)
 
+    def _boundary_walk_values(self, base, maximum):
+        # type: (int, int) -> List[int]
+        """
+        The ascending values _advance_state_pos() sends for a cycle over
+        [base, maximum] that is too wide to send whole: every power of two
+        in the range together with its two neighbours either side, plus the
+        range's own two endpoints and their neighbours.
+
+        That is where an integer defect is. 0 is the empty case and 1 the
+        single case, which is where a loop assuming at least one element
+        goes wrong; 2**n and its neighbours are where a width assumption,
+        a shift or a buffer sized from the value goes wrong (0x7f/0x80 for
+        a signed char, 0xffff/0x10000 for a 16-bit count); and the
+        endpoints are the field's own ceiling, which 2**bits overshoots by
+        one.
+
+        33 values for a byte and 153 for a 32-bit field, against the 128
+        an even spread used to send - cheaper for a narrow field, slightly
+        dearer for a wide one, and it reaches the boundaries either way.
+
+        Unlike _boundary_checkpoints(), which supplements the walk and is
+        keyed off MAGIC_BOUNDARIES' fixed constants, this *is* the walk and
+        so is derived from the range it is handed, because a field is not
+        only ever 8, 16, 32 or 64 bits wide and a cycle does not always
+        start at the field's own minimum.
+        """
+        # Two either side: an off-by-one defect is reached by +/- 1, and a
+        # length read one element past the end of a +/- 1 case by +/- 2.
+        reach = 2
+
+        values = {base, maximum}
+        if maximum - base > 1:
+            values.add(base + 1)
+            values.add(maximum - 1)
+
+        power = 1
+        while power - reach <= maximum:
+            for delta in range(-reach, reach + 1):
+                if base <= power + delta <= maximum:
+                    values.add(power + delta)
+            power *= 2
+
+        return sorted(values)
+
+    def _walk_cycle_counts(self, field_item):
+        # type: (Dict[str, Any]) -> Optional[Tuple[int, int]]
+        """
+        How many values one field of a state sends in the cycle
+        initialize_volatile_field() sets it up with, and how many in each
+        cycle a carry restarts for it afterwards - (first, restarted).
+
+        None where neither is a property of the field alone, which is one
+        case: a MultipleTypeField, whose concrete field is resolved by
+        reading the rest of the packet. See FuzzStates.total().
+
+        The two differ, and a closed form over the field's declaration
+        reaches neither:
+
+        - a field's width says nothing. _advance_state_pos() sends the
+          boundary values of whatever range it is handed, so a ByteField
+          contributes 33 and an IntField 153 - and the range itself is
+          resolved by initialize_volatile_field(), which is what runs
+          plan_budget() for a RandEnumWalk, sizes a RandString from its
+          'size' and arms a length walk's ladder. So this runs it.
+        - the first cycle starts where initialize_volatile_field() left the
+          cursor and drains the boundary checkpoints, which are never
+          refilled; every later one restarts from 'min' and skips
+          re-emitting it when the reset already sent it.
+        """
+        (holder, field_obj) = self.locate_field(self, field_item['name'])
+
+        name_in_layer = field_item['name'].split(':')[1]
+        for outer in holder.fields_desc:
+            resolved = _unwrap_field(outer)
+            if (isinstance(resolved, MultipleTypeField) and
+                    resolved.name == name_in_layer):
+                return None
+
+        max_samples = field_item.get('max_samples', 128)
+
+        # Counting a walk must not start one: this is the same call
+        # forward() makes when the state becomes active, so it leaves the
+        # field mid-cycle with its checkpoints queued. Everything it writes
+        # goes to the instance dict, so putting that back puts the field
+        # back.
+        snapshot = dict(field_obj.__dict__)
+        try:
+            self.initialize_volatile_field(
+                field_obj,
+                boundary_values=field_item.get('boundary_values', False),
+                max_samples=max_samples,
+            )
+            base = field_obj._walk_base
+            minimum = field_obj.min
+            maximum = field_obj.max
+            default = field_obj.default
+            checkpoints = list(getattr(field_obj, '_pending_checkpoints', []))
+            budget = max_samples
+            if getattr(field_obj, 'exhaustive', False):
+                budget = max(budget, maximum - minimum)
+        finally:
+            field_obj.__dict__.clear()
+            field_obj.__dict__.update(snapshot)
+
+        span = maximum - base
+        if span > budget > 1:
+            cycle = len(self._boundary_walk_values(base, maximum))
+        else:
+            # The whole range fits the budget, endpoints included.
+            cycle = max(0, span + 1)
+
+        first = cycle
+        if checkpoints and first:
+            # Drained one per call after the cycle's own first value and
+            # never refilled, so they only ever add to this first cycle -
+            # bar the one that is the value it just sent.
+            first += len(checkpoints) - (1 if checkpoints[0] == base else 0)
+
+        if type(default).__name__ in ['str', 'bytes', 'tuple']:
+            # forward() resets a string-shaped field to state_pos None, and
+            # None is also what makes it initialize the field again on the
+            # next call - so every later cycle of one is another first
+            # cycle, freshly queued checkpoints and all.
+            restarted = first
+        elif default == minimum:
+            # The call that resets a field also builds a case with the
+            # field at that value, so a cycle restarting there does not
+            # send it again - see _restart_walk(after_reset=True).
+            restarted = cycle - 1
+        else:
+            restarted = cycle
+
+        return (first, restarted)
+
     def _restart_walk(self, field_obj, after_reset=False):
         """
         Begin a fresh sampling cycle for field_obj.
@@ -1430,6 +1649,11 @@ class Packet(
           at all - state_pos is None then, meaning "render your own
           default") has not sent min, so it starts at index 0.
         """
+        # The boundary values _advance_state_pos() walks are those of
+        # [_walk_base, max], so they are a property of the cycle rather than
+        # of the field and the new cycle has to recompute them.
+        field_obj._walk_boundaries = None
+
         if after_reset:
             field_obj._walk_base = field_obj.min
             field_obj._walk_index = (
@@ -1455,12 +1679,16 @@ class Packet(
           reserved-must-be-zero field, a "no such type" branch or a
           zero-length count turns on. This is the same reason RandEnumWalk
           used to start its index at -1, which it no longer needs to.
-        - the rest are 'max_samples' points evenly spread to land exactly on
-          max, rather than a fixed integer stride from min. A byte field at
-          the default density used to jump by round(256/128) = 2 and send
-          2, 4, ... 254: one parity of the range, no minimum and no maximum.
-          Counting samples instead of accumulating a rounded stride sends
-          both endpoints and both parities.
+        - the rest are the range's boundary values in ascending order (see
+          _boundary_walk_values()), where the range is too wide to send
+          whole, and every value of the range otherwise. An evenly spread
+          'max_samples' points used to be sent instead, which lands on a
+          power of two only by coincidence: a byte field sent 128 values
+          and 127, 128, 1, 7, 15, 31, 63 and 254 were none of them, and
+          above 8 bits even spacing cannot reach them at all - a 32-bit
+          field strides by about 33.5 million and reached 2 of its 153
+          boundaries. The boundary set is where an integer defect is, and
+          for a narrow field it is also fewer values than the spread was.
 
         Pending boundary checkpoints (see _boundary_checkpoints()) are
         drained after the cycle's first value and before the spread ones, so
@@ -1505,10 +1733,18 @@ class Packet(
         index = field_obj._walk_index
         span = field_obj.max - base
         if span > max_samples > 1:
-            # index runs 0 .. max_samples - 1 over the cycle, so the last
-            # sample is base + span == max exactly, and the one after it
-            # overshoots and ends the field.
-            field_obj.state_pos = base + round(index * span / (max_samples - 1))
+            # Too wide to send whole, so send the boundaries rather than an
+            # even spread over the range - see _boundary_walk_values().
+            values = getattr(field_obj, '_walk_boundaries', None)
+            if values is None:
+                values = self._boundary_walk_values(base, field_obj.max)
+                field_obj._walk_boundaries = values
+            # Past the last boundary state_pos overshoots max, which is how
+            # forward() learns the cycle is over - the same way the index
+            # after the last evenly-spread sample used to overshoot.
+            field_obj.state_pos = (
+                values[index] if index < len(values) else field_obj.max + 1
+            )
         else:
             # The whole range fits in the budget - send every value of it.
             field_obj.state_pos = base + index
@@ -1731,9 +1967,14 @@ class Packet(
 
     def forward(self, states):
         """
-        Go through each field, find if they can still move
-        if they can great, move them, otherwise reset them to default
-        and move to the next one
+        Advance one field of the active state.
+
+        On overflow the carry advances the next field and restarts ONLY the
+        field immediately below it; fields below that stay finished. This
+        is what bounds a state's walk - a true odometer over four byte
+        fields is 128**4 steps, which no caller can take - at the cost of
+        making a state adjacent-pairwise rather than N-way. See
+        prepare_combinations() for what that covers and what it costs.
         """
         if states is None:
             raise ValueError("Please provide states")
@@ -1951,7 +2192,17 @@ class Packet(
                                 next_field.get('max_samples', 128))
 
                             if not next_field['done']:
-                                # Reset the item before us to not done
+                                # Reset the item before us to not done -
+                                # that one and no other. An odometer would
+                                # revive every digit below the one that
+                                # advanced, and a state of N fields would
+                                # then walk the product of their ranges:
+                                # 128**4 for four byte fields, which no
+                                # caller can take. Reviving one keeps a
+                                # state linear in N, and what it buys is
+                                # N-1 complete ADJACENT pairs rather than
+                                # N-way coverage - see
+                                # prepare_combinations().
                                 state_fuzzed['fields'][curr_pos]['done'] = False
 
                                 # Reset the previous item pos to the begining

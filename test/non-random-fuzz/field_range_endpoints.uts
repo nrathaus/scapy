@@ -13,8 +13,13 @@
 # RandEnumWalk already worked around this for enum fields by indexing its
 # value list from -1 so that values[0] was reachable. The mechanism is now
 # in _advance_state_pos() for every field: a cycle emits its own starting
-# value first, and spreads the rest of its budget to land exactly on max.
-# RandEnumWalk no longer needs (or has) its -1.
+# value first, and then the boundary values of its range in ascending
+# order, ending on max. RandEnumWalk no longer needs (or has) its -1.
+#
+# The even spread the boundary set replaced is the second half of the same
+# story: it reached both endpoints and both parities, but it landed on a
+# power of two only by coincidence, so a byte field sent 128 values and
+# 127 and 128 were not among them.
 
 ############
 ############
@@ -42,7 +47,7 @@ ttl = collect_values(fuzz(IP()), "IP:ttl")
 assert 0 in ttl, "the field's own minimum is still unreachable"
 assert 255 in ttl, "the field's own maximum is still unreachable"
 assert {v % 2 for v in ttl} == {0, 1}, "only one parity of the range is sampled"
-assert len(set(ttl)) == 128, len(set(ttl))
+assert len(set(ttl)) == 33, len(set(ttl))
 
 
 = A wide field sends its minimum and its maximum too
@@ -52,16 +57,69 @@ wide = collect_values(fuzz(IP()), "IP:id")
 
 assert min(wide) == 0, min(wide)
 assert max(wide) == 65535, max(wide)
-assert len(set(wide)) == 128, len(set(wide))
+assert len(set(wide)) == 73, len(set(wide))
 
 
-= max_samples_per_field still bounds how many values a field sends
+= max_samples_per_field decides whether a range is sent whole or sampled
 ~ fuzzing inet
+
+# It is a threshold, not a cap. A range wider than it is sampled at its
+# boundaries, and the boundary set is a property of the range alone - so
+# asking for 4 samples and asking for 512 of a 16-bit field both send the
+# same 73 values. Asking for the range itself is what sends every value.
 
 for samples in (4, 16, 128, 512):
     values = set(collect_values(fuzz(IP()), "IP:id", max_samples_per_field=samples))
-    assert len(values) == samples, (samples, len(values))
+    assert len(values) == 73, (samples, len(values))
     assert min(values) == 0 and max(values) == 65535, (samples, min(values), max(values))
+
+whole = set(collect_values(fuzz(IP()), "IP:id", max_samples_per_field=65536))
+assert whole == set(range(0, 65536)), len(whole)
+
+
+= A sampled field lands on its power-of-two boundaries
+~ fuzzing inet
+
+# The reason the boundary set replaced the even spread: evenly spaced
+# samples reach a power of two only by coincidence, and above 8 bits they
+# cannot reach one at all - a 32-bit field used to stride by about 33.5
+# million.
+
+ttl = set(collect_values(fuzz(IP()), "IP:ttl"))
+for boundary in (0, 1, 2, 3, 7, 8, 9, 15, 16, 17, 127, 128, 129, 254, 255):
+    assert boundary in ttl, boundary
+
+wide = set(collect_values(fuzz(IP()), "IP:id"))
+for boundary in (0, 1, 255, 256, 257, 32767, 32768, 32769, 65534, 65535):
+    assert boundary in wide, boundary
+
+
+= A 32- and a 64-bit field reach their boundaries, which no spread can
+~ fuzzing packet
+
+# Even spacing cannot reach these at all, rather than reaching them by
+# coincidence: 128 samples over a 32-bit range stride by about 33.5
+# million, so the walk reached 2 of that field's 153 boundary values and 1
+# of a 64-bit field's 313. Reaching them by spacing needs a sample count on
+# the order of the range itself.
+
+class WidePacket(Packet):
+    name = "WidePacket"
+    fields_desc = [IntField("four", 0), LongField("eight", 0)]
+
+four = set(collect_values(fuzz(WidePacket()), "WidePacket:four"))
+assert len(four) == 153, len(four)
+for boundary in (0, 1, 65535, 65536, 65537, 2**31 - 1, 2**31, 2**32 - 1):
+    assert boundary in four, boundary
+
+eight = set(collect_values(fuzz(WidePacket()), "WidePacket:eight"))
+assert len(eight) == 313, len(eight)
+# The maximum is the one the even spread lost on its own account at this
+# width: round(index * span / (max_samples - 1)) overshoots one index early
+# at a span of 2**64 - 1, so the field sent 127 values rather than 128 and
+# its own maximum was not among them.
+for boundary in (0, 1, 2**32 - 1, 2**32, 2**63 - 1, 2**63, 2**64 - 1):
+    assert boundary in eight, boundary
 
 
 = A range narrower than the budget is sent whole, endpoints included

@@ -126,9 +126,11 @@ while carry_on:
     raw(packet)   # raises here if any case cannot be built
     states, carry_on = packet.forward(states)
 
-# 665 is what this walk covered while 256 of its cases were still raising.
+# 665 was what this walk covered while 256 of its cases were still raising.
 # A fix that takes the raises to zero by generating fewer values shrinks it.
-assert cases == 665
+# 400 since each range too wide to send whole is sampled at its boundary
+# values rather than at 128 evenly spread points.
+assert cases == 400
 
 
 = The walk drives the option number, and every number it reaches encodes

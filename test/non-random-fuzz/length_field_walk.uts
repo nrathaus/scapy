@@ -330,9 +330,9 @@ assert len(walk.values) == 512
 # The same two-byte field twice, differing only in its name. Most declared
 # lengths are computed, so fuzz() skipped them and they could not vary at all
 # - there the ladder is pure gain. But a length that carried a default was
-# already sweeping at 128 values, and a ladder that REPLACED that sweep took
-# 123 cases off a field that was already reaching the wire, purely because of
-# what it is called.
+# already sampling its range at 73 values, and a ladder that REPLACED that
+# sampling took cases off a field that was already reaching the wire, purely
+# because of what it is called.
 
 class _PlainTwo(Packet):
     name = "PlainTwo"
@@ -354,7 +354,7 @@ def _cases(cls, field_name):
 
 plain = _cases(_PlainTwo, "PlainTwo:value")
 lenny = _cases(_LennyTwo, "LennyTwo:len")
-assert plain == 128, plain
+assert plain == 73, plain
 assert lenny >= plain, (lenny, plain)
 
 

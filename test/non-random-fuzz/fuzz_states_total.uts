@@ -1,0 +1,150 @@
+% Regression tests for the sequential (non-random) fuzzing state machine
+% FuzzStates.total() predicts a walk without taking it
+
+# There was no way to learn how many cases a walk would send without
+# sending them: a caller that wants to report progress, bound a run, or
+# notice that a change to this fork has moved a protocol's walk had to run
+# the whole walk first. What each field contributes is decided by
+# initialize_volatile_field() and _advance_state_pos() before anything is
+# built, so total() reads it off them instead - O(fields) against O(steps).
+#
+# The assertion below is the property, not a table of numbers: a test that
+# pinned total() against hardcoded counts would keep passing while both
+# sides drifted together.
+
+############
+############
++ total() equals the number of times forward() returns True
+
+= A packet of plain fields, across complexities and densities
+~ fuzzing packet
+
+class TotalPacket(Packet):
+    name = "TotalPacket"
+    fields_desc = [
+        ByteField("a", 0),
+        ShortField("b", 7),
+        BitField("c", 0, 4),
+        BitField("d", 0, 4),
+        StrFixedLenField("s", b"ABCD", 4),
+    ]
+
+def predicted_and_walked(make, complexity, max_samples, boundary_values):
+    packet = fuzz(make())
+    states = packet.prepare_combinations(
+        complexity,
+        max_samples_per_field=max_samples,
+        boundary_values=boundary_values,
+    )
+    predicted = states.total(packet)
+    steps = 0
+    more = True
+    while more:
+        states, more = packet.forward(states)
+        if more:
+            steps += 1
+    return predicted, steps
+
+for complexity in (1, 2, 3):
+    for max_samples in (8, 128):
+        for boundary_values in (False, True):
+            rung = (complexity, max_samples, boundary_values)
+            predicted, steps = predicted_and_walked(TotalPacket, *rung)
+            assert predicted == steps, (rung, predicted, steps)
+
+
+= Declared protocols, whose fields resolve their own ranges
+~ fuzzing inet packet
+
+# An enum walk sizes its value list to the sampling budget, a RandString
+# takes its range from its 'size' and a declared length leads with a
+# ladder - none of which is readable off the field's declaration, which is
+# why total() runs initialize_volatile_field() rather than guessing.
+
+# Complexity 2 only where the walk is short enough to take here: one
+# two-field state of UDP is 30 million cases.
+for stack, rungs in (
+    (IP, ((1, 128, False), (1, 128, True), (2, 16, False))),
+    (UDP, ((1, 128, False), (1, 128, True))),
+    (Dot1Q, ((1, 128, False), (1, 128, True), (2, 16, False))),
+):
+    for rung in rungs:
+        predicted, steps = predicted_and_walked(stack, *rung)
+        assert predicted == steps, (stack.__name__, rung, predicted, steps)
+
+
+= Counting a walk does not start one
+~ fuzzing inet
+
+# total() runs the same initialize_volatile_field() call forward() makes
+# when a state becomes active, which leaves the field mid-cycle with its
+# boundary checkpoints queued. It puts the field back afterwards, so a walk
+# that was counted sends exactly what an uncounted one sends.
+
+def case_bytes(packet, count_first):
+    states = packet.prepare_combinations(2, max_samples_per_field=16)
+    if count_first:
+        states.total(packet)
+    sent = []
+    more = True
+    while more:
+        states, more = packet.forward(states)
+        if more:
+            sent.append(bytes(packet))
+    return sent
+
+counted = case_bytes(fuzz(Dot1Q()), True)
+uncounted = case_bytes(fuzz(Dot1Q()), False)
+assert counted == uncounted, (len(counted), len(uncounted))
+
+
+############
+############
++ total() hands back None rather than a number it cannot stand behind
+
+= A state carrying a MultipleTypeField is not counted
+~ fuzzing inet
+
+# ICMP.unused is a zero-byte StrFixedLenField for most values of ICMP.type
+# and 2 or 4 bytes for a few, so how many values it contributes is a
+# property of the walk rather than of the field: resync_multiple_type_
+# fields() swaps the driven volatile whenever the selector moves between
+# variants, with each variant's progress cached.
+
+packet = fuzz(ICMP())
+states = packet.prepare_combinations(2)
+assert states.total(packet) is None
+
+# And it is the MultipleTypeField that does it, not ICMP: the same walk
+# over the states that do not carry one counts.
+without_mtf = FuzzStates(
+    state for state in states
+    if all("unused" not in entry['name'] for entry in state['fields'])
+)
+counted = without_mtf.total(packet)
+assert counted is not None
+
+steps = 0
+more = True
+while more:
+    without_mtf, more = packet.forward(without_mtf)
+    if more:
+        steps += 1
+
+assert counted == steps, (counted, steps)
+
+
+= A walk that has already started is not counted
+~ fuzzing inet
+
+# What is left of a state depends on where each of its fields got to, which
+# is the walk. A caller reporting progress takes the count up front and
+# counts its own steps against it.
+
+packet = fuzz(IP())
+states = packet.prepare_combinations(1)
+assert states.total(packet) is not None
+
+states, more = packet.forward(states)
+assert more
+assert states.total(packet) is None

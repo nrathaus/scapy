@@ -130,4 +130,6 @@ while continue_to_fuzz:
     (_, field_obj) = pkt.locate_field(pkt, "IP:ttl")
     seen.add(field_obj.state_pos)
 
-assert len(seen) > 100, len(seen)
+# Every boundary value of a byte-wide range, which is what a ttl state
+# walks - see Packet._boundary_walk_values().
+assert len(seen) == 33, len(seen)

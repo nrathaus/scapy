@@ -10,12 +10,15 @@
 # edge values. prepare_combinations() gained two opt-in parameters:
 # boundary_values=True front-loads a queue of such checkpoints for every
 # fuzzed field (Packet._boundary_checkpoints()/_advance_state_pos()), and
-# max_samples_per_field replaces the previously hardcoded 128-sample cap.
+# max_samples_per_field replaces the previously hardcoded 128.
 #
-# Both default to today's exact prior behavior (max_samples_per_field=128,
-# boundary_values=False) so any existing caller that doesn't pass these
-# keeps producing the exact same sequence of fuzzed values and combination
-# counts as before this change.
+# The walk itself answers the same complaint now: a range too wide to send
+# whole is sampled at its boundary values rather than at even intervals
+# (Packet._boundary_walk_values()), which is why boundary_values=True adds
+# nothing to the set of values a wide integer field reaches below - only
+# to the order it reaches them in. max_samples_per_field is what decides
+# which of the two a range gets, so it reads as a threshold rather than as
+# the cap it was.
 #
 # Each test below isolates a SINGLE field's state out of
 # prepare_combinations()'s full result (the same "drive one field's state
@@ -60,11 +63,22 @@ with_boundaries = collect_state_pos_sequence(boundary_values=True)
 for edge in (1, 127, 128, 255, 32767, 32768, 65534, 65535):
     assert edge in with_boundaries, f"boundary value {edge} was never sampled"
 
+# The plain walk reaches all of those on its own now, because it samples
+# the range at its boundaries rather than at even intervals - so what
+# separates the two is no longer which values appear but in what order.
+# Checkpoints drain ahead of the cycle's samples, so they take state_pos up
+# to max and the walk then resumes from near min; without them the cycle is
+# ascending, bar the final reset to the field's default.
 without_boundaries = collect_state_pos_sequence(boundary_values=False)
-assert 1 not in without_boundaries, (
-    "boundary_values=False must not inject checkpoints - only min's "
-    "neighbor (1) should ever appear if the plain jump stride happens to "
-    "land there, which it doesn't for this field's 512-wide jump"
+for edge in (1, 127, 128, 255, 32767, 32768, 65534, 65535):
+    assert edge in without_boundaries, f"boundary value {edge} was never sampled"
+
+assert without_boundaries[:-1] == sorted(without_boundaries[:-1]), (
+    "boundary_values=False must not inject checkpoints, which is what "
+    "would take the cycle back down after touching max"
+)
+assert with_boundaries[:-1] != sorted(with_boundaries[:-1]), (
+    "boundary_values=True drains its checkpoints ahead of the cycle"
 )
 
 
@@ -109,14 +123,13 @@ assert len(set(with_boundaries)) >= len(set(without)), (
     "sampling instead of supplementing it"
 )
 
-# Values only the uniform spread (65535 over 127 intervals, i.e. samples
-# at round(i * 65535 / 127)) would produce - none of these are boundary
-# checkpoints (0/1/127/128/255/32767/32768/65534/65535). These were
-# 512/1024/2048/... while the walk stepped by a rounded stride of
-# round(65535/128) = 512 from min; it now spreads its samples to land on
-# both endpoints instead, so the same intervals fall 4-129 higher (see
-# Packet._advance_state_pos()).
-uniform_only_samples = {516, 1032, 1548, 2064, 4128, 8256, 16513}
+# Values only the cycle's own samples produce - none of these is a boundary
+# checkpoint for this field (_boundary_checkpoints() gives it 0, 1, 127,
+# 128, 255, 32767, 32768, 65534 and 65535). They were 516/1032/2064/...
+# while the cycle spread 128 samples evenly over the range, and are powers
+# of two now that it walks the range's boundaries instead (see
+# Packet._boundary_walk_values()).
+uniform_only_samples = {1024, 2048, 4096, 8192, 16384}
 assert uniform_only_samples & set(with_boundaries), (
     "boundary_values=True never reached any plain uniform-jump sample "
     f"({sorted(uniform_only_samples)}) for {FIELD4!r} - it stopped as soon "
@@ -125,8 +138,12 @@ assert uniform_only_samples & set(with_boundaries), (
 )
 
 
-= max_samples_per_field tunes how many distinct values a field gets sampled at
+= max_samples_per_field decides whether a range is sent whole or sampled
 ~ fuzzing pptp
+
+# It is a threshold rather than a cap: a range wider than it is sampled at
+# its own boundary values, of which there are as many as the range has
+# whatever this is set to, and a range that fits inside it is sent whole.
 
 FIELD2 = "PPTP Start Control Connection Request:maximum_channels"
 
@@ -140,7 +157,9 @@ def distinct_sample_count(max_samples_per_field):
     seen = set()
     continue_to_fuzz = True
     iterations = 0
-    while continue_to_fuzz and iterations < 5000:
+    # Room for the whole 16-bit range, which max_samples_per_field=65536
+    # below asks for.
+    while continue_to_fuzz and iterations < 70000:
         target_states, continue_to_fuzz = pkt.forward(target_states)
         (_, field_obj) = pkt.locate_field(pkt, FIELD2)
         seen.add(field_obj.state_pos)
@@ -151,7 +170,10 @@ narrow = distinct_sample_count(16)
 default_width = distinct_sample_count(128)
 wide = distinct_sample_count(512)
 
-assert narrow < default_width < wide
+assert narrow == default_width == wide == 73, (narrow, default_width, wide)
+
+# maximum_channels is 0..65535, so this is the setting that sends it whole.
+assert distinct_sample_count(65536) == 65536
 
 
 = Calling prepare_combinations() with no new arguments samples the full range, endpoints included
@@ -160,10 +182,11 @@ assert narrow < default_width < wide
 # This used to pin forward()'s original jump math - state_pos += round(
 # (max - min) / 128) starting at min, which emitted min + 1 .. max and so
 # reached neither the field's minimum nor (for a range that doesn't divide
-# evenly) its maximum, and only one parity of a byte-wide range. The walk
-# now emits the cycle's own starting value first and spreads its remaining
-# samples to land exactly on max; the reference below is re-derived for
-# that, still independently of _advance_state_pos()'s implementation.
+# evenly) its maximum, and only one parity of a byte-wide range. Then it
+# pinned the even spread that replaced it. The walk now sends the range's
+# boundary values instead, because an even spread lands on a power of two
+# only by coincidence; the reference below is re-derived for that, still
+# independently of _advance_state_pos()'s implementation.
 
 FIELD3 = "PPTP Start Control Connection Request:maximum_channels"
 
@@ -172,11 +195,21 @@ def isolate_field_state3(states, field_name):
 
 def expected_sample_sequence(min_val, max_val, default_val, samples=128):
     # Re-derives _advance_state_pos()'s sampling as a pinned reference: the
-    # cycle's starting value, then 'samples' points evenly spread over
-    # [min, max] inclusive, then the reset to the field's default.
+    # range's boundary values in ascending order where it is too wide to
+    # send whole, every value of it where it is not, then the reset to the
+    # field's default.
     span = max_val - min_val
     if span > samples > 1:
-        seq = [min_val + round(i * span / (samples - 1)) for i in range(samples)]
+        seq = {min_val, max_val}
+        if span > 1:
+            seq.update((min_val + 1, max_val - 1))
+        power = 1
+        while power - 2 <= max_val:
+            seq.update(
+                v for v in range(power - 2, power + 3) if min_val <= v <= max_val
+            )
+            power *= 2
+        seq = sorted(seq)
     else:
         seq = list(range(min_val, max_val + 1))
     seq.append(default_val)
@@ -248,6 +281,11 @@ assert 65535 in actual, "the field's own maximum is still unreachable"
 #    already being swept at 128 values; the ladder leads that sweep rather
 #    than replacing it, so it keeps its 128 and gains the ordering. One new
 #    state of 128 took it to 2306/2307 and 478d74b9... See RandLengthWalk.
+# 5. _advance_state_pos() started sending a too-wide range's boundary
+#    values rather than 128 points evenly spread over it. This packet is
+#    mostly 16-bit fields, which send 73 values each now, so the total
+#    moved down to 1996/1997 and b402f788... It moves in both directions:
+#    a 32-bit field would go from 128 values to 153.
 #
 # Rather than just re-capture the total, it is re-derived from each field's
 # own range below, which is what says the change is only the intended one.
@@ -270,23 +308,33 @@ total_combinations = sum(s['combinations'] for s in states)
 # One state per field at complexity 1, so the run's combination count is
 # just the sum of each field's own sample count: an enum walk and a length
 # walk each send every value on their list, and any other field sends the
-# whole of a range that fits the 128 budget, or 128 points spread across one
+# whole of a range that fits the 128 budget, or the boundary values of one
 # that doesn't.
 # min/max are read after the walk because initialize_volatile_field() is
 # what resolves them (a RandBin's max comes from its size).
+def boundary_reference(lo, hi):
+    values = {lo, hi}
+    if hi - lo > 1:
+        values.update((lo + 1, hi - 1))
+    power = 1
+    while power - 2 <= hi:
+        values.update(v for v in range(power - 2, power + 3) if lo <= v <= hi)
+        power *= 2
+    return values
+
 expected_combinations = 0
 for state in states:
     (_, volatile) = pkt.locate_field(pkt, state['fields'][0]['name'])
     if isinstance(volatile, (RandEnumWalk, RandLengthWalk)):
         expected_combinations += len(volatile.values)
     elif volatile.max - volatile.min > 128:
-        expected_combinations += 128
+        expected_combinations += len(boundary_reference(volatile.min, volatile.max))
     else:
         expected_combinations += volatile.max - volatile.min + 1
 
-assert expected_combinations == 2306, expected_combinations
-assert total_combinations == 2306
+assert expected_combinations == 1996, expected_combinations
+assert total_combinations == 1996
 # One forward() call per combination, plus the final one that finds no
 # more work and returns False.
-assert total_iterations == 2307
-assert h.hexdigest() == "478d74b93e056c7d75050e8efbe690f9cf2063fe85cbc52a74b5f77061435113"
+assert total_iterations == 1997
+assert h.hexdigest() == "b402f78878ec454f73e7d83ce245bdf5d2764e19bcfa9004d408fd7dd1571687"

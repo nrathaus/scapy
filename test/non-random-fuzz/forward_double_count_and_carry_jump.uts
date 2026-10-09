@@ -1,7 +1,9 @@
 % Regression tests for the sequential (non-random) fuzzing state machine
 % forward() must advance exactly one combination per external call, and
 % must jump-scale a wide-range field even when it's only ever advanced via
-% carry (i.e. it isn't the fastest/innermost field in its combo)
+% carry (i.e. it isn't the fastest/innermost field in its combo), and the
+% one digit its carry revives is what decides what a state of N fields
+% covers
 
 # Bug 1 - double counting: when forward() rolls a maxed-out field over to
 # the next field, it bumps the next field's state_pos and increments
@@ -97,3 +99,59 @@ while continue_to_fuzz and iterations < 5000:
     iterations += 1
 
 assert not continue_to_fuzz, f"did not finish within 5000 iterations (got to {iterations})"
+
+
+############
+############
++ The carry revives one digit, which is what a state of N fields covers
+
+= A state of four fields covers its three adjacent pairs and no other whole
+~ fuzzing packet
+
+# The carry revives only the field immediately below the one that advanced,
+# so a state of N fields is not N-way coverage: its N-1 ADJACENT pairs are
+# complete, and every other pair gets one row and one column of its grid -
+# the cases sent while one of the two sat where a reset left it. That is
+# what bounds a state's walk; reviving every digit below the one that
+# advanced would walk the product of the ranges, 128**4 for four byte
+# fields, which no caller can take.
+
+import itertools
+
+class FourBytes(Packet):
+    name = "FourBytes"
+    fields_desc = [ByteField(name, 0) for name in "abcd"]
+
+packet = fuzz(FourBytes())
+states = packet.prepare_combinations(4)
+assert len(states) == 1, len(states)
+
+pairs = {pair: set() for pair in itertools.combinations("abcd", 2)}
+values = {name: set() for name in "abcd"}
+steps = 0
+continue_to_fuzz = True
+while continue_to_fuzz:
+    states, continue_to_fuzz = packet.forward(states)
+    if not continue_to_fuzz:
+        break
+    steps += 1
+    live = {name: int(packet.getfieldval(name)) for name in "abcd"}
+    for name in live:
+        values[name].add(live[name])
+    for (x, y) in pairs:
+        pairs[x, y].add((live[x], live[y]))
+
+# Each field sends the boundary values of a byte-wide range.
+assert all(len(sent) == 33 for sent in values.values()), values
+
+for (x, y), seen in pairs.items():
+    whole = len(values[x]) * len(values[y])
+    if "abcd".index(y) - "abcd".index(x) == 1:
+        assert len(seen) == whole, ((x, y), len(seen), whole)
+    else:
+        # One row and one column, counted once where they cross.
+        assert len(seen) == 2 * 33 - 1, ((x, y), len(seen), whole)
+
+# Linear in the field count: 33 for one field, then 33**2 for each one
+# after it. A product would be 33**4.
+assert steps == 33 + 3 * 33 ** 2, steps
