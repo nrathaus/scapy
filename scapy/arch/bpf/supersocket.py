@@ -100,6 +100,7 @@ class _L2bpfSocket(SuperSocket):
 
     desc = "read/write packets using BPF"
     nonblocking_socket = True
+    iface: str
 
     def __init__(self,
                  iface=None,  # type: Optional[_GlobInterfaceType]

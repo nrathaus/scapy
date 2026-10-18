@@ -96,6 +96,9 @@ class SuperSocket(metaclass=_SuperSocket_metaclass):
     closed = False  # type: bool
     nonblocking_socket = False  # type: bool
     auxdata_available = False  # type: bool
+    # Sockets that assign their own descriptors never reach __init__, and
+    # send() resolves on this. No interface is the honest answer for them.
+    iface = None  # type: Optional[_GlobInterfaceType]
 
     def __init__(self,
                  family=socket.AF_INET,  # type: int

@@ -204,6 +204,7 @@ def _flush_fd(fd):
 
 class L2Socket(SuperSocket):
     desc = "read/write packets at layer 2 using Linux PF_PACKET sockets"
+    iface: str
 
     def __init__(self,
                  iface=None,  # type: Optional[Union[str, NetworkInterface]]

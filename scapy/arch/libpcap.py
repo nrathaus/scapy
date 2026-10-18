@@ -579,6 +579,7 @@ if conf.use_pcap:
 
     class L2pcapSocket(_L2libpcapSocket):
         desc = "read/write packets at layer 2 using only libpcap"
+        iface: _GlobInterfaceType
 
         def __init__(self,
                      iface=None,  # type: Optional[_GlobInterfaceType]

@@ -3958,6 +3958,17 @@ if WINDOWS:
 ############
 + Tests of StreamSocket
 
+= A socket that assigns its own descriptors can send
+
+import socket
+for cls in [SimpleSocket, StreamSocket]:
+    a, b = socket.socketpair()
+    sock = cls(a)
+    assert sock.send(Raw(b"hello")) == 5
+    assert b.recv(10) == b"hello"
+    sock.close()
+    b.close()
+
 = Test with DNS over TCP
 ~ netaccess
 
