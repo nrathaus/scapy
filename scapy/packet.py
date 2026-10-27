@@ -1965,6 +1965,107 @@ class Packet(
                 del pkt.fields[f.name]
 
 
+    def snapshot_state_ambient(self, state):
+        # type: (Dict[str, Any]) -> None
+        """
+        Record what this state's fields render as before it walks them.
+
+        A state overwrites two things that outlive it: the concrete value
+        in the layer's 'fields', which is where a value the CALLER set
+        lives (UDP(sport=1234)), and the volatile's own state_pos. The
+        per-field reset in forward() puts neither back - it parks a
+        finished field on the volatile's own default and deletes the
+        caller's value outright - so every later state used to be walked
+        against whatever the earlier ones happened to leave. That made the
+        set of packets a walk produces a function of the order the states
+        are in, and degraded it even in the declared order.
+
+        Taken as the state becomes active. A state handed to forward()
+        already marked active (a hand-crafted one, skipping
+        prepare_combinations()) never passes here and so is not restored:
+        nothing recorded what it found.
+        """
+        ambient = []
+        for field_item in state['fields']:
+            (packet_holder, field_obj) = self.locate_field(self, field_item['name'])
+            key = field_item['name'].split(":")[1]
+            ambient.append({
+                'holder': packet_holder,
+                'name': field_item['name'],
+                'key': key,
+                'present': key in packet_holder.fields,
+                'value': packet_holder.fields.get(key),
+                'state_pos': getattr(field_obj, 'state_pos', None),
+                # _write_list_index() caches the pristine list here the
+                # first time any index of a list-shaped field is written,
+                # and the cache is per layer rather than per field - left
+                # behind, it is read as the pristine list of the next
+                # list-shaped field on the same layer.
+                'has_list_default': hasattr(packet_holder, 'default_list_value'),
+                'list_default': getattr(packet_holder, 'default_list_value', None),
+                'max_samples': field_item.get('max_samples', 128),
+            })
+
+        state['ambient'] = ambient
+
+    def restore_state_ambient(self, state):
+        # type: (Dict[str, Any]) -> None
+        """
+        Put this state's fields back the way snapshot_state_ambient()
+        found them, so the next state walks the packet the caller built
+        rather than the one this state stopped on.
+
+        Clears the record, so reaching the same state again is a no-op.
+        Only the ambient rendering is restored, never where the walk got
+        to: forward() re-initializes every field of a state as that state
+        becomes active, so no state's own combination count can move with
+        what an earlier one left.
+        """
+        ambient = state.get('ambient')
+        if not ambient:
+            return
+
+        # Applied twice, with the resync between. A MultipleTypeField
+        # resolves its concrete variant by reading the packet's other
+        # fields, so the values have to be back before it runs - and where
+        # it does swap a variant back, it drops that field's raw value and
+        # puts a different volatile object in default_fields, which is
+        # then the one whose position has to be put back.
+        self.apply_state_ambient(ambient)
+        for entry in ambient:
+            self.resync_multiple_type_fields(entry['holder'], entry['max_samples'])
+        self.apply_state_ambient(ambient)
+
+        state['ambient'] = None
+
+    def apply_state_ambient(self, ambient):
+        # type: (List[Dict[str, Any]]) -> None
+        """
+        Write a snapshot_state_ambient() record back onto the packet: the
+        concrete value in 'fields' - where absent is itself a value, since
+        it is what makes a length field compute itself again (see
+        _arm_length_walk()) - the pristine-list cache _write_list_index()
+        keeps per layer, and the volatile's state_pos.
+        """
+        for entry in ambient:
+            holder = entry['holder']
+
+            if entry['present']:
+                holder.fields[entry['key']] = entry['value']
+            else:
+                holder.fields.pop(entry['key'], None)
+
+            if entry['has_list_default']:
+                setattr(holder, 'default_list_value', entry['list_default'])
+            elif hasattr(holder, 'default_list_value'):
+                delattr(holder, 'default_list_value')
+
+            # Re-located rather than kept from the snapshot: a resync may
+            # have put a different volatile object there since.
+            (_, field_obj) = self.locate_field(self, entry['name'])
+            if isinstance(field_obj, VolatileValue):
+                field_obj.state_pos = entry['state_pos']
+
     def forward(self, states):
         """
         Advance one field of the active state.
@@ -1993,62 +2094,74 @@ class Packet(
         first_live = getattr(states, 'first_live', 0)
         for index in range(first_live, len(states)):
             state = states[index]
-            if not state['done']:
-                if index != first_live and hasattr(states, 'first_live'):
-                    # Everything we just walked past is done for good, so
-                    # the next call can start here. Advancing lazily (here)
-                    # rather than at the moment a state completes keeps the
-                    # cursor right no matter who marked the state done.
-                    states.first_live = index
-                state_fuzzed = state
-                fields = state['fields']
+            if state['done']:
+                # A state a caller marked done from outside never reached
+                # the restore at the bottom of this method, so its fields
+                # are still parked where its walk stopped. Restoring on the
+                # way past is what keeps an abandoned state from pinning
+                # them under every state after it.
+                self.restore_state_ambient(state)
+                continue
 
-                # Mark it as active, and print the transition once
-                was_active = state['active']
-                if not was_active:
-                    self.display_now_fuzzing(fields)
-                    # print(f"Now fuzzing: {fields}")
-                    state['active'] = True
+            if index != first_live and hasattr(states, 'first_live'):
+                # Everything we just walked past is done for good, so
+                # the next call can start here. Advancing lazily (here)
+                # rather than at the moment a state completes keeps the
+                # cursor right no matter who marked the state done.
+                states.first_live = index
+            state_fuzzed = state
+            fields = state['fields']
 
-                # Initialize every field the first time THIS state/pair
-                # becomes active (was_active False), regardless of
-                # whatever a field's own state_pos/default happens to be
-                # left at from a *different*, earlier pair reusing the
-                # same field object - a field whose default isn't its own
-                # min (e.g. a ShortField defaulting to its own max, like
-                # PPTPStartControlConnectionRequest.maximum_channels)
-                # would otherwise resume from that leftover value instead
-                # of a fresh min-to-max climb, silently collapsing this
-                # pair's combination count. ALSO initialize whenever
-                # state_pos is still None even though was_active was
-                # already True - covers a state handed to forward()
-                # pre-marked active=True (e.g. a hand-crafted state
-                # targeting one specific field directly, skipping
-                # prepare_combinations()); without this, such a field's
-                # state_pos stays None forever and 'state_pos += jump'
-                # below raises TypeError.
-                for field_item in fields:
-                    (_, field_obj) = self.locate_field(self, field_item['name'])
+            # Mark it as active, and print the transition once
+            was_active = state['active']
+            if not was_active:
+                self.display_now_fuzzing(fields)
+                # print(f"Now fuzzing: {fields}")
+                state['active'] = True
+                # Before initialize_volatile_field() below moves anything:
+                # this is the packet the state was handed, and what it has
+                # to leave behind when it finishes.
+                self.snapshot_state_ambient(state)
 
-                    if not isinstance(field_obj, VolatileValue):
-                        err = (f"field_obj: '{field_item['name']}' "
-                               f"isn't VolatileValue: {type(field_obj)=}, was scapy.all.fuzz called?")
-                        raise ValueError(err)
+            # Initialize every field the first time THIS state/pair
+            # becomes active (was_active False), regardless of
+            # whatever a field's own state_pos/default happens to be
+            # left at from a *different*, earlier pair reusing the
+            # same field object - a field whose default isn't its own
+            # min (e.g. a ShortField defaulting to its own max, like
+            # PPTPStartControlConnectionRequest.maximum_channels)
+            # would otherwise resume from that leftover value instead
+            # of a fresh min-to-max climb, silently collapsing this
+            # pair's combination count. ALSO initialize whenever
+            # state_pos is still None even though was_active was
+            # already True - covers a state handed to forward()
+            # pre-marked active=True (e.g. a hand-crafted state
+            # targeting one specific field directly, skipping
+            # prepare_combinations()); without this, such a field's
+            # state_pos stays None forever and 'state_pos += jump'
+            # below raises TypeError.
+            for field_item in fields:
+                (_, field_obj) = self.locate_field(self, field_item['name'])
 
-                    # getattr(..., None), not a direct attribute read: a
-                    # VolatileValue subclass that doesn't declare
-                    # state_pos at all (anything outside this fork's own
-                    # Rand* classes) would otherwise fall through
-                    # VolatileValue.__getattr__ into _fix() and raise
-                    # AttributeError on the fixed value instead.
-                    if not was_active or getattr(field_obj, 'state_pos', None) is None:
-                        self.initialize_volatile_field(
-                            field_obj,
-                            boundary_values=field_item.get('boundary_values', False),
-                            max_samples=field_item.get('max_samples', 128),
-                        )
+                if not isinstance(field_obj, VolatileValue):
+                    err = (f"field_obj: '{field_item['name']}' "
+                           f"isn't VolatileValue: {type(field_obj)=}, was scapy.all.fuzz called?")
+                    raise ValueError(err)
 
-                break
+                # getattr(..., None), not a direct attribute read: a
+                # VolatileValue subclass that doesn't declare
+                # state_pos at all (anything outside this fork's own
+                # Rand* classes) would otherwise fall through
+                # VolatileValue.__getattr__ into _fix() and raise
+                # AttributeError on the fixed value instead.
+                if not was_active or getattr(field_obj, 'state_pos', None) is None:
+                    self.initialize_volatile_field(
+                        field_obj,
+                        boundary_values=field_item.get('boundary_values', False),
+                        max_samples=field_item.get('max_samples', 128),
+                    )
+
+            break
 
         if state_fuzzed is None: # Means we couldn't find a state to fuzz
             return (states, False)
@@ -2298,6 +2411,10 @@ class Packet(
             # We reached the end...
             state['done'] = True
             state['active'] = False
+
+            # Ahead of the recursion, which builds the next state's first
+            # case: that state has to see the packet this one was handed.
+            self.restore_state_ambient(state)
 
             # Try to find the next one that is fuzzable (state)
             (states, found_a_fuzzable_field) = self.forward(states)

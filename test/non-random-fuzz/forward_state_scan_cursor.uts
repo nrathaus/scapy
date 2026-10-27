@@ -130,6 +130,11 @@ while continue_to_fuzz:
     (_, field_obj) = pkt.locate_field(pkt, "IP:ttl")
     seen.add(field_obj.state_pos)
 
+# The call that finishes the state restores ttl to the position it was
+# handed - None - which is not one of the values it sampled. See
+# Packet.restore_state_ambient().
+seen.discard(None)
+
 # Every boundary value of a byte-wide range, which is what a ttl state
 # walks - see Packet._boundary_walk_values().
 assert len(seen) == 33, len(seen)

@@ -1,0 +1,169 @@
+% Regression tests for the sequential (non-random) fuzzing state machine
+% A finished state must leave the packet the way it found it
+
+# A state walks its own fields; every other field on the packet is ambient,
+# the control the state is driving one field away from. When the state
+# finished, though, its fields were left on whatever the walk had reached:
+# forward()'s per-field reset parks a finished field on the volatile's own
+# default and deletes the value the CALLER set out of the layer's 'fields'.
+#
+#     pkt = fuzz(IP()/UDP(sport=1234)/Raw(load=b"abcd"))
+#     ...walk to the end...
+#     pkt[UDP].sport     -> 53, the field's default
+#     pkt[Raw].load      -> b"", the caller's payload gone
+#
+# Two things followed. Every state after the first was walked against a
+# degraded packet, in the declared order, with nobody reordering anything.
+# And because what a state is walked against depended on which states ran
+# before it, the SET of packets a walk produces was a function of the order
+# the states happened to be in - on IP()/UDP()/Raw(), moving one state to
+# the front changed 11,458 of 11,477 cases.
+#
+# forward() now records what a state's fields render as when the state
+# becomes active (snapshot_state_ambient()) and puts that back when it
+# finishes (restore_state_ambient()). Only the ambient rendering is
+# restored, never where the walk got to: every field of a state is
+# re-initialized as that state becomes active, so no state's own
+# combination count moves with what an earlier state left behind.
+
+############
+############
++ A state restores what it was handed
+
+= The order of the states list does not decide what is sent
+~ fuzzing inet
+
+def walk_corpus(order):
+    pkt = fuzz(IP(dst="10.0.0.1") / UDP(sport=1234, dport=5678) / Raw(load=b"abcd"))
+    states = pkt.prepare_combinations(1)
+    if order is not None:
+        states[:] = [states[i] for i in order]
+    produced = []
+    continue_to_fuzz = True
+    while continue_to_fuzz:
+        states, continue_to_fuzz = pkt.forward(states)
+        if continue_to_fuzz:
+            produced.append(bytes(pkt))
+    return produced
+
+declared = walk_corpus(None)
+assert len(declared) > 2
+
+# The simplest possible reordering: the last state walked first.
+count = len(fuzz(IP() / UDP() / Raw()).prepare_combinations(1))
+reordered = walk_corpus([count - 1] + list(range(count - 1)))
+
+from collections import Counter
+assert Counter(declared) == Counter(reordered), (
+    f"{len(Counter(declared) - Counter(reordered))} case(s) the declared "
+    "order sends and the reordered one does not"
+)
+
+
+= A finished walk hands the packet back exactly as it was given
+~ fuzzing inet
+
+pkt = fuzz(IP(dst="10.0.0.1") / UDP(sport=1234, dport=5678) / Raw(load=b"abcd"))
+states = pkt.prepare_combinations(1)
+pristine = bytes(pkt)
+
+continue_to_fuzz = True
+while continue_to_fuzz:
+    states, continue_to_fuzz = pkt.forward(states)
+
+assert bytes(pkt) == pristine, (bytes(pkt).hex(), pristine.hex())
+
+# Spelled out, because this is what the walk used to spend: the values the
+# caller set, which lived in each layer's 'fields' until a state deleted
+# them.
+assert pkt[UDP].sport == 1234
+assert pkt[UDP].dport == 5678
+assert pkt[Raw].load == b"abcd"
+
+
+= Only the state being walked moves away from the packet the caller built
+~ fuzzing inet
+
+# The ambient is a control: a case belonging to any other state carries
+# the sport the caller set, both before UDP:sport's own state is reached
+# and after it has finished. Read out of the built bytes rather than off
+# the field, so a value restored into 'fields' but not into the volatile
+# (or the reverse) is still caught.
+
+pkt = fuzz(IP(dst="10.0.0.1") / UDP(sport=1234, dport=5678) / Raw(load=b"abcd"))
+states = pkt.prepare_combinations(1)
+sport_state = [s for s in states if s['fields'][0]['name'] == "UDP:sport"]
+assert len(sport_state) == 1
+
+elsewhere = set()
+driven = set()
+continue_to_fuzz = True
+while continue_to_fuzz:
+    states, continue_to_fuzz = pkt.forward(states)
+    if continue_to_fuzz:
+        (driven if sport_state[0]['active'] else elsewhere).add(bytes(pkt)[20:22])
+
+assert elsewhere == {b"\x04\xd2"}, sorted(elsewhere)
+assert len(driven) > 1, "UDP:sport's own state never drove the field"
+
+
+= A state marked done from outside reaches the same restore
+~ fuzzing inet
+
+# A caller that bounds a run abandons the state it is in. That state never
+# reaches the restore at the end of forward(), so forward() restores it on
+# the way past instead - otherwise exactly the fields this campaign is
+# about stay pinned, for every state after it.
+
+pkt = fuzz(IP(dst="10.0.0.1") / UDP(sport=1234, dport=5678) / Raw(load=b"abcd"))
+states = pkt.prepare_combinations(1)
+pristine = bytes(pkt)
+target = [s for s in states if s['fields'][0]['name'] == "UDP:sport"][0]
+
+continue_to_fuzz = True
+while continue_to_fuzz:
+    states, continue_to_fuzz = pkt.forward(states)
+    if target['active'] and target['combinations'] > 5:
+        break
+
+assert pkt[UDP].sport != 1234, "the state under test is not driving sport"
+
+target['done'] = True
+target['active'] = False
+
+states, continue_to_fuzz = pkt.forward(states)
+assert pkt[UDP].sport == 1234, pkt[UDP].sport
+
+while continue_to_fuzz:
+    states, continue_to_fuzz = pkt.forward(states)
+
+assert bytes(pkt) == pristine, (bytes(pkt).hex(), pristine.hex())
+
+
+= Restoring the ambient does not move a state's combination count
+~ fuzzing inet
+
+# What a state contributes is a property of its own fields, so it must not
+# move with what an earlier state left behind - and a count that is read
+# off another field (a MultipleTypeField's extent) legitimately does, which
+# is why this pins a stack that carries none.
+
+pkt = fuzz(IP(dst="10.0.0.1") / UDP(sport=1234, dport=5678) / Raw(load=b"abcd"))
+states = pkt.prepare_combinations(1)
+continue_to_fuzz = True
+while continue_to_fuzz:
+    states, continue_to_fuzz = pkt.forward(states)
+
+counted = {s['fields'][0]['name']: s['combinations'] for s in states}
+assert counted == {
+    'IP:len': 128,
+    'UDP:len': 128,
+    'IP:version': 16,
+    'IP:tos': 33,
+    'IP:id': 73,
+    'IP:flags': 8,
+    'IP:ttl': 33,
+    'UDP:sport': 5505,
+    'UDP:dport': 5505,
+    'Raw:load': 48,
+}, counted

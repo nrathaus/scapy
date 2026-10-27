@@ -164,6 +164,10 @@ def distinct_sample_count(max_samples_per_field):
         (_, field_obj) = pkt.locate_field(pkt, FIELD2)
         seen.add(field_obj.state_pos)
         iterations += 1
+    # The call that finishes the state restores the field to the position
+    # it was handed - None, "nothing is driving me" - which is not one of
+    # the values it sampled. See Packet.restore_state_ambient().
+    seen.discard(None)
     return len(seen)
 
 narrow = distinct_sample_count(16)
@@ -193,11 +197,12 @@ FIELD3 = "PPTP Start Control Connection Request:maximum_channels"
 def isolate_field_state3(states, field_name):
     return [s for s in states if s['fields'][0]['name'] == field_name]
 
-def expected_sample_sequence(min_val, max_val, default_val, samples=128):
+def expected_sample_sequence(min_val, max_val, parked_val, samples=128):
     # Re-derives _advance_state_pos()'s sampling as a pinned reference: the
     # range's boundary values in ascending order where it is too wide to
-    # send whole, every value of it where it is not, then the reset to the
-    # field's default.
+    # send whole, every value of it where it is not, then the position the
+    # finished state is restored to - None for a field nothing had driven
+    # when the state was handed the packet (Packet.restore_state_ambient()).
     span = max_val - min_val
     if span > samples > 1:
         seq = {min_val, max_val}
@@ -212,7 +217,7 @@ def expected_sample_sequence(min_val, max_val, default_val, samples=128):
         seq = sorted(seq)
     else:
         seq = list(range(min_val, max_val + 1))
-    seq.append(default_val)
+    seq.append(parked_val)
     return seq
 
 pkt = fuzz(PPTP() / PPTPStartControlConnectionRequest())
@@ -228,7 +233,7 @@ while continue_to_fuzz and iterations < 5000:
     actual.append(field_obj.state_pos)
     iterations += 1
 
-expected = expected_sample_sequence(0, 65535, 65535)
+expected = expected_sample_sequence(0, 65535, None)
 assert actual == expected
 
 # The two gaps the re-derivation closes, spelled out: the field's own
