@@ -102,10 +102,14 @@ class TimeStampField(FixedPointField):
         val = self.i2h(pkt, val)
         if val < _NTP_BASETIME:
             return str(val)
-        return time.strftime(
-            "%a, %d %b %Y %H:%M:%S +0000",
-            time.gmtime(int(val - _NTP_BASETIME))
-        )
+        try:
+            return time.strftime(
+                "%a, %d %b %Y %H:%M:%S +0000",
+                time.gmtime(int(val - _NTP_BASETIME))
+            )
+        except (OSError, OverflowError, ValueError):
+            # Outside of the range the platform's gmtime() handles
+            return str(val)
 
     def any2i(self, pkt, val):
         if isinstance(val, str):

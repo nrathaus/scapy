@@ -83,6 +83,12 @@ pkt = NTP(b'#\x02\n\x00\x00\x00\x00\x00\x00\x00\x00\x00\x7f\x00\x00\x01\x00\x00\
 assert NTP(raw(NTP(orig=pkt.orig))).orig == pkt.orig
 assert str(pkt.orig) == '3819600631.703241999'
 
+= NTPHeader - timestamp outside the range gmtime() handles
+~ field NTP
+pkt = NTP(sent=0xffffffffffffffff)
+assert pkt.sprintf("%NTPHeader.sent%") == str(pkt.sent)
+assert NTP(sent=3900000000).sprintf("%NTPHeader.sent%") == 'Wed, 02 Aug 2023 21:20:00 +0000'
+
 = NTPHeader - KoD
 s = b'\xe4\x00\x06\xe8\x00\x00\x00\x00\x00\x00\x02\xcaINIT\x00\x00\x00\x00\x00\x00\x00\x00\xdb@\xe3\x9eH\xa3pj\xdb@\xe3\x9eH\xf0\xc3\\\xdb@\xe3\x9eH\xfaL\xac\x00\x00\x00\x01B\x86)\xc1Q4\x8bW8\xe7Q\xda\xd0Z\xbc\xb8'
 p = NTP(s)
