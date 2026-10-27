@@ -1079,6 +1079,15 @@ class Conf(ConfClass):
     prog: ProgPath = ProgPath()
     #: holds list of fields for which resolution should be done
     resolve: Resolve = Resolve()
+    #: allow a field's i2m() to resolve a hostname while a packet is being
+    #: serialised. Off by default, like conf.resolve above: name resolution
+    #: inside a field is opt-in. Off means bytes(pkt) never consults a
+    #: resolver, so build time and build failures do not depend on the host's
+    #: DNS configuration, and generated or externally supplied field data is
+    #: not sent to it. This gates the forward lookup on the BUILD path only:
+    #: a destination given as a name, such as IP(dst="example.com"), is
+    #: resolved when it is assigned and is not affected.
+    resolve_hostnames_on_build = False
     #: holds list of enum fields for which conversion to string
     #: should NOT be done
     noenum: Resolve = Resolve()

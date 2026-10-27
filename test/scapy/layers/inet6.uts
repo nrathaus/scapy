@@ -2399,6 +2399,46 @@ assert a.answers(q)
 
 ############
 ############
++ IP6ListField - resolving an element as a hostname
+
+= IP6ListField - an element that is not an address is refused without a lookup
+~ ipv6
+
+import socket
+from unittest import mock
+
+assert conf.resolve_hostnames_on_build is False
+
+with mock.patch("scapy.layers.inet6.socket.getaddrinfo") as resolver:
+    for packet in [ICMPv6MLQuery2, ICMPv6HAADReply]:
+        for element in [b"", b"a", b"abcdefg", b"\x00\x01\x02", "host.example"]:
+            field = "sources" if packet is ICMPv6MLQuery2 else "addresses"
+            try:
+                raw(packet(**{field: [element]}))
+            except ValueError as exception:
+                assert "conf.resolve_hostnames_on_build" in str(exception), element
+            else:
+                raise AssertionError("%r was built" % (element,))
+
+assert resolver.call_count == 0
+
+= IP6ListField - an element is resolved when the caller asks for it
+~ ipv6
+
+with mock.patch("scapy.layers.inet6.socket.getaddrinfo") as resolver:
+    resolver.return_value = [(socket.AF_INET6, 0, 0, "", ("2001:db8::1", 0, 0, 0))]
+    conf.resolve_hostnames_on_build = True
+    try:
+        built = raw(ICMPv6MLQuery2(sources=["host.example"]))
+    finally:
+        conf.resolve_hostnames_on_build = False
+
+assert resolver.call_args[0][0] == "host.example"
+assert resolver.call_count == 1
+assert built.endswith(inet_pton(socket.AF_INET6, "2001:db8::1"))
+
+############
+############
 + IPv6 attacks
 
 = Define test utilities

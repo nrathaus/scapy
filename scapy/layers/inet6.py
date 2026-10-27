@@ -344,7 +344,21 @@ class IP6ListField(StrField):
         for y in x:
             try:
                 y = inet_pton(socket.AF_INET6, y)
-            except Exception:
+            except (OSError, ValueError):
+                # An element that is not an address could be a hostname, so
+                # it is looked up - but only when the caller asked for that.
+                # These two are all that scapy's own inet_pton raises: it
+                # decodes bytes before parsing, so a bytes element is refused
+                # with OSError exactly as a hostname-shaped string is, and no
+                # exception type can tell them apart. A TypeError is left to
+                # propagate rather than turned into a lookup.
+                if not conf.resolve_hostnames_on_build:
+                    raise ValueError(
+                        "%r is not an IPv6 address. Resolving it as a "
+                        "hostname is disabled; set "
+                        "conf.resolve_hostnames_on_build = True to allow "
+                        "serialisation to query a resolver." % (y,)
+                    )
                 y = socket.getaddrinfo(y, None, socket.AF_INET6)[0][-1][0]
                 y = inet_pton(socket.AF_INET6, y)
             s += y
