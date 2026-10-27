@@ -2422,7 +2422,7 @@ class Dot11EltEHTOperation(Dot11EltExtension):
             ),
             lambda p: (
                 p.eht_operation_information_present == 1 and
-                p.len >= 9
+                (p.len is None or p.len >= 9)
             )),
 
         ConditionalField(
@@ -2430,7 +2430,7 @@ class Dot11EltEHTOperation(Dot11EltExtension):
             lambda p: (
                 p.eht_operation_information_present == 1 and
                 p.disabled_subchannel_bitmap_present == 1 and
-                p.len >= 11
+                (p.len is None or p.len >= 11)
             )),
     ]
 
