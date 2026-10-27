@@ -167,3 +167,103 @@ assert counted == {
     'UDP:dport': 5505,
     'Raw:load': 48,
 }, counted
+
+
+############
+############
++ A declared default survives its own state
+
+# Restoring 'fields' and state_pos reaches a value the CALLER set and stops
+# short of one that comes from the layer's own fields_desc. Such a field has
+# no entry in 'fields' at all: its value is the volatile's 'default', which
+# initialize_volatile_field() overwrites with the field's min for every
+# declared default that is not an int, str, bytes or tuple - a FlagValue, an
+# ASN1 object, None. The cursor then came back to None and the field still
+# rendered 0.
+
+= A field nobody assigned renders its declared default after its own state
+~ fuzzing vxlan
+
+# VXLAN.flags is declared <Flag 8 (Instance)>, so "renders its default" and
+# "renders zero" are distinguishable at all; the caller sets nothing.
+
+pkt = fuzz(VXLAN())
+states = pkt.prepare_combinations(1)
+assert states[0]['fields'][0]['name'] == "VXLAN:flags"
+assert bytes(pkt)[0] == 0x08, bytes(pkt).hex()
+
+continue_to_fuzz = True
+while continue_to_fuzz and not states[0]['done']:
+    states, continue_to_fuzz = pkt.forward(states)
+
+# Read off the built bytes rather than the field: what is at stake is what
+# every later state is walked against.
+assert bytes(pkt)[0] == 0x08, bytes(pkt).hex()
+assert 'flags' not in pkt.fields, pkt.fields
+
+
+= The order of the states list does not decide what is sent, with nothing assigned
+~ fuzzing vxlan
+
+def walk_corpus(order):
+    pkt = fuzz(VXLAN())
+    states = pkt.prepare_combinations(1)
+    if order is not None:
+        states[:] = [states[i] for i in order]
+    produced = []
+    continue_to_fuzz = True
+    while continue_to_fuzz:
+        states, continue_to_fuzz = pkt.forward(states)
+        if continue_to_fuzz:
+            produced.append(bytes(pkt))
+    return produced
+
+declared = walk_corpus(None)
+count = len(fuzz(VXLAN()).prepare_combinations(1))
+reordered = walk_corpus([count - 1] + list(range(count - 1)))
+
+from collections import Counter
+assert Counter(declared) == Counter(reordered), (
+    f"{len(Counter(declared) - Counter(reordered))} case(s) the declared "
+    "order sends and the reordered one does not"
+)
+
+
+= Restoring the declared default does not move a state's combination count
+~ fuzzing vxlan
+
+pkt = fuzz(VXLAN())
+states = pkt.prepare_combinations(1)
+continue_to_fuzz = True
+while continue_to_fuzz:
+    states, continue_to_fuzz = pkt.forward(states)
+
+counted = {s['fields'][0]['name']: s['combinations'] for s in states}
+assert counted == {
+    'VXLAN:flags': 33,
+    'VXLAN:reserved1': 153,
+    'VXLAN:vni': 153,
+    'VXLAN:reserved2': 33,
+}, counted
+
+
+= A single state, walked alone, hands the packet back untouched
+~ fuzzing vxlan dot11
+
+# The same property read one state at a time, across layers whose declared
+# defaults are of the types initialize_volatile_field() used to drop:
+# a FlagValue (VXLAN.flags), a str (Dot11Elt.info) and an int.
+
+for layer in [VXLAN(), Dot11Elt(), Dot11Beacon()]:
+    for which in range(len(fuzz(layer).prepare_combinations(1))):
+        pkt = fuzz(layer)
+        states = pkt.prepare_combinations(1)
+        pristine = bytes(pkt)
+        only = states[which]
+        del states[:]
+        states.append(only)
+        continue_to_fuzz = True
+        while continue_to_fuzz:
+            states, continue_to_fuzz = pkt.forward(states)
+        assert bytes(pkt) == pristine, (
+            only['fields'][0]['name'], bytes(pkt).hex(), pristine.hex())

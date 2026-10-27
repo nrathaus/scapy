@@ -1970,15 +1970,17 @@ class Packet(
         """
         Record what this state's fields render as before it walks them.
 
-        A state overwrites two things that outlive it: the concrete value
-        in the layer's 'fields', which is where a value the CALLER set
-        lives (UDP(sport=1234)), and the volatile's own state_pos. The
-        per-field reset in forward() puts neither back - it parks a
-        finished field on the volatile's own default and deletes the
-        caller's value outright - so every later state used to be walked
-        against whatever the earlier ones happened to leave. That made the
-        set of packets a walk produces a function of the order the states
-        are in, and degraded it even in the declared order.
+        A state overwrites three things that outlive it: the concrete
+        value in the layer's 'fields', which is where a value the CALLER
+        set lives (UDP(sport=1234)), the volatile's own state_pos, and the
+        volatile's 'default', which is what it renders once state_pos is
+        back to None. The per-field reset in forward() puts none of them
+        back - it parks a finished field on the volatile's own default and
+        deletes the caller's value outright - so every later state used to
+        be walked against whatever the earlier ones happened to leave.
+        That made the set of packets a walk produces a function of the
+        order the states are in, and degraded it even in the declared
+        order.
 
         Taken as the state becomes active. A state handed to forward()
         already marked active (a hand-crafted one, skipping
@@ -1989,6 +1991,11 @@ class Packet(
         for field_item in state['fields']:
             (packet_holder, field_obj) = self.locate_field(self, field_item['name'])
             key = field_item['name'].split(":")[1]
+            # Read out of __dict__, which is also where every _fix() tests
+            # for it: VolatileValue.__getattr__() answers a missing
+            # attribute with getattr(self._fix(), attr), so asking the
+            # instance whether it has one computes the field.
+            volatile_attrs = getattr(field_obj, '__dict__', {})
             ambient.append({
                 'holder': packet_holder,
                 'name': field_item['name'],
@@ -1996,6 +2003,15 @@ class Packet(
                 'present': key in packet_holder.fields,
                 'value': packet_holder.fields.get(key),
                 'state_pos': getattr(field_obj, 'state_pos', None),
+                # The volatile's own 'default', which is what it renders at
+                # state_pos None. initialize_volatile_field() overwrites it
+                # with the field's min for every declared default that is
+                # not an int, str, bytes or tuple - a FlagValue, an ASN1
+                # object, None - so restoring state_pos alone puts the
+                # cursor back and still renders 0 (VXLAN.flags is declared
+                # <Flag 8 (Instance)> and came back 0).
+                'has_default': 'default' in volatile_attrs,
+                'default': volatile_attrs.get('default'),
                 # _write_list_index() caches the pristine list here the
                 # first time any index of a list-shaped field is written,
                 # and the cache is per layer rather than per field - left
@@ -2045,7 +2061,7 @@ class Packet(
         concrete value in 'fields' - where absent is itself a value, since
         it is what makes a length field compute itself again (see
         _arm_length_walk()) - the pristine-list cache _write_list_index()
-        keeps per layer, and the volatile's state_pos.
+        keeps per layer, and the volatile's state_pos and 'default'.
         """
         for entry in ambient:
             holder = entry['holder']
@@ -2065,6 +2081,15 @@ class Packet(
             (_, field_obj) = self.locate_field(self, entry['name'])
             if isinstance(field_obj, VolatileValue):
                 field_obj.state_pos = entry['state_pos']
+
+                # Absent is a value here too: a MultipleTypeField's randval
+                # carries no 'default' until forward() initializes it, and
+                # every _fix() renders that case from the field's own
+                # fallback rather than from min.
+                if entry['has_default']:
+                    field_obj.__dict__['default'] = entry['default']
+                else:
+                    field_obj.__dict__.pop('default', None)
 
     def forward(self, states):
         """
