@@ -1,0 +1,205 @@
+% Regression tests for the sequential (non-random) fuzzing state machine
+% A field whose value is a Packet is walked, and cannot end the walk
+
+# fuzz() installs volatiles inside a PacketField's sub-packet, so it is ready
+# to be walked - NTPControl.status on a mode 6 reply carries four of them.
+# Nothing walked it: return_relevant_fields() rejected the value for not
+# being a VolatileValue itself, so the sub-packet was built from the walk's
+# starting position on every case and contributed a constant to the wire.
+#
+#     pkt = fuzz(NTPControl(response=1))
+#     ...3,000 steps...
+#     one distinct status word
+#
+# The descent it needed already existed for a sub-packet held in a list; the
+# only difference was the list wrapper. The name is that one with the index
+# left out, and a middle component that is not an index is what tells
+# locate_field() the two apart.
+#
+# The other half is what happened when such a field DID reach an active
+# state: a MultipleTypeField can resolve to a scalar when fuzz() runs and to
+# a PacketField later, once the selector has moved, and resync_multiple_
+# type_fields() then swaps the registered volatile for a Packet. forward()
+# raised ValueError over it, ending the walk a long way from the call that
+# caused it - on Ether()/IP()/UDP()/NTPControl() at complexity 2 it arrived
+# at step 367,480. One field that cannot be stepped is now skipped with a
+# warning instead.
+
+
+############
+############
++ A Packet-valued field is named and located
+
+= return_relevant_fields() names a sub-packet's fuzzed fields
+~ fuzzing packet ntp
+
+from scapy.layers.ntp import NTPControl, NTPSystemStatusPacket
+
+packet = fuzz(NTPControl(response=1))
+status = packet.default_fields["status"]
+assert isinstance(status, NTPSystemStatusPacket), status
+
+names = packet.return_relevant_fields(packet)
+assert sorted(n for n in names if ":status:" in n) == [
+    "NTP Control message:status:clock_source",
+    "NTP Control message:status:leap_indicator",
+    "NTP Control message:status:system_event_code",
+    "NTP Control message:status:system_event_counter",
+]
+
+# The field itself is not offered as well - it cannot be stepped.
+assert "NTP Control message:status" not in names
+
+
+= locate_field() resolves the sub-packet's own volatile
+~ fuzzing packet ntp
+
+packet = fuzz(NTPControl(response=1))
+status = packet.default_fields["status"]
+
+(holder, field_obj) = packet.locate_field(
+    packet, "NTP Control message:status:leap_indicator")
+
+# The holder is the layer carrying the field, as it is for a list reference.
+assert holder is packet
+assert field_obj is status.default_fields["leap_indicator"]
+assert isinstance(field_obj, VolatileValue)
+
+
+= A name that does not resolve says which half it failed on
+~ fuzzing packet ntp
+
+packet = fuzz(NTPControl(response=1))
+
+try:
+    packet.locate_field(packet, "NTP Control message:status:does_not_exist")
+    assert False, "expected a ValueError"
+except ValueError as exception:
+    assert "does_not_exist" in str(exception)
+
+# A three-part name whose middle component IS an index is still read as a
+# list reference, so a scalar field named this way fails as a list.
+try:
+    packet.locate_field(packet, "NTP Control message:sequence:0")
+    assert False, "expected a ValueError"
+except ValueError as exception:
+    assert "isn't a list" in str(exception)
+
+# ...and one whose middle component is not an index fails as a sub-packet.
+try:
+    packet.locate_field(packet, "NTP Control message:sequence:leap")
+    assert False, "expected a ValueError"
+except ValueError as exception:
+    assert "isn't a Packet" in str(exception)
+
+
+############
+############
++ A Packet-valued field is walked
+
+= The status word varies over a walk
+~ fuzzing packet ntp
+
+packet = fuzz(NTPControl(response=1))
+states = packet.prepare_combinations(2)
+
+# The status word is the two bytes after the four-byte header.
+seen = set()
+continue_to_fuzz = True
+iterations = 0
+
+while continue_to_fuzz and iterations < 3000:
+    seen.add(bytes(packet)[4:6])
+    states, continue_to_fuzz = packet.forward(states)
+    iterations += 1
+
+assert len(seen) > 1, seen
+
+
+= The walk steps the sub-packet rather than replacing it
+~ fuzzing packet ntp
+
+packet = fuzz(NTPControl(response=1))
+states = packet.prepare_combinations(1)
+
+continue_to_fuzz = True
+iterations = 0
+
+while continue_to_fuzz and iterations < 2000:
+    data = bytes(packet)
+    states, continue_to_fuzz = packet.forward(states)
+    iterations += 1
+
+# The volatile lives in the sub-packet, so there is nothing to promote onto
+# the layer: writing the stepped value into 'fields' would replace the whole
+# sub-packet with one sub-field's value.
+assert isinstance(packet.default_fields["status"], NTPSystemStatusPacket)
+assert "status" not in packet.fields
+
+# The caller's own value is still the only thing in 'fields'...
+assert packet.fields["response"] == 1
+
+# ...and the packet still dissects back to the same sub-packet.
+assert isinstance(NTPControl(bytes(packet)).status, NTPSystemStatusPacket)
+
+
+############
+############
++ A field that cannot be stepped does not end the walk
+
+= forward() skips a state's field whose value became a Packet
+~ fuzzing packet ntp
+
+# The request direction resolves 'status' to a plain ShortField, so it is
+# registered as a scalar...
+packet = fuzz(NTPControl())
+assert isinstance(packet.default_fields["status"], VolatileValue)
+
+states = [state for state in packet.prepare_combinations(1)
+          if any("status" in field["name"] for field in state["fields"])]
+assert len(states) == 1
+
+# ...and this is what a walk does by itself once 'response' moves.
+packet.default_fields["response"] = 1
+packet.resync_multiple_type_fields(packet)
+assert isinstance(packet.default_fields["status"], NTPSystemStatusPacket)
+
+continue_to_fuzz = True
+iterations = 0
+
+while continue_to_fuzz and iterations < 300:
+    states, continue_to_fuzz = packet.forward(states)
+    iterations += 1
+
+# Skipped rather than raised over: the state runs out of fields and the walk
+# ends on its own terms.
+assert not continue_to_fuzz
+assert states[0]["fields"][0]["done"]
+
+
+= A state after it is still walked
+~ fuzzing packet ntp
+
+packet = fuzz(NTPControl())
+states = packet.prepare_combinations(1)
+
+status_idx = [idx for (idx, state) in enumerate(states)
+              if any("status" in field["name"] for field in state["fields"])][0]
+assert status_idx + 1 < len(states), "the un-steppable state must not be last"
+
+packet.default_fields["response"] = 1
+packet.resync_multiple_type_fields(packet)
+
+# Start at the state carrying 'status' so the skip is what the walk meets
+# first, and count the cases every state after it still produces.
+states = states[status_idx:]
+seen = set()
+continue_to_fuzz = True
+iterations = 0
+
+while continue_to_fuzz and iterations < 3000:
+    seen.add(bytes(packet))
+    states, continue_to_fuzz = packet.forward(states)
+    iterations += 1
+
+assert len(seen) > 1, seen

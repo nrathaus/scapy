@@ -1123,6 +1123,28 @@ class Packet(
 
                 continue
 
+            if isinstance(field, Packet):
+                # A field whose value is a sub-Packet - a PacketField, or a
+                # MultipleTypeField that resolved to its PacketField arm
+                # (NTPControl.status). fuzz() installs volatiles in the
+                # sub-Packet's own default_fields, so walk them one by one
+                # the way the list branch above walks a sub-Packet held in
+                # a list. The name is that one with the index left out,
+                # which is how locate_field() tells the two apart.
+                for field_in_packet_name in field.default_fields.keys():
+                    field_in_packet = field.default_fields[field_in_packet_name]
+
+                    # As in the list branch: only genuinely fuzzed
+                    # sub-fields are relevant, and a 'list' inside a
+                    # sub-Packet isn't supported (at the moment) either.
+                    if not isinstance(field_in_packet, VolatileValue):
+                        continue
+
+                    relevant_fields.append(
+                        f"{pkt.name}:{field_name}:{field_in_packet_name}")
+
+                continue
+
             if not isinstance(field, VolatileValue):
                 # Concrete/unfuzzed value - covers plain NoneType/int/str/
                 # bytes/_ScopedIP/BGPORF defaults fuzz() never touched, as
@@ -1162,27 +1184,46 @@ class Packet(
                     field_type = "list"
                     field_idx = field_list[:field_list.index(':')]
                     field_in_list = field_list[field_list.index(':')+1:]
-                else:
+                elif field_list.isdigit():
                     # A list of raw scalar VolatileValues: idx only
                     #  (e.g. Dot11EltRates.rates)
                     field_type = "list_scalar"
                     field_idx = field_list
                     field_in_list = None
-
-                try:
-                    field_idx = int(field_idx)
-                except:
-                    raise ValueError(f"We expected {field_idx} to be an int ")
+                else:
+                    # A field whose value is a sub-Packet: subfield only
+                    #  (e.g. NTPControl.status' leap_indicator). A middle
+                    #  component that isn't an index is what tells this
+                    #  apart from a list reference.
+                    field_type = "sub_packet"
+                    field_idx = None
+                    field_in_list = field_list
 
                 if packet_field not in pkt.default_fields:
                     raise ValueError(f"We are referencing {packet_field} which is not found inside default_fields")
 
                 val = pkt.default_fields[packet_field]
-                if not isinstance(val, list):
-                    raise ValueError(f"The field {packet_field} isn't a list")
 
-                if field_idx > len(val):
-                    raise ValueError(f"The field {packet_field} cannot accomodate {field_idx} index")
+                if field_type == "sub_packet":
+                    if not isinstance(val, Packet):
+                        raise ValueError(f"The field {packet_field} isn't a Packet")
+
+                    if field_in_list not in val.default_fields:
+                        raise ValueError(
+                            f"Cannot find {field_in_list} inside {packet_field}")
+                else:
+                    try:
+                        field_idx = int(field_idx)
+                    except:
+                        raise ValueError(f"We expected {field_idx} to be an int ")
+
+                    if not isinstance(val, list):
+                        raise ValueError(f"The field {packet_field} isn't a list")
+
+                    if field_idx > len(val):
+                        raise ValueError(
+                            f"The field {packet_field} cannot accomodate "
+                            f"{field_idx} index")
 
             if (packet_field not in pkt.fields and packet_field not in pkt.default_fields):
                 raise ValueError(f"Cannot find {packet_field} inside {packet_type}")
@@ -1197,6 +1238,15 @@ class Packet(
                     if item_in_list.default_fields[field_in_list] is None:
                         raise ValueError(f"Shouldn't be None, did we not find the obj? {field_idx=}:{field_in_list=}")
                     return (pkt, item_in_list.default_fields[field_in_list])
+
+                if field_type == "sub_packet":
+                    sub_packet = pkt.default_fields[packet_field]
+
+                    if sub_packet.default_fields[field_in_list] is None:
+                        raise ValueError(
+                            f"Shouldn't be None, did we not find the obj? "
+                            f"{packet_field=}:{field_in_list=}")
+                    return (pkt, sub_packet.default_fields[field_in_list])
 
                 if field_type == "list_scalar":
                     if field_idx >= len(pkt.default_fields[packet_field]):
@@ -2169,9 +2219,19 @@ class Packet(
                 (_, field_obj) = self.locate_field(self, field_item['name'])
 
                 if not isinstance(field_obj, VolatileValue):
-                    err = (f"field_obj: '{field_item['name']}' "
-                           f"isn't VolatileValue: {type(field_obj)=}, was scapy.all.fuzz called?")
-                    raise ValueError(err)
+                    # Nothing to initialize, and nothing this state can do
+                    # with it - most often a MultipleTypeField registered
+                    # as a scalar arm whose selector has since moved onto
+                    # a PacketField arm, which resync_multiple_type_fields()
+                    # swaps for a Packet. Warn and leave it where it is:
+                    # ending the walk over one field loses every case after
+                    # it, a long way from the call that caused it. The
+                    # advance loop below skips it the same way.
+                    log_runtime.warning(
+                        "field_obj: '%s' isn't VolatileValue: %s, "
+                        "was scapy.all.fuzz called?",
+                        field_item['name'], type(field_obj))
+                    continue
 
                 # getattr(..., None), not a direct attribute read: a
                 # VolatileValue subclass that doesn't declare
@@ -2197,6 +2257,15 @@ class Packet(
         for (field_idx, field) in enumerate(state_fuzzed['fields']):
             if not field['done']:
                 (packet_holder, field_fuzzed) = self.locate_field(self, field['name'])
+
+                if not isinstance(field_fuzzed, VolatileValue):
+                    # A field that cannot be stepped - see the warning in
+                    # the initialization loop above. Marked done so the
+                    # walk moves on to the next field rather than reporting
+                    # it over and over.
+                    field['done'] = True
+                    continue
+
                 if field_fuzzed.max == field_fuzzed.min and field_fuzzed.max == 0:
                     print(f"Why is '{field['name']}' max == 0? this is not going to do anything")
 
@@ -2212,6 +2281,7 @@ class Packet(
                 field_split = field['name'].split(":")
                 field_name = None
                 list_idx = None
+                sub_field_name = None
                 if len(field_split) > 1:
                     field_name = field_split[1]
                 if len(field_split) == 3:
@@ -2221,6 +2291,14 @@ class Packet(
                     try:
                         list_idx = int(field_split[2])
                     except ValueError:
+                        # "pkt:field:subfield" - a field whose value is a
+                        # sub-Packet (NTPControl.status). The volatile sits
+                        # in the sub-Packet's own default_fields and the
+                        # sub-Packet renders it from there, so this layer's
+                        # 'fields' must be left alone: writing the stepped
+                        # value there would replace the whole sub-Packet
+                        # with one sub-field's value.
+                        sub_field_name = field_split[2]
                         list_idx = None
 
                 # If we reached max for this field, try the next one
@@ -2250,7 +2328,8 @@ class Packet(
                     # and end this field's new cycle instantly.
                     self._restart_walk(field_fuzzed, after_reset=True)
 
-                    if field_name is not None and field_name in packet_holder.fields:
+                    if (field_name is not None and sub_field_name is None
+                            and field_name in packet_holder.fields):
                         if isinstance(packet_holder.fields[field_name], list):
                             # Make sure that the first item is not 'obj'
                             if len(packet_holder.fields[field_name]) > 0:
@@ -2295,6 +2374,17 @@ class Packet(
                         if not next_field['done']:
                             # Try to move to the next item
                             (next_field_holder, field_fuzzed) = self.locate_field(self, next_field['name'])
+
+                            if not isinstance(field_fuzzed, VolatileValue):
+                                # The carry cannot step it either - see the
+                                # matching skip on the advance path above.
+                                # Marked done so the carry walks on to the
+                                # field after it.
+                                next_field['done'] = True
+                                curr_pos += 1
+                                are_we_last = (curr_pos + 1) == len(
+                                    state_fuzzed['fields'])
+                                continue
 
                             if not hasattr(field_fuzzed, 'state_pos'):
                                 err = f"We will fail for: {field_fuzzed}"
@@ -2395,7 +2485,13 @@ class Packet(
                 else:
                     # Put the new value (fuzzed) in the 'fields' so that ".commmand()" will display it
                     if field_name is not None:
-                        if list_idx is not None:
+                        if sub_field_name is not None:
+                            # A sub-Packet's own field - see the comment on
+                            # sub_field_name above: the sub-Packet holds
+                            # the volatile, so there is nothing to write
+                            # onto this layer.
+                            pass
+                        elif list_idx is not None:
                             # A list-of-scalar-VolatileValue item (e.g.
                             # Dot11EltRates.rates, DHCP.options) - update
                             # just this index, preserving every other item

@@ -23,6 +23,7 @@ from scapy.compat import bytes_encode, chb, plain_str
 from scapy.utils import corrupt_bits, corrupt_bytes
 
 from typing import (
+    TYPE_CHECKING,
     Iterable,
     List,
     TypeVar,
@@ -114,6 +115,15 @@ _T = TypeVar('_T')
 
 
 class VolatileValue(Generic[_T]):
+    if TYPE_CHECKING:
+        # Declared for the type checker only. The walk (Packet.forward(),
+        # Packet.restore_state_ambient(), ...) assigns 'state_pos' on any
+        # volatile it is handed, while the classes that can actually be
+        # walked declare it themselves. A real class attribute here would
+        # make hasattr(volatile, 'state_pos') true for every VolatileValue,
+        # and that is the test the walk uses to tell the two apart.
+        state_pos = None  # type: Any
+
     def __repr__(self):
         # type: () -> str
         return "<%s>" % self.__class__.__name__
