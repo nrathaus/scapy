@@ -4741,14 +4741,19 @@ def fuzz(p,  # type: _P
     by random objects.
 
     :param p: the Packet instance to fuzz
-    :param _lengths: internal. False for a sub-packet living inside a
-        PacketListField: Packet.forward() drives such a field only through
-        the volatile rendering at build time - it explicitly does not write
-        into 'fields' for a list of Packets - and a length walk is driven
-        the other way round (see Packet._arm_length_walk()), so there would
-        be nothing to drive it and its armed value would never come back
-        off. Those length fields keep today's behaviour: computed, and not
-        fuzzed.
+    :param _lengths: internal. False for a sub-packet living inside another
+        field - a PacketListField, a PacketField or a PacketLenField.
+        Packet.forward() drives such a field only through the volatile
+        rendering at build time - it explicitly does not write into 'fields'
+        for a list of Packets, and return_relevant_fields() registers a
+        sub-packet's own fields from its default_fields, where a length walk
+        deliberately does not sit - and a length walk is driven the other way
+        round (see Packet._arm_length_walk()), so there would be nothing to
+        drive it and its armed value would never come back off:
+        _disarm_length_walks() reaches the payload chain, not a packet held
+        in a field. Those length fields keep today's behaviour: computed, and
+        not fuzzed. The length the enclosing layer declares for the
+        sub-packet is a field of that layer and walks as usual.
     :return: the fuzzed packet.
     """
     if not _inplace:

@@ -203,3 +203,122 @@ while continue_to_fuzz and iterations < 3000:
     iterations += 1
 
 assert len(seen) > 1, seen
+
+
+############
+############
++ A PacketLenField holds a sub-packet too
+
+= randval() builds the class the field names, not a byte blob
+~ fuzzing packet fields
+
+# PacketField defined randval() and PacketLenField inherited _StrField's, so
+# two fields that both hold a nested packet were fuzzed in opposite ways: the
+# one that inherited got RandBin(RandNum(0, 1200)) and its sub-packet's own
+# fields were reached by nothing. It is defined on _PacketFieldSingle now,
+# which both of them are.
+
+from scapy.layers.isakmp import ISAKMP, ISAKMP_payload_Proposal, ISAKMP_payload_SA
+
+field = [f for f in ISAKMP_payload_SA.fields_desc if f.name == "prop"][0]
+assert isinstance(field, PacketLenField)
+assert isinstance(field.randval(), ISAKMP_payload_Proposal)
+
+
+= The sub-packet's own fields are named
+~ fuzzing packet isakmp
+
+packet = fuzz(ISAKMP_payload_SA())
+prop = packet.default_fields["prop"]
+assert isinstance(prop, ISAKMP_payload_Proposal), prop
+
+names = packet.return_relevant_fields(packet)
+assert sorted(n for n in names if ":prop" in n) == [
+    "ISAKMP SA:prop:SPI",
+    "ISAKMP SA:prop:proposal",
+    "ISAKMP SA:prop:proto",
+    "ISAKMP SA:prop:res",
+]
+
+# The field declares a Raw default - a placeholder for "nothing here" -
+# which Packet.init_fields() copies into 'fields', where it shadowed
+# everything fuzz() wrote to default_fields. fuzz_current_value() drops it.
+assert isinstance(field.default, conf.raw_layer)
+assert "prop" not in packet.fields
+
+
+= The proposal varies over a walk
+~ fuzzing packet isakmp
+
+packet = fuzz(ISAKMP(exch_type=2) / ISAKMP_payload_SA())
+states = packet.prepare_combinations(1)
+
+seen = set()
+continue_to_fuzz = True
+iterations = 0
+
+while continue_to_fuzz and iterations < 2000:
+    seen.add(bytes(packet))
+    states, continue_to_fuzz = packet.forward(states)
+    iterations += 1
+
+assert len(seen) > 1, seen
+
+# Stepped, not replaced: the sub-packet is still the proposal it started as.
+assert isinstance(packet.payload.default_fields["prop"], ISAKMP_payload_Proposal)
+
+
+= A sub-packet's own length field is left computed
+~ fuzzing packet isakmp
+
+# A length walk is parked on the layer rather than kept in default_fields,
+# and nothing reaches one inside a sub-packet: return_relevant_fields() reads
+# default_fields, and _disarm_length_walks() follows the payload chain. An
+# armed one would therefore be a wrong length under every case of every other
+# field, so fuzz() is called with _lengths=False for a sub-packet.
+
+packet = fuzz(ISAKMP_payload_SA())
+prop = packet.default_fields["prop"]
+
+assert not getattr(prop, "length_walks", {})
+assert "length" not in prop.fields
+
+# The length the enclosing layer declares for it is an ordinary field of that
+# layer, and still walks.
+assert "ISAKMP SA:length" in packet.return_relevant_fields(packet)
+
+
+= A caller's own sub-packet is fuzzed where it stands
+~ fuzzing packet isakmp
+
+packet = fuzz(ISAKMP_payload_SA(
+    prop=ISAKMP_payload_Proposal(proposal=7)))
+
+# Their value, not one built from the field's class.
+assert packet.prop.proposal == 7
+assert sorted(n for n in packet.return_relevant_fields(packet) if ":prop" in n) == [
+    "ISAKMP SA:prop:SPI",
+    "ISAKMP SA:prop:proposal",
+    "ISAKMP SA:prop:proto",
+    "ISAKMP SA:prop:res",
+]
+
+
+= A class picked from the bytes keeps the byte blob
+~ fuzzing packet dhcp6
+
+# DHCP6OptClientId.duid names _duid_dispatcher, which reads the DUID type out
+# of the bytes it is handed and so cannot be called here. There is no packet
+# to build and the field's default is b"", so randval() has nothing to fuzz -
+# and the content is length-delimited, which makes the blob _StrField offers
+# a value the field can carry. That is what it has always been fuzzed with.
+
+from scapy.layers.dhcp6 import DHCP6OptClientId
+
+field = [f for f in DHCP6OptClientId.fields_desc if f.name == "duid"][0]
+assert not isinstance(field.cls, type)
+assert isinstance(field.randval(), RandBin)
+
+packet = fuzz(DHCP6OptClientId())
+assert isinstance(packet.default_fields["duid"], RandBin)
+assert "DHCP6 Client Identifier Option:duid" in packet.return_relevant_fields(packet)

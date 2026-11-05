@@ -2044,6 +2044,59 @@ class _PacketField(_StrField[K]):
 
 
 class _PacketFieldSingle(_PacketField[K]):
+    def fuzz_current_value(self, pkt):
+        # type: (Packet) -> Optional[Packet]
+        """Fuzz the sub-packet ``pkt`` carries, in place.
+
+        A sub-packet lives in ``pkt.fields``, which shadows everything
+        ``fuzz()`` writes to ``pkt.default_fields``, so a field holding one
+        dropped out of the fuzz space entirely - while the
+        ``PacketListField`` beside it was fuzzed in place and walked.
+        Fuzzing it where it stands keeps the value the caller chose and
+        gives its fields the volatiles ``return_relevant_fields()`` descends
+        into, which is what that list branch of ``fuzz()`` does.
+
+        Two things put a sub-packet there, and only one of them is a value.
+        """
+        from scapy.packet import Packet, fuzz  # late: it imports this module
+        current = pkt.fields.get(self.name)
+        if not isinstance(current, Packet):
+            # Nothing here to shadow default_fields: randval() builds it.
+            return None
+        if isinstance(self.default, Packet) and \
+                current.__class__ is self.default.__class__ and \
+                current.fields == self.default.fields:
+            # Packet.init_fields() copies a Packet default into 'fields' so
+            # that instances do not share one object. That copy is the
+            # declared default rather than anything the caller chose, and
+            # several of these fields declare a placeholder of another class
+            # than the one they hold - ISAKMP_payload_SA.prop declares a Raw
+            # and holds an ISAKMP_payload_Proposal. Drop it and let
+            # randval() build the class the field names.
+            del pkt.fields[self.name]
+            return None
+        return fuzz(current, _inplace=1, _lengths=False)
+
+    def randval(self):  # type: ignore
+        # type: () -> Optional[Packet]
+        from scapy.packet import Packet, fuzz  # late: it imports this module
+        if not isinstance(self.cls, type):
+            # A field that picks its class from the bytes in its own m2i()
+            # (NTPControlStatusField, _ECBasisField, _TLSServerParamsField,
+            # _TLSCKExchKeysField, _pObjectDataField) declares no class at
+            # all, and one that picks it in a dispatcher (KRB_InnerToken.root,
+            # DHCP6OptClientId.duid, DHCP6OptRelayMsg.message) declares a
+            # function taking those bytes. Neither can be called here, and
+            # calling one took the whole packet down rather than just this
+            # field. Fuzz the packet the default carries when there is one -
+            # it is one of the classes the dispatch can return - and leave
+            # the field at its default otherwise: fuzz() skips a field whose
+            # randval() answers None.
+            if isinstance(self.default, Packet):
+                return fuzz(self.default, _lengths=False)
+            return None
+        return fuzz(self.cls(), _lengths=False)
+
     def any2i(self, pkt, x):
         # type: (Optional[Packet], Any) -> K
         if x and pkt and hasattr(x, "add_parent"):
@@ -2067,22 +2120,7 @@ class _PacketFieldSingle(_PacketField[K]):
 
 
 class PacketField(_PacketFieldSingle[BasePacket]):
-    def randval(self):  # type: ignore
-        # type: () -> Optional[Packet]
-        from scapy.packet import Packet, fuzz  # late: it imports this module
-        if self.cls is None:
-            # A field that picks its class from the bytes in its own m2i()
-            # (NTPControlStatusField, _ECBasisField, _TLSServerParamsField,
-            # _TLSCKExchKeysField, _pObjectDataField) has no class to build
-            # here, and calling None took the whole packet down rather than
-            # just this field. Fuzz the packet the default carries when there
-            # is one - it is one of the classes m2i() can return - and leave
-            # the field at its default otherwise: fuzz() skips a field whose
-            # randval() answers None.
-            if isinstance(self.default, Packet):
-                return fuzz(self.default)
-            return None
-        return fuzz(self.cls())  # type: ignore
+    pass
 
 
 class PacketLenField(_PacketFieldSingle[Optional[BasePacket]]):
@@ -2097,6 +2135,19 @@ class PacketLenField(_PacketFieldSingle[Optional[BasePacket]]):
         # type: (...) -> None
         super(PacketLenField, self).__init__(name, default, cls)
         self.length_from = length_from or (lambda x: 0)
+
+    def randval(self):  # type: ignore
+        # type: () -> Union[Optional[Packet], RandBin]
+        value = super(PacketLenField, self).randval()
+        if value is None:
+            # Nothing to build a sub-packet from (DHCP6OptClientId.duid and
+            # DHCP6OptServerId.duid, whose dispatcher reads the DUID type out
+            # of the bytes). The content here is length-delimited and the
+            # enclosing length is computed from it, so the random bytes
+            # _StrField offers are a value the field can carry - which is
+            # what this field has always been fuzzed with.
+            return _StrField.randval(self)
+        return value
 
     def getfield(self,
                  pkt,  # type: Packet

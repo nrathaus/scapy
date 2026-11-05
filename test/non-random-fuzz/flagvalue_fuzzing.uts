@@ -46,9 +46,25 @@ ip = fuzz(IP(dst="192.168.1.1"))
 assert any(f.endswith(':flags') for f in ip.return_relevant_fields(ip))
 
 
-= RSNCipherSuite (a concrete PacketField value) is still correctly excluded
+= RSNCipherSuite, a PacketField value, is fuzzed rather than excluded
 ~ fuzzing dot11
+
+# This used to assert the opposite - that a concrete PacketField value stays
+# excluded. Packet.init_fields() copies the declared RSNCipherSuite default
+# into 'fields' so that instances do not share one, and that copy shadowed
+# whatever randval() wrote to 'default_fields': the field was unreachable
+# while the PacketListField beside it (pairwise_cipher_suites) was fuzzed
+# and walked. _PacketFieldSingle.fuzz_current_value() drops the copy, so
+# the sub-packet randval() builds is the one the layer carries.
 
 rsn = fuzz(Dot11EltRSN())
 fields = rsn.return_relevant_fields(rsn)
-assert not any('group_cipher_suite' in f for f in fields)
+assert '802.11 RSN information:group_cipher_suite:oui' in fields
+assert '802.11 RSN information:group_cipher_suite:cipher' in fields
+
+assert 'group_cipher_suite' not in rsn.fields
+assert isinstance(rsn.group_cipher_suite, RSNCipherSuite)
+assert isinstance(rsn.group_cipher_suite.default_fields['oui'], VolatileValue)
+
+# It still builds - the suite is 4 octets wherever the walk puts it.
+assert len(bytes(rsn.group_cipher_suite)) == 4

@@ -263,6 +263,33 @@ assert field.randval() is not first
 assert field.default.default_fields == before
 
 
+= A class named by a dispatcher cannot be called either
+~ fuzzing packet kerberos
+
+# 'self.cls is None' was the wrong test for "no class to build": a field can
+# also name a function that picks the class out of the bytes it is handed,
+# and calling that with no arguments raises the same way None() did.
+#
+#     fuzz(KRB_InnerToken())
+#     TypeError: KRB_InnerToken.<lambda>() missing 2 required positional
+#                arguments: 'x' and '_parent'
+#
+# The test is now whether cls is a class at all.
+
+from scapy.layers.kerberos import KRB_AP_REQ, KRB_InnerToken
+
+field = [f for f in KRB_InnerToken.fields_desc if f.name == "root"][0]
+assert field.cls is not None
+assert not isinstance(field.cls, type)
+
+# Answered from the default, exactly as a cls of None is: it is one of the
+# classes the dispatcher can return.
+packet = fuzz(KRB_InnerToken())
+assert isinstance(packet.default_fields["root"], KRB_AP_REQ)
+assert isinstance(packet.default_fields["root"].default_fields["pvno"],
+                  VolatileValue)
+
+
 ############
 ############
 + An active list-valued field that does not hold a list
