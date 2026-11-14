@@ -7,13 +7,17 @@
 """
 References:
   - https://tools.ietf.org/html/rfc4601
+  - https://tools.ietf.org/html/rfc7761
+  - https://tools.ietf.org/html/rfc5059
+  - https://tools.ietf.org/html/rfc3973
   - https://www.iana.org/assignments/pim-parameters/pim-parameters.xhtml
 """
 import struct
-from scapy.packet import Packet, bind_layers
+from scapy.packet import Packet, bind_bottom_up, bind_layers
 from scapy.fields import BitFieldLenField, BitField, BitEnumField, ByteField, \
-    ShortField, XShortField, IPField, IP6Field, PacketListField, \
-    IntField, FieldLenField, BoundStrLenField, MultipleTypeField
+    ShortField, XShortField, IPField, IP6Field, PacketField, \
+    PacketListField, IntField, FieldLenField, BoundStrLenField, \
+    MultipleTypeField
 from scapy.layers.inet import IP
 from scapy.layers.inet6 import IPv6, in6_chksum, _IPv6ExtHdr
 from scapy.utils import checksum
@@ -53,8 +57,11 @@ class PIMv2Hdr(Packet):
         """
         p += pay
         if self.chksum is None:
+            # RFC 7761 s:4.9.1: the checksum of a Register message covers
+            # its first 8 octets only, leaving out the datagram it carries.
+            data = p[:8] if self.type == 1 else p
             if isinstance(self.underlayer, IP):
-                ck = checksum(p)
+                ck = checksum(data)
                 # ck = in4_chksum(103, self.underlayer, p)
                 # According to RFC768 if the result checksum is 0, it should be set to 0xFFFF  # noqa: E501
                 if ck == 0:
@@ -62,7 +69,7 @@ class PIMv2Hdr(Packet):
                 p = p[:2] + struct.pack("!H", ck) + p[4:]
 
             elif isinstance(self.underlayer, IPv6) or isinstance(self.underlayer, _IPv6ExtHdr):  # noqa: E501
-                ck = in6_chksum(103, self.underlayer, p)  # noqa: E501
+                ck = in6_chksum(103, self.underlayer, data)  # noqa: E501
                 # According to RFC2460 if the result checksum is 0, it should be set to 0xFFFF  # noqa: E501
                 if ck == 0:
                     ck = 0xFFFF
@@ -216,6 +223,39 @@ PIMv2_HELLO_CLASSES = {
 
 
 ##################################
+# PIMv2 Encoded Addresses
+##################################
+class PIMv2UnicastAddr(_PIMGenericTlvBase):
+    name = "PIMv2 Encoded-Unicast Address"
+    fields_desc = [
+        ByteField("addr_family", 1),
+        ByteField("encoding_type", 0),
+        MultipleTypeField(
+            [(IP6Field("addr", "::"),
+              lambda pkt: pkt.addr_family == 2)],
+            IPField("addr", "0.0.0.0")
+        ),
+    ]
+
+
+class PIMv2GroupAddr(_PIMGenericTlvBase):
+    name = "PIMv2 Encoded-Group Address"
+    fields_desc = [
+        ByteField("addr_family", 1),
+        ByteField("encoding_type", 0),
+        BitField("bidirection", 0, 1),
+        BitField("reserved", 0, 6),
+        BitField("admin_scope_zone", 0, 1),
+        ByteField("mask_len", 32),
+        MultipleTypeField(
+            [(IP6Field("gaddr", "::"),
+              lambda pkt: pkt.addr_family == 2)],
+            IPField("gaddr", "0.0.0.0")
+        ),
+    ]
+
+
+##################################
 # PIMv2 Join/Prune
 ##################################
 class PIMv2JoinPruneAddrsBase(_PIMGenericTlvBase):
@@ -244,20 +284,9 @@ class PIMv2PruneAddrs(PIMv2JoinPruneAddrsBase):
     name = "PIMv2 Prune: Source Address"
 
 
-class PIMv2GroupAddrs(_PIMGenericTlvBase):
+class PIMv2GroupAddrs(PIMv2GroupAddr):
     name = "PIMv2 Join/Prune: Multicast Group Address"
-    fields_desc = [
-        ByteField("addr_family", 1),
-        ByteField("encoding_type", 0),
-        BitField("bidirection", 0, 1),
-        BitField("reserved", 0, 6),
-        BitField("admin_scope_zone", 0, 1),
-        ByteField("mask_len", 32),
-        MultipleTypeField(
-            [(IP6Field("gaddr", "::"),
-              lambda pkt: pkt.addr_family == 2)],
-            IPField("gaddr", "0.0.0.0")
-        ),
+    fields_desc = PIMv2GroupAddr.fields_desc + [
         BitFieldLenField("num_joins", None, size=16, count_of="join_ips"),
         BitFieldLenField("num_prunes", None, size=16, count_of="prune_ips"),
         PacketListField("join_ips", [], PIMv2JoinAddrs,
@@ -285,7 +314,113 @@ class PIMv2JoinPrune(_PIMGenericTlvBase):
     ]
 
 
+##################################
+# PIMv2 Register
+##################################
+def _guess_pimv2_register_class(p, **kargs):
+    """A Register encapsulates a datagram of the family it is sent over."""
+    if p and p[0] >> 4 == 6:
+        return IPv6(p, **kargs)
+    return IP(p, **kargs)
+
+
+class PIMv2Register(_PIMGenericTlvBase):
+    name = "PIMv2 Register"
+    fields_desc = [
+        BitField("border", 0, 1),
+        BitField("null_register", 0, 1),
+        BitField("reserved2", 0, 30),
+        PacketField("packet", IP(), _guess_pimv2_register_class),
+    ]
+
+
+class PIMv2RegisterStop(_PIMGenericTlvBase):
+    name = "PIMv2 Register-Stop"
+    fields_desc = [
+        PacketField("group", PIMv2GroupAddr(), PIMv2GroupAddr),
+        PacketField("source", PIMv2UnicastAddr(), PIMv2UnicastAddr),
+    ]
+
+
+##################################
+# PIMv2 Bootstrap
+##################################
+class PIMv2BootstrapRP(_PIMGenericTlvBase):
+    name = "PIMv2 Bootstrap: Candidate RP"
+    fields_desc = [
+        PacketField("rp", PIMv2UnicastAddr(), PIMv2UnicastAddr),
+        ShortField("holdtime", 150),
+        ByteField("priority", 1),
+        ByteField("reserved", 0),
+    ]
+
+
+class PIMv2BootstrapGroup(_PIMGenericTlvBase):
+    name = "PIMv2 Bootstrap: Group Range"
+    fields_desc = [
+        PacketField("group", PIMv2GroupAddr(), PIMv2GroupAddr),
+        FieldLenField("rp_count", None, count_of="rps", fmt="B"),
+        # RFC 5059 s:4.1 - the RPs carried by THIS fragment are counted by
+        # frag_rp_count, while rp_count counts the ones the whole Bootstrap
+        # message holds for this group range.
+        FieldLenField("frag_rp_count", None, count_of="rps", fmt="B"),
+        ShortField("reserved", 0),
+        PacketListField("rps", [], PIMv2BootstrapRP,
+                        count_from=lambda pkt: pkt.frag_rp_count),
+    ]
+
+
+class PIMv2Bootstrap(_PIMGenericTlvBase):
+    name = "PIMv2 Bootstrap"
+    fields_desc = [
+        ShortField("fragment_tag", 0),
+        ByteField("hash_mask_len", 30),
+        ByteField("bsr_priority", 0),
+        PacketField("bsr", PIMv2UnicastAddr(), PIMv2UnicastAddr),
+        PacketListField("groups", [], PIMv2BootstrapGroup),
+    ]
+
+
+##################################
+# PIMv2 Assert
+##################################
+class PIMv2Assert(_PIMGenericTlvBase):
+    name = "PIMv2 Assert"
+    fields_desc = [
+        PacketField("group", PIMv2GroupAddr(), PIMv2GroupAddr),
+        PacketField("source", PIMv2UnicastAddr(), PIMv2UnicastAddr),
+        BitField("rpt", 0, 1),
+        BitField("metric_preference", 0, 31),
+        IntField("metric", 0),
+    ]
+
+
+##################################
+# PIMv2 Candidate-RP-Advertisement
+##################################
+class PIMv2CandidateRPAdv(_PIMGenericTlvBase):
+    name = "PIMv2 Candidate-RP-Advertisement"
+    fields_desc = [
+        FieldLenField("prefix_count", None, count_of="groups", fmt="B"),
+        ByteField("priority", 0),
+        ShortField("holdtime", 150),
+        PacketField("rp", PIMv2UnicastAddr(), PIMv2UnicastAddr),
+        PacketListField("groups", [], PIMv2GroupAddr,
+                        count_from=lambda pkt: pkt.prefix_count),
+    ]
+
+
 bind_layers(IP, PIMv2Hdr, proto=103)
 bind_layers(IPv6, PIMv2Hdr, nh=103)
 bind_layers(PIMv2Hdr, PIMv2Hello, type=0)
+bind_layers(PIMv2Hdr, PIMv2Register, type=1)
+bind_layers(PIMv2Hdr, PIMv2RegisterStop, type=2)
 bind_layers(PIMv2Hdr, PIMv2JoinPrune, type=3)
+bind_layers(PIMv2Hdr, PIMv2Bootstrap, type=4)
+bind_layers(PIMv2Hdr, PIMv2Assert, type=5)
+# Graft and Graft-Ack (RFC 3973 s:4.6) carry the Join/Prune format exactly.
+# They are bound for dissection only, so that a PIMv2JoinPrune that is built
+# still carries type 3 rather than the type of the last binding made.
+bind_bottom_up(PIMv2Hdr, PIMv2JoinPrune, type=6)
+bind_bottom_up(PIMv2Hdr, PIMv2JoinPrune, type=7)
+bind_layers(PIMv2Hdr, PIMv2CandidateRPAdv, type=8)

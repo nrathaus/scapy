@@ -131,6 +131,221 @@ assert raw(prune_pkt) == b'\x01\x00^\x00\x00\r\xc2\x02=\x80\x00\x01\x08\x00E\xc0
 
 
 
+= PIMv2 Register - build
+
+register_data = b'E\x00\x00<\x00\x01\x00\x00@gd\xf5\n\x01\x01\x01\n\x00\x00d!\x00\xde\xff\x00\x00\x00\x00E\x00\x00 \x00\x01\x00\x00\n\x11\xb4\xbd\n\x01\x01\n\xef\x01\x02\x03\x04\xd2\x16.\x00\x0c\x10\x04data'
+
+register_pkt = IP(id=1, ttl=64, src="10.1.1.1", dst="10.0.0.100")/\
+               PIMv2Hdr()/\
+               PIMv2Register(packet=IP(id=1, ttl=10, src="10.1.1.10", dst="239.1.2.3")/UDP(sport=1234, dport=5678)/b"data")
+
+assert raw(register_pkt) == register_data
+
+= PIMv2 Register - instantiation
+
+register_rcv = IP(register_data)
+
+assert (register_rcv[PIMv2Hdr].type == 1)
+assert (register_rcv[PIMv2Register].border == 0)
+assert (register_rcv[PIMv2Register].null_register == 0)
+assert (register_rcv[PIMv2Register].reserved2 == 0)
+assert (register_rcv[PIMv2Register].packet.src == "10.1.1.10")
+assert (register_rcv[PIMv2Register].packet.dst == "239.1.2.3")
+assert (register_rcv[PIMv2Register].packet[UDP].dport == 5678)
+assert (raw(register_rcv[PIMv2Register].packet[Raw]) == b"data")
+
+# RFC 7761 s:4.9.1 - the checksum of a Register covers its first 8 octets
+# only, so verifying it over the encapsulated datagram as well must fail.
+assert (checksum(raw(register_rcv[PIMv2Hdr])[:8]) == 0)
+assert (checksum(raw(register_rcv[PIMv2Hdr])) != 0)
+
+= PIMv2 Register - a Null-Register carries the inner header alone
+
+null_register_pkt = PIMv2Hdr()/PIMv2Register(null_register=1, packet=IP(id=1, ttl=10, src="10.1.1.10", dst="239.1.2.3"))
+
+assert raw(null_register_pkt) == b'!\x00\x00\x00@\x00\x00\x00E\x00\x00\x14\x00\x01\x00\x00\n\x00\xb4\xda\n\x01\x01\n\xef\x01\x02\x03'
+
+null_register_rcv = PIMv2Hdr(raw(null_register_pkt))
+
+assert (null_register_rcv[PIMv2Register].null_register == 1)
+assert (null_register_rcv[PIMv2Register].packet.dst == "239.1.2.3")
+assert (len(null_register_rcv[PIMv2Register].packet.payload) == 0)
+
+= PIMv2 Register-Stop - build and dissect
+
+register_stop_data = b'E\x00\x00&\x00\x02\x00\x00@ge\n\n\x00\x00d\n\x01\x01\x01"\x00\xdf\xcf\x01\x00\x00 \xef\x01\x02\x03\x01\x00\n\x01\x01\n'
+
+register_stop_pkt = IP(id=2, ttl=64, src="10.0.0.100", dst="10.1.1.1")/\
+                    PIMv2Hdr()/\
+                    PIMv2RegisterStop(group=PIMv2GroupAddr(gaddr="239.1.2.3"),
+                                      source=PIMv2UnicastAddr(addr="10.1.1.10"))
+
+assert raw(register_stop_pkt) == register_stop_data
+
+register_stop_rcv = IP(register_stop_data)
+
+assert (register_stop_rcv[PIMv2Hdr].type == 2)
+assert (register_stop_rcv[PIMv2RegisterStop].group.addr_family == 1)
+assert (register_stop_rcv[PIMv2RegisterStop].group.mask_len == 32)
+assert (register_stop_rcv[PIMv2RegisterStop].group.gaddr == "239.1.2.3")
+assert (register_stop_rcv[PIMv2RegisterStop].source.addr_family == 1)
+assert (register_stop_rcv[PIMv2RegisterStop].source.addr == "10.1.1.10")
+
+= PIMv2 Assert - build and dissect
+
+assert_data = b'E\x00\x00.\x00\x03\x00\x00\x01g\xcfX\n\x00\x00\x01\xe0\x00\x00\r%\x00\xdcM\x01\x00\x00 \xef\x01\x02\x03\x01\x00\n\x01\x01\n\x00\x00\x00n\x00\x00\x00\x14'
+
+assert_pkt = IP(id=3, ttl=1, src="10.0.0.1", dst="224.0.0.13")/\
+             PIMv2Hdr()/\
+             PIMv2Assert(group=PIMv2GroupAddr(gaddr="239.1.2.3"),
+                         source=PIMv2UnicastAddr(addr="10.1.1.10"),
+                         rpt=0, metric_preference=110, metric=20)
+
+assert raw(assert_pkt) == assert_data
+
+assert_rcv = IP(assert_data)
+
+assert (assert_rcv[PIMv2Hdr].type == 5)
+assert (assert_rcv[PIMv2Assert].group.gaddr == "239.1.2.3")
+assert (assert_rcv[PIMv2Assert].source.addr == "10.1.1.10")
+assert (assert_rcv[PIMv2Assert].rpt == 0)
+assert (assert_rcv[PIMv2Assert].metric_preference == 110)
+assert (assert_rcv[PIMv2Assert].metric == 20)
+
+# The RPT bit sits directly above a 31 bit preference
+assert_rpt_rcv = PIMv2Assert(raw(PIMv2Assert(rpt=1, metric_preference=0x7fffffff, metric=0xdeadbeef)))
+
+assert (assert_rpt_rcv.rpt == 1)
+assert (assert_rpt_rcv.metric_preference == 0x7fffffff)
+assert (assert_rpt_rcv.metric == 0xdeadbeef)
+
+= PIMv2 Bootstrap - build and dissect
+
+bootstrap_data = b'E\x00\x00X\x00\x04\x00\x00\x01g\xcf-\n\x00\x00\x01\xe0\x00\x00\r$\x00\x95\xe6\x124\x1e@\x01\x00\n\x00\x00\x01\x01\x00\x00\x08\xef\x00\x00\x00\x02\x02\x00\x00\x01\x00\n\x00\x00\x02\x00\x96\x01\x00\x01\x00\n\x00\x00\x03\x00\x96\x02\x00\x01\x00\x00\x08\xee\x00\x00\x00\x01\x01\x00\x00\x01\x00\n\x00\x00\x04\x00Z\x03\x00'
+
+bootstrap_pkt = IP(id=4, ttl=1, src="10.0.0.1", dst="224.0.0.13")/\
+                PIMv2Hdr()/\
+                PIMv2Bootstrap(fragment_tag=0x1234, hash_mask_len=30, bsr_priority=64,
+                               bsr=PIMv2UnicastAddr(addr="10.0.0.1"),
+                               groups=[PIMv2BootstrapGroup(group=PIMv2GroupAddr(gaddr="239.0.0.0", mask_len=8),
+                                                           rps=[PIMv2BootstrapRP(rp=PIMv2UnicastAddr(addr="10.0.0.2"), holdtime=150, priority=1),
+                                                                PIMv2BootstrapRP(rp=PIMv2UnicastAddr(addr="10.0.0.3"), holdtime=150, priority=2)]),
+                                       PIMv2BootstrapGroup(group=PIMv2GroupAddr(gaddr="238.0.0.0", mask_len=8),
+                                                           rps=[PIMv2BootstrapRP(rp=PIMv2UnicastAddr(addr="10.0.0.4"), holdtime=90, priority=3)])])
+
+assert raw(bootstrap_pkt) == bootstrap_data
+
+bootstrap_rcv = IP(bootstrap_data)
+
+assert (bootstrap_rcv[PIMv2Hdr].type == 4)
+assert (bootstrap_rcv[PIMv2Bootstrap].fragment_tag == 0x1234)
+assert (bootstrap_rcv[PIMv2Bootstrap].hash_mask_len == 30)
+assert (bootstrap_rcv[PIMv2Bootstrap].bsr_priority == 64)
+assert (bootstrap_rcv[PIMv2Bootstrap].bsr.addr == "10.0.0.1")
+assert (len(bootstrap_rcv[PIMv2Bootstrap].groups) == 2)
+assert (bootstrap_rcv[PIMv2Bootstrap].groups[0].group.gaddr == "239.0.0.0")
+assert (bootstrap_rcv[PIMv2Bootstrap].groups[0].group.mask_len == 8)
+assert (bootstrap_rcv[PIMv2Bootstrap].groups[0].rp_count == 2)
+assert (bootstrap_rcv[PIMv2Bootstrap].groups[0].frag_rp_count == 2)
+assert (len(bootstrap_rcv[PIMv2Bootstrap].groups[0].rps) == 2)
+assert (bootstrap_rcv[PIMv2Bootstrap].groups[0].rps[1].rp.addr == "10.0.0.3")
+assert (bootstrap_rcv[PIMv2Bootstrap].groups[0].rps[1].holdtime == 150)
+assert (bootstrap_rcv[PIMv2Bootstrap].groups[0].rps[1].priority == 2)
+assert (bootstrap_rcv[PIMv2Bootstrap].groups[1].group.gaddr == "238.0.0.0")
+assert (len(bootstrap_rcv[PIMv2Bootstrap].groups[1].rps) == 1)
+assert (bootstrap_rcv[PIMv2Bootstrap].groups[1].rps[0].holdtime == 90)
+assert (not bootstrap_rcv[PIMv2Bootstrap].payload)
+
+# RFC 5059 s:4.1 - a fragment carries frag_rp_count RPs, which is the count
+# the list is read with, while rp_count stays the total for the group range.
+bootstrap_frag_rcv = PIMv2Bootstrap(raw(PIMv2Bootstrap(groups=[PIMv2BootstrapGroup(rp_count=5,
+                                                                                   rps=[PIMv2BootstrapRP(rp=PIMv2UnicastAddr(addr="10.0.0.2"))])])))
+
+assert (bootstrap_frag_rcv.groups[0].rp_count == 5)
+assert (bootstrap_frag_rcv.groups[0].frag_rp_count == 1)
+assert (len(bootstrap_frag_rcv.groups[0].rps) == 1)
+
+= PIMv2 Candidate-RP-Advertisement - build and dissect
+
+candidate_rp_data = b'E\x00\x002\x00\x05\x00\x00\x01g\xa5W\n\x00\x00\t\n\x00\x00\x01(\x00\xea4\x02\x07\x00\x96\x01\x00\n\x00\x00\t\x01\x00\x00\x10\xef\x01\x00\x00\x01\x00\x00\x10\xef\x02\x00\x00'
+
+candidate_rp_pkt = IP(id=5, ttl=1, src="10.0.0.9", dst="10.0.0.1")/\
+                   PIMv2Hdr()/\
+                   PIMv2CandidateRPAdv(priority=7, holdtime=150,
+                                       rp=PIMv2UnicastAddr(addr="10.0.0.9"),
+                                       groups=[PIMv2GroupAddr(gaddr="239.1.0.0", mask_len=16),
+                                               PIMv2GroupAddr(gaddr="239.2.0.0", mask_len=16)])
+
+assert raw(candidate_rp_pkt) == candidate_rp_data
+
+candidate_rp_rcv = IP(candidate_rp_data)
+
+assert (candidate_rp_rcv[PIMv2Hdr].type == 8)
+assert (candidate_rp_rcv[PIMv2CandidateRPAdv].prefix_count == 2)
+assert (candidate_rp_rcv[PIMv2CandidateRPAdv].priority == 7)
+assert (candidate_rp_rcv[PIMv2CandidateRPAdv].holdtime == 150)
+assert (candidate_rp_rcv[PIMv2CandidateRPAdv].rp.addr == "10.0.0.9")
+assert (len(candidate_rp_rcv[PIMv2CandidateRPAdv].groups) == 2)
+assert (candidate_rp_rcv[PIMv2CandidateRPAdv].groups[1].gaddr == "239.2.0.0")
+assert (candidate_rp_rcv[PIMv2CandidateRPAdv].groups[1].mask_len == 16)
+
+= PIMv2 Graft and Graft-Ack - dissection
+
+# RFC 3973 s:4.6 - both carry the Join/Prune format, so they dissect into
+# PIMv2JoinPrune. Building one asks for the type by hand, since PIMv2JoinPrune
+# is the Join/Prune message and keeps type 3 of its own.
+graft_data = b'E\x00\x006\x00\x06\x00\x00\x01g\xcfM\n\x00\x00\x01\xe0\x00\x00\r&\x00\xce\xd9\x01\x00\n\x00\x00\x02\x00\x01\x00\xd2\x01\x00\x00 \xef\x01\x02\x03\x00\x01\x00\x00\x01\x00\x01 \n\x01\x01\n'
+
+graft_pkt = IP(id=6, ttl=1, src="10.0.0.1", dst="224.0.0.13")/\
+            PIMv2Hdr(type=6)/\
+            PIMv2JoinPrune(up_neighbor_ip="10.0.0.2",
+                           jp_ips=[PIMv2GroupAddrs(gaddr="239.1.2.3",
+                                                   join_ips=[PIMv2JoinAddrs(src_ip="10.1.1.10")])])
+
+assert raw(graft_pkt) == graft_data
+
+graft_rcv = IP(graft_data)
+
+assert (graft_rcv[PIMv2Hdr].type == 6)
+assert (isinstance(graft_rcv[PIMv2Hdr].payload, PIMv2JoinPrune))
+assert (graft_rcv[PIMv2JoinPrune].up_neighbor_ip == "10.0.0.2")
+assert (graft_rcv[PIMv2JoinPrune].jp_ips[0].join_ips[0].src_ip == "10.1.1.10")
+
+graft_ack_rcv = IP(b"E\x00\x006\x00\x06\x00\x00\x01g\xcfM\n\x00\x00\x01\xe0\x00\x00\r'\x00\xcd\xd9\x01\x00\n\x00\x00\x02\x00\x01\x00\xd2\x01\x00\x00 \xef\x01\x02\x03\x00\x01\x00\x00\x01\x00\x01 \n\x01\x01\n")
+
+assert (graft_ack_rcv[PIMv2Hdr].type == 7)
+assert (isinstance(graft_ack_rcv[PIMv2Hdr].payload, PIMv2JoinPrune))
+
+# PIMv2JoinPrune is still built as a Join/Prune
+assert (raw(PIMv2Hdr()/PIMv2JoinPrune())[0] & 0x0f == 3)
+
+= PIMv2 - every type named in PIM_TYPE is bound
+
+pim_bound = dict((cond["type"], layer) for cond, layer in PIMv2Hdr.payload_guess if "type" in cond)
+
+assert (set(pim_bound) == set(PIM_TYPE))
+assert (pim_bound[0] is PIMv2Hello)
+assert (pim_bound[1] is PIMv2Register)
+assert (pim_bound[2] is PIMv2RegisterStop)
+assert (pim_bound[3] is PIMv2JoinPrune)
+assert (pim_bound[4] is PIMv2Bootstrap)
+assert (pim_bound[5] is PIMv2Assert)
+assert (pim_bound[6] is PIMv2JoinPrune)
+assert (pim_bound[7] is PIMv2JoinPrune)
+assert (pim_bound[8] is PIMv2CandidateRPAdv)
+
+= PIMv2 encoded address - a family that disagrees with the address it carries
+
+# The declared family and the address are independent values on the wire.
+# RawVal carries the ones that disagree, which an address field will not take.
+pim_mismatch = PIMv2GroupAddr(addr_family=2, gaddr=RawVal(b"\xef\x01\x02\x03"))
+
+assert raw(pim_mismatch) == b"\x02\x00\x00 \xef\x01\x02\x03"
+
+pim_mismatch_unicast = PIMv2UnicastAddr(addr_family=1, addr=RawVal(b"\x20\x01\x0d\xb8" + b"\x00" * 12))
+
+assert raw(pim_mismatch_unicast) == b"\x01\x00 \x01\r\xb8" + b"\x00" * 12
+
 ####################################################################################
 # IPv6 added
 ####################################################################################
@@ -273,3 +488,41 @@ prune_pkt6 = Ether(dst='33:33:00:00:00:0d', src='02:00:00:00:00:01')/ \
 assert raw(prune_pkt6) == jp_data6prune
 
 
+= IPv6 PIMv2 Register - build and dissect
+
+register_data6 = b'`\x00\x00\x00\x00<g@ \x01\r\xb8\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01 \x01\r\xb8\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00d!\x00\x82\xb8\x00\x00\x00\x00`\x00\x00\x00\x00\x0c\x11\n \x01\r\xb8\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\n\xff>\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x04\xd2\x16.\x00\x0c\xdf\x0fdata'
+
+register_pkt6 = IPv6(hlim=64, src="2001:db8:1::1", dst="2001:db8::64")/\
+                PIMv2Hdr()/\
+                PIMv2Register(packet=IPv6(hlim=10, src="2001:db8:1::a", dst="ff3e::1")/UDP(sport=1234, dport=5678)/b"data")
+
+assert raw(register_pkt6) == register_data6
+
+register_rcv6 = IPv6(register_data6)
+
+assert (register_rcv6[PIMv2Hdr].type == 1)
+assert (isinstance(register_rcv6[PIMv2Register].packet, IPv6))
+assert (register_rcv6[PIMv2Register].packet.src == "2001:db8:1::a")
+assert (register_rcv6[PIMv2Register].packet.dst == "ff3e::1")
+assert (register_rcv6[PIMv2Register].packet[UDP].dport == 5678)
+
+# RFC 7761 s:4.9.1 - the checksum covers the first 8 octets of the message
+assert (in6_chksum(103, register_rcv6, raw(register_rcv6[PIMv2Hdr])[:8]) == 0)
+
+= IPv6 PIMv2 Assert - build and dissect
+
+assert_pkt6 = IPv6(hlim=1, src="fe80::ff:fe00:1", dst="ff02::d")/\
+              PIMv2Hdr()/\
+              PIMv2Assert(group=PIMv2GroupAddr(addr_family=2, mask_len=128, gaddr="ff3e::8000:1"),
+                          source=PIMv2UnicastAddr(addr_family=2, addr="2001:db8:1::a"),
+                          rpt=1, metric_preference=110, metric=20)
+
+assert_rcv6 = IPv6(raw(assert_pkt6))
+
+assert (assert_rcv6[PIMv2Hdr].type == 5)
+assert (assert_rcv6[PIMv2Assert].group.addr_family == 2)
+assert (assert_rcv6[PIMv2Assert].group.gaddr == "ff3e::8000:1")
+assert (assert_rcv6[PIMv2Assert].source.addr == "2001:db8:1::a")
+assert (assert_rcv6[PIMv2Assert].rpt == 1)
+assert (assert_rcv6[PIMv2Assert].metric_preference == 110)
+assert (assert_rcv6[PIMv2Assert].metric == 20)
