@@ -13,7 +13,7 @@ References:
   - https://www.iana.org/assignments/pim-parameters/pim-parameters.xhtml
 """
 import struct
-from scapy.packet import Packet, bind_bottom_up, bind_layers
+from scapy.packet import Packet, bind_layers
 from scapy.fields import BitFieldLenField, BitField, BitEnumField, ByteField, \
     ShortField, XShortField, IPField, IP6Field, PacketField, \
     PacketListField, IntField, FieldLenField, BoundStrLenField, \
@@ -315,6 +315,22 @@ class PIMv2JoinPrune(_PIMGenericTlvBase):
 
 
 ##################################
+# PIMv2 Graft and Graft-Ack
+##################################
+# RFC 3973 s:4.6 - a Graft and a Graft-Ack carry the Join/Prune format
+# exactly, so they differ from it, and from each other, only by the type they
+# are built with. match_subclass keeps pkt[PIMv2JoinPrune] reaching both.
+class PIMv2Graft(PIMv2JoinPrune):
+    name = "PIMv2 Graft"
+    match_subclass = True
+
+
+class PIMv2GraftAck(PIMv2JoinPrune):
+    name = "PIMv2 Graft-Ack"
+    match_subclass = True
+
+
+##################################
 # PIMv2 Register
 ##################################
 def _guess_pimv2_register_class(p, **kargs):
@@ -418,9 +434,6 @@ bind_layers(PIMv2Hdr, PIMv2RegisterStop, type=2)
 bind_layers(PIMv2Hdr, PIMv2JoinPrune, type=3)
 bind_layers(PIMv2Hdr, PIMv2Bootstrap, type=4)
 bind_layers(PIMv2Hdr, PIMv2Assert, type=5)
-# Graft and Graft-Ack (RFC 3973 s:4.6) carry the Join/Prune format exactly.
-# They are bound for dissection only, so that a PIMv2JoinPrune that is built
-# still carries type 3 rather than the type of the last binding made.
-bind_bottom_up(PIMv2Hdr, PIMv2JoinPrune, type=6)
-bind_bottom_up(PIMv2Hdr, PIMv2JoinPrune, type=7)
+bind_layers(PIMv2Hdr, PIMv2Graft, type=6)
+bind_layers(PIMv2Hdr, PIMv2GraftAck, type=7)
 bind_layers(PIMv2Hdr, PIMv2CandidateRPAdv, type=8)

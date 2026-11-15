@@ -289,35 +289,54 @@ assert (len(candidate_rp_rcv[PIMv2CandidateRPAdv].groups) == 2)
 assert (candidate_rp_rcv[PIMv2CandidateRPAdv].groups[1].gaddr == "239.2.0.0")
 assert (candidate_rp_rcv[PIMv2CandidateRPAdv].groups[1].mask_len == 16)
 
-= PIMv2 Graft and Graft-Ack - dissection
+= PIMv2 Graft and Graft-Ack - build and dissect
 
-# RFC 3973 s:4.6 - both carry the Join/Prune format, so they dissect into
-# PIMv2JoinPrune. Building one asks for the type by hand, since PIMv2JoinPrune
-# is the Join/Prune message and keeps type 3 of its own.
+# RFC 3973 s:4.6 - both carry the Join/Prune format, so PIMv2Graft and
+# PIMv2GraftAck extend PIMv2JoinPrune and differ from it only by the type
+# they are bound with.
 graft_data = b'E\x00\x006\x00\x06\x00\x00\x01g\xcfM\n\x00\x00\x01\xe0\x00\x00\r&\x00\xce\xd9\x01\x00\n\x00\x00\x02\x00\x01\x00\xd2\x01\x00\x00 \xef\x01\x02\x03\x00\x01\x00\x00\x01\x00\x01 \n\x01\x01\n'
 
 graft_pkt = IP(id=6, ttl=1, src="10.0.0.1", dst="224.0.0.13")/\
-            PIMv2Hdr(type=6)/\
-            PIMv2JoinPrune(up_neighbor_ip="10.0.0.2",
-                           jp_ips=[PIMv2GroupAddrs(gaddr="239.1.2.3",
-                                                   join_ips=[PIMv2JoinAddrs(src_ip="10.1.1.10")])])
+            PIMv2Hdr()/\
+            PIMv2Graft(up_neighbor_ip="10.0.0.2",
+                       jp_ips=[PIMv2GroupAddrs(gaddr="239.1.2.3",
+                                               join_ips=[PIMv2JoinAddrs(src_ip="10.1.1.10")])])
 
 assert raw(graft_pkt) == graft_data
 
 graft_rcv = IP(graft_data)
 
 assert (graft_rcv[PIMv2Hdr].type == 6)
-assert (isinstance(graft_rcv[PIMv2Hdr].payload, PIMv2JoinPrune))
-assert (graft_rcv[PIMv2JoinPrune].up_neighbor_ip == "10.0.0.2")
-assert (graft_rcv[PIMv2JoinPrune].jp_ips[0].join_ips[0].src_ip == "10.1.1.10")
+assert (isinstance(graft_rcv[PIMv2Hdr].payload, PIMv2Graft))
+assert (graft_rcv[PIMv2Graft].up_neighbor_ip == "10.0.0.2")
+assert (graft_rcv[PIMv2Graft].jp_ips[0].join_ips[0].src_ip == "10.1.1.10")
 
-graft_ack_rcv = IP(b"E\x00\x006\x00\x06\x00\x00\x01g\xcfM\n\x00\x00\x01\xe0\x00\x00\r'\x00\xcd\xd9\x01\x00\n\x00\x00\x02\x00\x01\x00\xd2\x01\x00\x00 \xef\x01\x02\x03\x00\x01\x00\x00\x01\x00\x01 \n\x01\x01\n")
+# match_subclass: a Graft is still reached by the format it carries
+assert (graft_rcv[PIMv2JoinPrune] is graft_rcv[PIMv2Graft])
+
+graft_ack_data = b"E\x00\x006\x00\x06\x00\x00\x01g\xcfM\n\x00\x00\x01\xe0\x00\x00\r'\x00\xcd\xd9\x01\x00\n\x00\x00\x02\x00\x01\x00\xd2\x01\x00\x00 \xef\x01\x02\x03\x00\x01\x00\x00\x01\x00\x01 \n\x01\x01\n"
+
+graft_ack_pkt = IP(id=6, ttl=1, src="10.0.0.1", dst="224.0.0.13")/\
+                PIMv2Hdr()/\
+                PIMv2GraftAck(up_neighbor_ip="10.0.0.2",
+                              jp_ips=[PIMv2GroupAddrs(gaddr="239.1.2.3",
+                                                      join_ips=[PIMv2JoinAddrs(src_ip="10.1.1.10")])])
+
+assert raw(graft_ack_pkt) == graft_ack_data
+
+graft_ack_rcv = IP(graft_ack_data)
 
 assert (graft_ack_rcv[PIMv2Hdr].type == 7)
-assert (isinstance(graft_ack_rcv[PIMv2Hdr].payload, PIMv2JoinPrune))
+assert (isinstance(graft_ack_rcv[PIMv2Hdr].payload, PIMv2GraftAck))
 
-# PIMv2JoinPrune is still built as a Join/Prune
+# The three share a format and nothing else: each builds as its own type, and
+# neither Graft class answers for the other.
 assert (raw(PIMv2Hdr()/PIMv2JoinPrune())[0] & 0x0f == 3)
+assert (raw(PIMv2Hdr()/PIMv2Graft())[0] & 0x0f == 6)
+assert (raw(PIMv2Hdr()/PIMv2GraftAck())[0] & 0x0f == 7)
+assert (raw(PIMv2Graft()) == raw(PIMv2JoinPrune()))
+assert (not graft_rcv.haslayer(PIMv2GraftAck))
+assert (not IP(raw(IP(src="10.0.0.1", dst="224.0.0.13")/PIMv2Hdr()/PIMv2JoinPrune())).haslayer(PIMv2Graft))
 
 = PIMv2 - every type named in PIM_TYPE is bound
 
@@ -330,8 +349,8 @@ assert (pim_bound[2] is PIMv2RegisterStop)
 assert (pim_bound[3] is PIMv2JoinPrune)
 assert (pim_bound[4] is PIMv2Bootstrap)
 assert (pim_bound[5] is PIMv2Assert)
-assert (pim_bound[6] is PIMv2JoinPrune)
-assert (pim_bound[7] is PIMv2JoinPrune)
+assert (pim_bound[6] is PIMv2Graft)
+assert (pim_bound[7] is PIMv2GraftAck)
 assert (pim_bound[8] is PIMv2CandidateRPAdv)
 
 = PIMv2 encoded address - a family that disagrees with the address it carries
