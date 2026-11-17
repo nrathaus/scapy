@@ -356,7 +356,7 @@ assert (pim_bound[8] is PIMv2CandidateRPAdv)
 = PIMv2 encoded address - a family that disagrees with the address it carries
 
 # The declared family and the address are independent values on the wire.
-# RawVal carries the ones that disagree, which an address field will not take.
+# RawVal carries a pair that disagrees as bytes, unexamined.
 pim_mismatch = PIMv2GroupAddr(addr_family=2, gaddr=RawVal(b"\xef\x01\x02\x03"))
 
 assert raw(pim_mismatch) == b"\x02\x00\x00 \xef\x01\x02\x03"
@@ -364,6 +364,21 @@ assert raw(pim_mismatch) == b"\x02\x00\x00 \xef\x01\x02\x03"
 pim_mismatch_unicast = PIMv2UnicastAddr(addr_family=1, addr=RawVal(b"\x20\x01\x0d\xb8" + b"\x00" * 12))
 
 assert raw(pim_mismatch_unicast) == b"\x01\x00 \x01\r\xb8" + b"\x00" * 12
+
+# A plain address of the other family expresses the same pair without the
+# escape hatch: the field the family selects cannot encode it, so the
+# MultipleTypeField emits it through the one that can.
+assert raw(PIMv2GroupAddr(addr_family=2, gaddr="239.1.2.3")) == b"\x02\x00\x00 \xef\x01\x02\x03"
+assert raw(PIMv2GroupAddr(addr_family=1, gaddr="ff02::1")) == b"\x01\x00\x00 \xff\x02" + b"\x00" * 13 + b"\x01"
+
+# The family is a sibling field, so assigning it must not stop a packet that
+# already builds - which is the form fuzz() meets, since it resolves the
+# address field once against the family as it stood.
+pim_group = PIMv2GroupAddr(gaddr="239.1.2.3")
+assert raw(pim_group) == b"\x01\x00\x00 \xef\x01\x02\x03"
+
+pim_group.addr_family = 2
+assert raw(pim_group) == b"\x02\x00\x00 \xef\x01\x02\x03"
 
 ####################################################################################
 # IPv6 added

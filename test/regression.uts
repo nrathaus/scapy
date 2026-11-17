@@ -1638,6 +1638,22 @@ assert pkt.command() == "PPTPStartControlConnectionReply()/IP(src='127.0.0.1', d
 assert pkt.json() == '{"len": 156, "type": 1, "magic_cookie": 439041101, "ctrl_msg_type": 2, "reserved_0": 0, "protocol_version": 256, "result_code": 1, "error_code": 0, "framing_capabilities": 0, "bearer_capabilities": 0, "maximum_channels": 65535, "firmware_revision": 256, "host_name": "linux", "vendor_string": "", "payload": {"version": 4, "ihl": null, "tos": 0, "len": null, "id": 1, "flags": 0, "frag": 0, "ttl": 64, "proto": 0, "chksum": null, "src": "127.0.0.1", "dst": "127.0.0.1"}}'
 
 
+= Test command() with a RawVal
+
+# RawVal's repr is a display form rather than a constructor, so without a
+# command() of its own it rendered as "<RawVal [b'####']>", which is not
+# Python - and the escape hatch for a field that refuses its value could not
+# be reproduced from the command that names it.
+
+pkt = IP(dst="127.0.0.1", src="127.0.0.1", len=RawVal(b"####"))
+assert pkt.command() == "IP(len=RawVal(b'####'), src='127.0.0.1', dst='127.0.0.1')"
+assert raw(eval(pkt.command())) == raw(pkt)
+
+= Test json() with a RawVal
+
+assert pkt.json() == '{"version": 4, "ihl": null, "tos": 0, "len": {"type": "RawVal", "value": "b\'####\'"}, "id": 1, "flags": 0, "frag": 0, "ttl": 64, "proto": 0, "chksum": null, "src": "127.0.0.1", "dst": "127.0.0.1"}'
+
+
 ############
 ############
 + Tests on padding

@@ -104,6 +104,18 @@ class RawVal:
         # type: () -> str
         return "<RawVal [%r]>" % self.val
 
+    def command(self, json=False):
+        # type: (bool) -> Union[Dict[str, str], str]
+        """
+        Packet.command() asks a value for its own rendering when it has one,
+        and falls back to repr() otherwise. repr() of a RawVal is a display
+        form rather than a constructor, so without this a packet carrying one
+        renders to something that is not Python.
+        """
+        if json:
+            return {"type": self.__class__.__name__, "value": repr(self.val)}
+        return "%s(%r)" % (self.__class__.__name__, self.val)
+
 
 class ObservableDict(Dict[int, str]):
     """
@@ -964,15 +976,49 @@ the value to set is also known) of ._find_fld_pkt() instead.
         # type: (...) -> Tuple[bytes, Any]
         return self._find_fld_pkt(pkt).getfield(pkt, s)
 
+    def _with_a_field_that_accepts(self, fld, val, use):
+        # type: (Field[Any, Any], Any, Callable[[Field[Any, Any]], Any]) -> Any
+        """Call `use` on `fld`, and on the first other registered field that
+        accepts `val` if `fld` refuses it.
+
+        The conditions choose the field from the packet, while the value was
+        set through whichever field the packet resolved to back then. The two
+        are independent, and several protocols let them disagree on the wire -
+        an Encoded-Address declares its family and then carries an address
+        whose width is supposed to follow it (RFC 7761 s:4.9.1), which is the
+        pair a receiver gets wrong. Emitting the value through a field that
+        accepts it expresses that shape; refusing to build does not. A value
+        no registered field accepts still raises.
+        """
+        try:
+            return use(fld)
+        except (OSError, struct.error, TypeError, ValueError) as exception:
+            log_runtime.debug(
+                "%s: %s does not accept %r (%s), falling back",
+                self.name, fld.__class__.__name__, val, exception
+            )
+            for other in [x[0] for x in self.flds] + [self.dflt]:
+                if other is fld:
+                    continue
+                try:
+                    return use(other)
+                except (OSError, struct.error, TypeError, ValueError):
+                    continue
+            raise
+
     def addfield(self, pkt, s, val):
         # type: (Packet, bytes, Any) -> bytes
         fld, val = self._find_fld_pkt_val(pkt, val)
-        return fld.addfield(pkt, s, val)
+        return cast(bytes, self._with_a_field_that_accepts(
+            fld, val, lambda x: x.addfield(pkt, s, val)
+        ))
 
     def any2i(self, pkt, val):
         # type: (Optional[Packet], Any) -> Any
         fld, val = self._find_fld_pkt_val(pkt, val)
-        return fld.any2i(pkt, val)
+        return self._with_a_field_that_accepts(
+            fld, val, lambda x: x.any2i(pkt, val)
+        )
 
     def h2i(self, pkt, val):
         # type: (Optional[Packet], Any) -> Any
@@ -1003,7 +1049,9 @@ the value to set is also known) of ._find_fld_pkt() instead.
         hint = ""
         if fld in self.hints:
             hint = " (%s)" % self.hints[fld]
-        return fld.i2repr(pkt, val) + hint
+        return cast(str, self._with_a_field_that_accepts(
+            fld, val, lambda x: x.i2repr(pkt, val)
+        )) + hint
 
     def register_owner(self, cls):
         # type: (Type[Packet]) -> None

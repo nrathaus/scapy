@@ -1749,6 +1749,42 @@ assert o.subfield == 0xBEEFBEEF
 o = SweetPacket(switch=1, subfield=0x88)
 assert o.subfield == 0x88
 
+= A field that cannot encode the value falls back to one that can
+
+# The conditions choose the field from the packet, while the value was set
+# through whichever field was resolved at the time, and the two are
+# independent - several protocols let them disagree on the wire. An
+# Encoded-Address declares its family and then carries an address whose width
+# is supposed to follow it (RFC 7761 s:4.9.1), which is the pair a receiver
+# gets wrong. So a packet that builds must not stop building because a
+# sibling field was assigned.
+
+a = DebugPacket(addr="192.168.0.1")
+assert raw(a) == b"\x01\xc0\xa8\x00\x01"
+
+a.atyp = 0x4
+assert raw(a) == b"\x04\xc0\xa8\x00\x01"
+assert "192.168.0.1" in repr(a)
+
+# Same through the constructor, which assigns in declaration order, so the
+# family is already in place when the address is interpreted.
+assert raw(DebugPacket(atyp=0x4, addr="192.168.0.1")) == b"\x04\xc0\xa8\x00\x01"
+
+# "The first registered field that accepts it" is meant literally: an IPv6
+# address under atyp=1 goes to the DNS arm, declared before the IPv6 one.
+assert raw(DebugPacket(atyp=0x1, addr="2001:db8::1")) == b"\x01\x0b2001:db8::1\x00"
+
+= A value no registered field accepts still raises
+
+# The fallback is not a licence to emit anything: SweetPacket's three arms
+# are integer fields, and a string is not an integer for any of them.
+
+try:
+    raw(SweetPacket(switch=1, subfield="nope"))
+    assert False, "a value no registered field accepts was emitted"
+except ValueError:
+    pass
+
 = MultipleTypeField - syntax error
 
 import warnings
